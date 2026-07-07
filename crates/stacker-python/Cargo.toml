@@ -1,0 +1,59 @@
+[package]
+name = "z-stackr-python"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+description = "PyO3 Python bindings for the z-stackr focus-stacking engine (out-of-core file pipeline + in-RAM numpy array path)"
+# Not published to crates.io: this crate ships to end users exclusively as a
+# prebuilt Python wheel via `maturin build`/`maturin develop` (see
+# pyproject.toml and the crate README's "Building wheels" section), never as
+# a Rust library dependency of another crate.
+publish = false
+
+[lib]
+name = "stacker_python"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+python = ["dep:pyo3", "dep:numpy"]
+extension-module = ["pyo3/extension-module", "pyo3/generate-import-lib"]
+# Feature forwarding, mirroring the style documented in
+# `crates/stacker-pipeline/Cargo.toml`: these are pure forwards to the
+# identically-named feature on `z-stackr-pipeline`, so a maturin build that
+# enables `nn`/`raw` here compiles AI fusion / neural alignment / RAW frame
+# loading into the extension module exactly like the CLI/GUI's own
+# `--features nn` / `--features raw` builds do.
+nn = ["z-stackr-pipeline/nn"]
+raw = ["z-stackr-pipeline/raw"]
+# GPU-accelerated tiled/batch Apex fusion, production warp, Strata saliency
+# and Relief guided-filter/multigrid (see
+# `docs/gpu_acceleration_summary.md`). Forwards `z-stackr-pipeline/gpu` (used
+# by `stack_files`/`batch_stack`, via `run_pipeline`'s own internal
+# `set_enabled` call) AND `z-stackr-core/gpu` directly, since
+# `array_api::run_in_ram_stack` (the `stack_arrays` in-RAM path, which never
+# goes through `run_pipeline`) calls `stacker_core::gpu::set_enabled` itself
+# — both edges must be forwarded, or that call site fails to compile under
+# `maturin build --features gpu`.
+gpu = ["z-stackr-pipeline/gpu", "z-stackr-core/gpu"]
+
+[dependencies]
+# python/numpy are optional: only compiled in when the `python` feature is
+# enabled (see the `[features]` section above).
+pyo3 = { version = "0.29.0", optional = true }
+numpy = { version = "0.29.0", optional = true }
+z-stackr-core = { workspace = true }
+z-stackr-align = { workspace = true }
+z-stackr-pipeline = { workspace = true }
+z-stackr-algo = { workspace = true }
+smol = { workspace = true }
+image = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+pyo3 = { version = "0.29.0", features = ["auto-initialize"] }
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

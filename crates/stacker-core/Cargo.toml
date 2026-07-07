@@ -1,0 +1,59 @@
+[package]
+name = "z-stackr-core"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "Core image representations, colour handling, shared preprocessing, EXIF copy-through and the out-of-core tile manager for the z-stackr focus-stacking suite"
+readme = "README.md"
+repository = { workspace = true }
+keywords = ["focus-stacking", "image-processing", "macro", "photography"]
+categories = ["multimedia::images", "computer-vision"]
+
+[lib]
+name = "stacker_core"
+
+[dependencies]
+image = { workspace = true }
+imgref = "1.12.2"
+bytemuck = "1.25"
+num-traits = "0.2.19"
+rayon = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+smol = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+kamadak-exif = "0.6.1"
+img-parts = "0.4.0"
+# RAW support (`raw` feature, optional): pure-Rust container/Bayer decode
+# plus its own default demosaic/white-balance/gamma develop pipeline, both
+# from the actively-maintained `rawler` crate (the dnglab decoding engine —
+# see `src/io.rs`). Pinned to its exact current crates.io release rather
+# than a floating range: this is a single dependency now (no more pairing
+# concern with a second crate), but an exact pin still protects against a
+# silent behavioural change in RAW decode/demosaic output landing in an
+# unreviewed dependency bump.
+rawler = { version = "=0.7.2", optional = true }
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+
+[features]
+default = []
+nn = []
+# Pure-Rust RAW image support (CR2/NEF/ARW/DNG/RAF/ORF/RW2/PEF/CR3/… — see
+# `src/io.rs`'s module docs) via `rawler`. Deliberately kept out of the
+# default feature set: it pulls in an extra dependency purely for a format
+# class most users never touch, and this crate's zero-C-dependency pure-Rust
+# build chain (and its PGO/BOLT release profiles) must stay intact whether
+# or not `raw` is enabled.
+raw = ["dep:rawler"]
+# Shared wgpu context helper (`src/gpu.rs`) consumed by `z-stackr-algo`'s and
+# `z-stackr-align`'s own `gpu` features, so the two crates' near-identical
+# `get_wgpu_context()` implementations have exactly one shared definition
+# instead of two copies that can drift apart. This crate has no compute
+# shaders of its own — it only owns the adapter/device/queue acquisition.
+gpu = ["dep:wgpu", "dep:pollster"]
+
+[lints]
+workspace = true

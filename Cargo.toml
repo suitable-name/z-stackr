@@ -1,0 +1,65 @@
+[workspace]
+resolver = "3"
+members = ["apps/*", "crates/*"]
+
+[workspace.package]
+version = "1.0.1"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/suitable-name/z-stackr"
+
+[workspace.dependencies]
+z-stackr-core = { path = "crates/stacker-core", version = "1.0.0" }
+z-stackr-align = { path = "crates/stacker-align", version = "1.0.0" }
+z-stackr-algo = { path = "crates/stacker-algo", version = "1.0.0" }
+z-stackr-nn = { path = "crates/stacker-nn", version = "1.0.0", default-features = false }
+z-stackr-pipeline = { path = "crates/stacker-pipeline", version = "1.0.0", default-features = false }
+image = "0.25.10"
+rayon = "1.12"
+thiserror = "2.0.18"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+smol = "2.0.2"
+notify = "8.2.0"
+nalgebra = "0.35.0"
+tikv-jemallocator = "0.7.0"
+mimalloc = "0.1.52"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+toml = "1.1.2"
+wgpu = "30.0.0"
+pollster = "0.4.0"
+bytemuck = { version = "1.15.0", features = ["derive"] }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+
+# ── Release profile ───────────────────────────────────────────────────────────
+# Maximum-optimisation shipping profile: full (fat) LTO across the whole
+# dependency graph, a single codegen unit for cross-module inlining, and
+# symbol stripping for small distributable binaries. `panic` stays at the
+# default (unwind) on purpose: the GUI runs alignment/fusion on worker threads
+# whose panics must not abort the whole process.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "symbols"
+
+# ── PGO / BOLT profile ────────────────────────────────────────────────────────
+# Same optimisation level as `release`, but keeps symbols and line tables:
+# BOLT needs symbol + relocation information to rewrite the binary layout, and
+# profile-guided builds are far easier to debug/inspect with line tables
+# present. Used by the PGO/BOLT tasks in the VS Code tasks file
+# (docs/vscode-tasks.json → .vscode/tasks.json); the extra linker flag BOLT
+# needs (--emit-relocs) is passed via RUSTFLAGS there, not here, because it is
+# ELF/Linux-only.
+[profile.release-perf]
+inherits = "release"
+strip = false
+debug = "line-tables-only"

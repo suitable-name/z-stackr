@@ -1,0 +1,104 @@
+[package]
+name = "z-stackr-nn"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "Neural networks for z-stackr focus-stacking (Burn backend): pairwise and whole-stack fusion models plus batch stack alignment"
+readme = "README.md"
+repository = { workspace = true }
+keywords = ["focus-stacking", "neural-network", "burn", "image-processing"]
+categories = ["multimedia::images", "computer-vision", "science"]
+
+[lib]
+# Keep the crate identifier `stacker_nn` so source `use` paths are unchanged.
+name = "stacker_nn"
+
+# ---------------------------------------------------------------------------
+# Feature matrix
+#
+#   ndarray  – pure-Rust CPU backend; the default CI / verification backend.
+#   wgpu     – Vulkan-based GPU backend for AMD / Intel / NVIDIA inference.
+#   cuda     – CUDA backend for NVIDIA A100 training.
+#   autodiff – wraps the selected backend for backprop (default; CI-verified).
+#
+# Exactly ONE of {ndarray, wgpu, cuda} should be active per build.
+#
+# Notes:
+# * `burn/std` is required for `burn::optim` (AdamW) and the file recorders, so
+#   it is folded into each backend feature.
+# * There is intentionally NO `train` feature: `burn-train` is not used at all
+#   by this crate — the trainer is hand-rolled on `burn::optim`, which
+#   `burn/std` already provides. So the training binary builds under the
+#   default features and is fully CI-verified.
+# * The `cuda` feature maps to burn's own `cuda` feature (renamed from
+#   `cuda-jit` in burn 0.17 alongside the `CudaJit` backend type being renamed
+#   to `burn::backend::cuda::Cuda` — see `src/lib.rs`'s `SelectedBackend`
+#   alias). This crate's OWN public feature name (`cuda`) is unchanged, so
+#   downstream apps (`apps/*`) needed no changes for this rename.
+# ---------------------------------------------------------------------------
+[features]
+# `autodiff` is in the default set on purpose: the CI helpers (`run_clippy` /
+# `run_tests`) cannot pass `--features`, so the autodiff-backed backward pass of
+# the model + loss — and the recurrent rollout in `train.rs` — must be reachable
+# under the default build to be verified.
+default = ["ndarray", "autodiff"]
+ndarray = ["burn/ndarray", "burn/std"]
+wgpu = ["burn/wgpu", "burn/std"]
+cuda = ["burn/cuda", "burn/std"]
+autodiff = ["burn/autodiff"]
+
+# ---------------------------------------------------------------------------
+# Training driver — its own binary. It only needs the autodiff backend (which is
+# in the default set), so it builds and is clippy-verified by the default CI run.
+# To train on GPU instead of the default CPU backend, build with e.g.
+#   cargo run -p z-stackr-nn --release --no-default-features \
+#       --features "cuda,autodiff" --bin z-stackr-train -- <args>
+# ---------------------------------------------------------------------------
+[[bin]]
+name = "z-stackr-train"
+path = "src/bin/train.rs"
+required-features = ["autodiff"]
+
+[dependencies]
+# Burn – we declare a single dependency and gate backends via its own features.
+# Pinned to the exact 0.21.0 release (the current latest 0.21.x patch at the
+# time of this migration — pinned exactly, not a floating "0.21", to force a
+# fresh dependency resolution rather than silently trusting whatever was
+# already sitting in `Cargo.lock`).
+#
+# This crate was previously pinned to burn 0.16 with every call site written
+# against 0.16's API. It has since been migrated through the 0.17-0.21
+# breaking-change sequence; the call sites now match burn 0.21, notably:
+# * `squeeze(dim)` / `squeeze::<N>(dim)` → `squeeze_dim(dim)` / `squeeze_dim::<N>(dim)` (0.19).
+# * `PaddingConfig2d::Explicit(l, r)` (2 fields) → `PaddingConfig2d::Explicit(top, left, bottom, right)`
+#   (4 fields; asymmetric padding support added in 0.21 — this crate only ever
+#   used symmetric padding, so every call site duplicates its old 2 values).
+# * `burn::backend::CudaJit` → `burn::backend::cuda::Cuda`, and the `cuda-jit`
+#   burn feature → `cuda` (0.17) — see `[features]` above and `src/lib.rs`.
+# * `Shape`'s `dims` field is now private (0.21); call sites that read a
+#   tensor's full shape as an array use `Tensor::dims()` instead of
+#   `tensor.shape().dims`.
+# Migrating this crate to burn 0.21's API was a substantial, separate
+# undertaking, not a drive-by fix alongside batchalign-v2 (see git history
+# around that feature for the prior 0.16-pinned state and its rationale).
+burn = { version = "0.21.0", default-features = false }
+
+# Pipeline image type (PlanarImage) — needed by the planar<->tensor bridge.
+z-stackr-core = { workspace = true }
+
+# Data / I/O
+image = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+rayon = { workspace = true }
+tracing = { workspace = true }
+nalgebra = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+# Also a dev-dependency so integration tests in `tests/` can build PlanarImages.
+z-stackr-core = { workspace = true }
+
+[lints]
+workspace = true

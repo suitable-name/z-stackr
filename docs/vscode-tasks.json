@@ -1,0 +1,709 @@
+{
+	// Build matrix: {GUI, CLI, Trainer} × {generic, AVX2, AVX512, znver3, znver4} × {Windows, Linux},
+	// plus PGO(+BOLT) chains for CLI/GUI at the bottom.
+	//
+	// Arch variants are driven by RUSTFLAGS (-C target-cpu=…):
+	//   generic → baseline x86-64 (portable_simd falls back to SSE2/scalar)
+	//   AVX2    → x86-64-v3  (AVX2 + FMA + BMI — Haswell+/Zen1+)
+	//   AVX512  → x86-64-v4  (AVX-512 F/BW/CD/DQ/VL)
+	//   znver3  → AMD Zen 3 tuned (AVX2)
+	//   znver4  → AMD Zen 4 tuned (AVX-512)
+	//
+	// Each arch variant uses its own CARGO_TARGET_DIR (target/<arch>) so
+	// switching variants never invalidates another variant's build cache.
+	//
+	// OS variants use explicit --target triples. Cross-compiling needs the
+	// target installed (`rustup target add x86_64-unknown-linux-gnu` /
+	// `x86_64-pc-windows-msvc`) plus a matching linker; the GUI (Slint/winit)
+	// generally only builds for the host OS — run the matching task on the
+	// matching machine (this tasks.json is shared between them).
+	//
+	// The project requires a NIGHTLY toolchain (portable_simd).
+	"version": "2.0.0",
+	"tasks": [
+		// ── GUI (z-stackr-gui) ── Windows ─────────────────────────────────
+		{
+			"type": "shell",
+			"label": "build GUI release — generic (Windows)",
+			"command": "cargo build --release -p z-stackr-gui --target x86_64-pc-windows-msvc",
+			"options": {
+				"env": {
+					"CARGO_TARGET_DIR": "target/generic"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build GUI release — AVX2 (Windows)",
+			"command": "cargo build --release -p z-stackr-gui --target x86_64-pc-windows-msvc",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=x86-64-v3",
+					"CARGO_TARGET_DIR": "target/avx2"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build GUI release — AVX512 (Windows)",
+			"command": "cargo build --release -p z-stackr-gui --target x86_64-pc-windows-msvc",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=x86-64-v4",
+					"CARGO_TARGET_DIR": "target/avx512"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build GUI release — znver3 (Windows)",
+			"command": "cargo build --release -p z-stackr-gui --target x86_64-pc-windows-msvc",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=znver3",
+					"CARGO_TARGET_DIR": "target/znver3"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build GUI release — znver4 (Windows)",
+			"command": "cargo build --release -p z-stackr-gui --target x86_64-pc-windows-msvc",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=znver4",
+					"CARGO_TARGET_DIR": "target/znver4"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		// ── GUI (z-stackr-gui) ── Linux ───────────────────────────────────
+		{
+			"type": "shell",
+			"label": "build GUI release — generic (Linux)",
+			"command": "cargo build --release -p z-stackr-gui --target x86_64-unknown-linux-gnu",
+			"options": {
+				"env": {
+					"CARGO_TARGET_DIR": "target/generic"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build GUI release — AVX2 (Linux)",
+			"command": "cargo build --release -p z-stackr-gui --target x86_64-unknown-linux-gnu",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=x86-64-v3",
+					"CARGO_TARGET_DIR": "target/avx2"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build GUI release — AVX512 (Linux)",
+			"command": "cargo build --release -p z-stackr-gui --target x86_64-unknown-linux-gnu",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=x86-64-v4",
+					"CARGO_TARGET_DIR": "target/avx512"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build GUI release — znver3 (Linux)",
+			"command": "cargo build --release -p z-stackr-gui --target x86_64-unknown-linux-gnu",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=znver3",
+					"CARGO_TARGET_DIR": "target/znver3"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build GUI release — znver4 (Linux)",
+			"command": "cargo build --release -p z-stackr-gui --target x86_64-unknown-linux-gnu",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=znver4",
+					"CARGO_TARGET_DIR": "target/znver4"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		// ── CLI (z-stackr-cli, binary `z-stackr`) ── Windows ──────────────
+		{
+			"type": "shell",
+			"label": "build CLI release — generic (Windows)",
+			"command": "cargo build --release -p z-stackr-cli --target x86_64-pc-windows-msvc",
+			"options": {
+				"env": {
+					"CARGO_TARGET_DIR": "target/generic"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build CLI release — AVX2 (Windows)",
+			"command": "cargo build --release -p z-stackr-cli --target x86_64-pc-windows-msvc",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=x86-64-v3",
+					"CARGO_TARGET_DIR": "target/avx2"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build CLI release — AVX512 (Windows)",
+			"command": "cargo build --release -p z-stackr-cli --target x86_64-pc-windows-msvc",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=x86-64-v4",
+					"CARGO_TARGET_DIR": "target/avx512"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build CLI release — znver3 (Windows)",
+			"command": "cargo build --release -p z-stackr-cli --target x86_64-pc-windows-msvc",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=znver3",
+					"CARGO_TARGET_DIR": "target/znver3"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build CLI release — znver4 (Windows)",
+			"command": "cargo build --release -p z-stackr-cli --target x86_64-pc-windows-msvc",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=znver4",
+					"CARGO_TARGET_DIR": "target/znver4"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		// ── CLI (z-stackr-cli, binary `z-stackr`) ── Linux ────────────────
+		{
+			"type": "shell",
+			"label": "build CLI release — generic (Linux)",
+			"command": "cargo build --release -p z-stackr-cli --target x86_64-unknown-linux-gnu",
+			"options": {
+				"env": {
+					"CARGO_TARGET_DIR": "target/generic"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build CLI release — AVX2 (Linux)",
+			"command": "cargo build --release -p z-stackr-cli --target x86_64-unknown-linux-gnu",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=x86-64-v3",
+					"CARGO_TARGET_DIR": "target/avx2"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build CLI release — AVX512 (Linux)",
+			"command": "cargo build --release -p z-stackr-cli --target x86_64-unknown-linux-gnu",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=x86-64-v4",
+					"CARGO_TARGET_DIR": "target/avx512"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build CLI release — znver3 (Linux)",
+			"command": "cargo build --release -p z-stackr-cli --target x86_64-unknown-linux-gnu",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=znver3",
+					"CARGO_TARGET_DIR": "target/znver3"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build CLI release — znver4 (Linux)",
+			"command": "cargo build --release -p z-stackr-cli --target x86_64-unknown-linux-gnu",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=znver4",
+					"CARGO_TARGET_DIR": "target/znver4"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		// ── Trainer (z-stackr-train, crate z-stackr-nn) ── Windows ────────
+		// Default nn features = ndarray + autodiff (CPU training). For CUDA
+		// training use: --no-default-features --features "cuda,autodiff".
+		{
+			"type": "shell",
+			"label": "build Trainer release — generic (Windows)",
+			"command": "cargo build --release -p z-stackr-nn --bin z-stackr-train --target x86_64-pc-windows-msvc",
+			"options": {
+				"env": {
+					"CARGO_TARGET_DIR": "target/generic"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build Trainer release — AVX2 (Windows)",
+			"command": "cargo build --release -p z-stackr-nn --bin z-stackr-train --target x86_64-pc-windows-msvc",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=x86-64-v3",
+					"CARGO_TARGET_DIR": "target/avx2"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build Trainer release — AVX512 (Windows)",
+			"command": "cargo build --release -p z-stackr-nn --bin z-stackr-train --target x86_64-pc-windows-msvc",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=x86-64-v4",
+					"CARGO_TARGET_DIR": "target/avx512"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build Trainer release — znver3 (Windows)",
+			"command": "cargo build --release -p z-stackr-nn --bin z-stackr-train --target x86_64-pc-windows-msvc",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=znver3",
+					"CARGO_TARGET_DIR": "target/znver3"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build Trainer release — znver4 (Windows)",
+			"command": "cargo build --release -p z-stackr-nn --bin z-stackr-train --target x86_64-pc-windows-msvc",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=znver4",
+					"CARGO_TARGET_DIR": "target/znver4"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		// ── Trainer (z-stackr-train, crate z-stackr-nn) ── Linux ──────────
+		{
+			"type": "shell",
+			"label": "build Trainer release — generic (Linux)",
+			"command": "cargo build --release -p z-stackr-nn --bin z-stackr-train --target x86_64-unknown-linux-gnu",
+			"options": {
+				"env": {
+					"CARGO_TARGET_DIR": "target/generic"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build Trainer release — AVX2 (Linux)",
+			"command": "cargo build --release -p z-stackr-nn --bin z-stackr-train --target x86_64-unknown-linux-gnu",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=x86-64-v3",
+					"CARGO_TARGET_DIR": "target/avx2"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build Trainer release — AVX512 (Linux)",
+			"command": "cargo build --release -p z-stackr-nn --bin z-stackr-train --target x86_64-unknown-linux-gnu",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=x86-64-v4",
+					"CARGO_TARGET_DIR": "target/avx512"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build Trainer release — znver3 (Linux)",
+			"command": "cargo build --release -p z-stackr-nn --bin z-stackr-train --target x86_64-unknown-linux-gnu",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=znver3",
+					"CARGO_TARGET_DIR": "target/znver3"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "build Trainer release — znver4 (Linux)",
+			"command": "cargo build --release -p z-stackr-nn --bin z-stackr-train --target x86_64-unknown-linux-gnu",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=znver4",
+					"CARGO_TARGET_DIR": "target/znver4"
+				}
+			},
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+
+		// ════════════════════════════════════════════════════════════════════
+		// PGO (+ BOLT on Linux) build chains — CLI & GUI.
+		//
+		// Prerequisites:
+		//   * `rustup component add llvm-tools` and put its bin dir on PATH
+		//     (…/lib/rustlib/<host>/bin/), or install a matching system LLVM,
+		//     so `llvm-profdata` is available (its version must match rustc's
+		//     LLVM major).
+		//   * BOLT (Linux ONLY — it rewrites ELF; Windows PE is not supported):
+		//     `llvm-bolt` from the llvm-bolt package.
+		//   * All steps use the `release-perf` cargo profile (symbols + line
+		//     tables kept — see the workspace Cargo.toml) and the dedicated
+		//     target dir `target/pgo`, so normal build caches stay untouched.
+		//
+		// Run the numbered steps in order. Step 2 (the workload) should be
+		// representative: real stacks, both fusion modes. The CLI workload
+		// chains two runs with `&&` (needs bash or PowerShell 7+). The GUI
+		// workload is interactive — the task launches the instrumented
+		// binary; load a stack, align, fuse with Apex AND Relief, then quit
+		// (profiles are written on exit).
+		// ════════════════════════════════════════════════════════════════════
+
+		// ── PGO + BOLT: CLI — znver4 (Linux) ──────────────────────────────
+		{
+			"type": "shell",
+			"label": "PGO CLI znver4 Linux — 1: build instrumented",
+			"command": "cargo build --profile release-perf -p z-stackr-cli --target x86_64-unknown-linux-gnu",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=znver4 -C profile-generate=${workspaceFolder}/target/pgo-data/cli-znver4",
+					"CARGO_TARGET_DIR": "target/pgo"
+				}
+			},
+			"problemMatcher": ["$rustc"],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "PGO CLI znver4 Linux — 2: run workload (apex + relief)",
+			"command": "./target/pgo/x86_64-unknown-linux-gnu/release-perf/z-stackr --input-dir sample/test_subset_apex --output-file target/pgo-data/pgo_workload_apex.tif --mode apex --tile-size 512 && ./target/pgo/x86_64-unknown-linux-gnu/release-perf/z-stackr --input-dir sample/test_subset_relief --output-file target/pgo-data/pgo_workload_relief.tif --mode relief --tile-size 512",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "PGO CLI znver4 Linux — 3: merge profiles",
+			"command": "llvm-profdata merge -o target/pgo-data/cli-znver4/merged.profdata target/pgo-data/cli-znver4",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "PGO CLI znver4 Linux — 4: build PGO-optimised (BOLT-ready)",
+			"command": "cargo build --profile release-perf -p z-stackr-cli --target x86_64-unknown-linux-gnu",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=znver4 -C profile-use=${workspaceFolder}/target/pgo-data/cli-znver4/merged.profdata -C llvm-args=-pgo-warn-missing-function -C link-args=-Wl,--emit-relocs",
+					"CARGO_TARGET_DIR": "target/pgo"
+				}
+			},
+			"problemMatcher": ["$rustc"],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "BOLT CLI znver4 Linux — 5: instrument",
+			"command": "llvm-bolt target/pgo/x86_64-unknown-linux-gnu/release-perf/z-stackr -instrument -o target/pgo/x86_64-unknown-linux-gnu/release-perf/z-stackr-inst --instrumentation-file=${workspaceFolder}/target/pgo-data/cli-znver4-bolt.fdata",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "BOLT CLI znver4 Linux — 6: run instrumented workload",
+			"command": "./target/pgo/x86_64-unknown-linux-gnu/release-perf/z-stackr-inst --input-dir sample/test_subset_apex --output-file target/pgo-data/bolt_workload_apex.tif --mode apex --tile-size 512 && ./target/pgo/x86_64-unknown-linux-gnu/release-perf/z-stackr-inst --input-dir sample/test_subset_relief --output-file target/pgo-data/bolt_workload_relief.tif --mode relief --tile-size 512",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "BOLT CLI znver4 Linux — 7: optimise layout (→ z-stackr-bolt)",
+			"command": "llvm-bolt target/pgo/x86_64-unknown-linux-gnu/release-perf/z-stackr -o target/pgo/x86_64-unknown-linux-gnu/release-perf/z-stackr-bolt --data=target/pgo-data/cli-znver4-bolt.fdata -reorder-blocks=ext-tsp -reorder-functions=hfsort -split-functions -split-all-cold -icf=1 -dyno-stats",
+			"problemMatcher": [],
+			"group": "build"
+		},
+
+		// ── PGO + BOLT: GUI — znver4 (Linux) ──────────────────────────────
+		{
+			"type": "shell",
+			"label": "PGO GUI znver4 Linux — 1: build instrumented",
+			"command": "cargo build --profile release-perf -p z-stackr-gui --target x86_64-unknown-linux-gnu",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=znver4 -C profile-generate=${workspaceFolder}/target/pgo-data/gui-znver4",
+					"CARGO_TARGET_DIR": "target/pgo"
+				}
+			},
+			"problemMatcher": ["$rustc"],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "PGO GUI znver4 Linux — 2: run workload (INTERACTIVE — stack with Apex & Relief, then quit)",
+			"command": "./target/pgo/x86_64-unknown-linux-gnu/release-perf/z-stackr-gui",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "PGO GUI znver4 Linux — 3: merge profiles",
+			"command": "llvm-profdata merge -o target/pgo-data/gui-znver4/merged.profdata target/pgo-data/gui-znver4",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "PGO GUI znver4 Linux — 4: build PGO-optimised (BOLT-ready)",
+			"command": "cargo build --profile release-perf -p z-stackr-gui --target x86_64-unknown-linux-gnu",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=znver4 -C profile-use=${workspaceFolder}/target/pgo-data/gui-znver4/merged.profdata -C llvm-args=-pgo-warn-missing-function -C link-args=-Wl,--emit-relocs",
+					"CARGO_TARGET_DIR": "target/pgo"
+				}
+			},
+			"problemMatcher": ["$rustc"],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "BOLT GUI znver4 Linux — 5: instrument",
+			"command": "llvm-bolt target/pgo/x86_64-unknown-linux-gnu/release-perf/z-stackr-gui -instrument -o target/pgo/x86_64-unknown-linux-gnu/release-perf/z-stackr-gui-inst --instrumentation-file=${workspaceFolder}/target/pgo-data/gui-znver4-bolt.fdata",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "BOLT GUI znver4 Linux — 6: run instrumented workload (INTERACTIVE, then quit)",
+			"command": "./target/pgo/x86_64-unknown-linux-gnu/release-perf/z-stackr-gui-inst",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "BOLT GUI znver4 Linux — 7: optimise layout (→ z-stackr-gui-bolt)",
+			"command": "llvm-bolt target/pgo/x86_64-unknown-linux-gnu/release-perf/z-stackr-gui -o target/pgo/x86_64-unknown-linux-gnu/release-perf/z-stackr-gui-bolt --data=target/pgo-data/gui-znver4-bolt.fdata -reorder-blocks=ext-tsp -reorder-functions=hfsort -split-functions -split-all-cold -icf=1 -dyno-stats",
+			"problemMatcher": [],
+			"group": "build"
+		},
+
+		// ── PGO: CLI — znver3 (Windows) — BOLT not available for PE ───────
+		{
+			"type": "shell",
+			"label": "PGO CLI znver3 Windows — 1: build instrumented",
+			"command": "cargo build --profile release-perf -p z-stackr-cli --target x86_64-pc-windows-msvc",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=znver3 -C profile-generate=${workspaceFolder}\\target\\pgo-data\\cli-znver3",
+					"CARGO_TARGET_DIR": "target/pgo"
+				}
+			},
+			"problemMatcher": ["$rustc"],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "PGO CLI znver3 Windows — 2: run workload (apex + relief; needs PowerShell 7+ or bash)",
+			"command": ".\\target\\pgo\\x86_64-pc-windows-msvc\\release-perf\\z-stackr.exe --input-dir sample/test_subset_apex --output-file target/pgo-data/pgo_workload_apex.tif --mode apex --tile-size 512 && .\\target\\pgo\\x86_64-pc-windows-msvc\\release-perf\\z-stackr.exe --input-dir sample/test_subset_relief --output-file target/pgo-data/pgo_workload_relief.tif --mode relief --tile-size 512",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "PGO CLI znver3 Windows — 3: merge profiles",
+			"command": "llvm-profdata merge -o target/pgo-data/cli-znver3/merged.profdata target/pgo-data/cli-znver3",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "PGO CLI znver3 Windows — 4: build PGO-optimised",
+			"command": "cargo build --profile release-perf -p z-stackr-cli --target x86_64-pc-windows-msvc",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=znver3 -C profile-use=${workspaceFolder}\\target\\pgo-data\\cli-znver3\\merged.profdata -C llvm-args=-pgo-warn-missing-function",
+					"CARGO_TARGET_DIR": "target/pgo"
+				}
+			},
+			"problemMatcher": ["$rustc"],
+			"group": "build"
+		},
+
+		// ── PGO: GUI — znver3 (Windows) — BOLT not available for PE ───────
+		{
+			"type": "shell",
+			"label": "PGO GUI znver3 Windows — 1: build instrumented",
+			"command": "cargo build --profile release-perf -p z-stackr-gui --target x86_64-pc-windows-msvc",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=znver3 -C profile-generate=${workspaceFolder}\\target\\pgo-data\\gui-znver3",
+					"CARGO_TARGET_DIR": "target/pgo"
+				}
+			},
+			"problemMatcher": ["$rustc"],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "PGO GUI znver3 Windows — 2: run workload (INTERACTIVE — stack with Apex & Relief, then quit)",
+			"command": ".\\target\\pgo\\x86_64-pc-windows-msvc\\release-perf\\z-stackr-gui.exe",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "PGO GUI znver3 Windows — 3: merge profiles",
+			"command": "llvm-profdata merge -o target/pgo-data/gui-znver3/merged.profdata target/pgo-data/gui-znver3",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"type": "shell",
+			"label": "PGO GUI znver3 Windows — 4: build PGO-optimised",
+			"command": "cargo build --profile release-perf -p z-stackr-gui --target x86_64-pc-windows-msvc",
+			"options": {
+				"env": {
+					"RUSTFLAGS": "-C target-cpu=znver3 -C profile-use=${workspaceFolder}\\target\\pgo-data\\gui-znver3\\merged.profdata -C llvm-args=-pgo-warn-missing-function",
+					"CARGO_TARGET_DIR": "target/pgo"
+				}
+			},
+			"problemMatcher": ["$rustc"],
+			"group": "build"
+		}
+	]
+}

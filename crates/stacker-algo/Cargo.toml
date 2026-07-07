@@ -1,0 +1,44 @@
+[package]
+name = "z-stackr-algo"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "Focus-stacking fusion algorithms for the z-stackr suite: Apex Laplacian-pyramid blending, dual-engine Relief (guided filter / multigrid depth solver) and frame auto-culling"
+readme = "README.md"
+repository = { workspace = true }
+keywords = ["focus-stacking", "image-processing", "laplacian-pyramid", "depth-map"]
+categories = ["multimedia::images", "computer-vision"]
+
+[lib]
+name = "stacker_algo"
+
+[dependencies]
+z-stackr-core = { workspace = true }
+rayon = { workspace = true }
+image = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
+
+[features]
+default = []
+# GPU-accelerated tiled/batch Apex fusion (`apex::gpu`), the in-RAM
+# incremental Apex accumulator (`apex::gpu::accumulator`), Strata saliency
+# (`strata::gpu`), and Relief's fused guided-filter pipeline + Multigrid
+# relaxation sweep (`relief::gpu`) — gated so a default build stays
+# pure-CPU/SIMD. Forwards `z-stackr-core/gpu` to reuse its shared `wgpu`
+# context helper (`stacker_core::gpu::context`) instead of duplicating
+# adapter/device acquisition here — see that module's docs.
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "z-stackr-core/gpu"]
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[[bench]]
+name = "apex_fusion"
+harness = false
+
+[lints]
+workspace = true

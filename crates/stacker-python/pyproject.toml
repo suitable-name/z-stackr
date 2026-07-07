@@ -1,0 +1,36 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+# PyPI/package name. NOTE: this intentionally differs from the Python import
+# name — `pip install z-stackr` but `import zstackr`. See the crate README's
+# "Installation" section, which calls this pairing out prominently.
+name = "z-stackr"
+version = "1.0.0"
+description = "Python bindings for z-stackr, a pure-Rust out-of-core focus-stacking engine (import name: zstackr)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=2.5.1",
+]
+
+[tool.maturin]
+# Base feature set for a plain `maturin build` / `maturin develop`: just the
+# PyO3 bindings themselves. `nn` (AI fusion + neural alignment) and `raw`
+# (camera RAW input) are opt-in, exactly like the CLI/GUI's own
+# `--features nn` / `--features raw` builds — enable them explicitly with
+# `maturin build --release --features nn,raw` (see the crate README's
+# "Installation" and "AI models" / "RAW support" sections). They are NOT
+# included by default because they pull in the Burn ML stack and the
+# rawloader/imagepipe RAW decoders respectively, neither of which most
+# installs need.
+features = ["python", "extension-module"]
+# Import name (`import zstackr`), independent of the PyPI package name
+# above and of the `[lib] name` in Cargo.toml (which stays `stacker_python`
+# so the `rlib` used by the crate's own `cargo test` keeps a stable Rust
+# identifier). This is the single place all three names are reconciled —
+# see the crate README's "Installation" section for the full explanation of
+# why there are three different names for "the same thing".
+module-name = "zstackr"

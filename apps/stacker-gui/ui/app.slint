@@ -1,0 +1,2313 @@
+import { Button, CheckBox, Slider, VerticalBox, HorizontalBox, ComboBox, ScrollView, Switch, LineEdit } from "std-widgets.slint";
+// `ContextMenuArea`, `Menu`, and `MenuItem` (used below for the Save button's
+// "Save as PNG/TIFF/JPG" context menu) are Slint builtin elements, not
+// std-widgets — they need no import.
+
+// ── Components ───────────────────────────────────────────────────────────────
+
+component InfoIcon inherits Rectangle {
+    in property <string> tip-text: "";
+    width: 14px; height: 14px;
+    out property <bool> has-hover: ta.has-hover;
+    // No floating popup here: the previous per-icon popup was absolutely
+    // positioned relative to the icon and got clipped or drawn on top of
+    // neighbouring controls (dropdowns in particular) whenever the icon sat
+    // near an edge, making the text unreadable. Every caller instead reads
+    // `tip-text` via `has-hover`/a `hovered` callback and shows it in one
+    // fixed, always-visible, always-large-enough place (see SettingsDialog's
+    // "Tooltip Display" area).
+    callback hovered(string);
+    changed has-hover => {
+        if (root.has-hover && root.tip-text != "") {
+            root.hovered(root.tip-text);
+        }
+    }
+    Text { 
+        text: "ⓘ"; 
+        color: root.has-hover ? #ffffff : #888888; 
+        font-size: 14px; 
+        horizontal-alignment: center; 
+        vertical-alignment: center; 
+    }
+    ta := TouchArea {
+        mouse-cursor: help;
+    }
+}
+
+// ── Toolbar button with a floating hover tooltip ──────────────────────────────
+// Self-contained (unlike `InfoIcon`, which bubbles `hovered(string)` up to a
+// shared fixed display area inside `SettingsDialog`): the top toolbar has no
+// such shared area, so each button owns a small floating box that appears
+// directly below it on hover instead.
+component ToolbarButtonWithTip inherits Rectangle {
+    in property <string> text;
+    in property <string> tip;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    width: btn.width;
+    height: btn.height;
+
+    btn := Button {
+        text: root.text;
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+
+    if (ta.has-hover && root.tip != "") : Rectangle {
+        y: root.height + 4px;
+        z: 100;
+        width: max(220px, tip-text.preferred-width + 16px);
+        height: tip-text.preferred-height + 12px;
+        background: #000000ee;
+        border-radius: 4px;
+        border-width: 1px;
+        border-color: #555555;
+        tip-text := Text {
+            x: 8px; y: 6px;
+            width: parent.width - 16px;
+            text: root.tip;
+            color: #eeeeee;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+    }
+
+    ta := TouchArea {
+        // Purely for hover detection — `btn` (drawn on top) still receives
+        // the actual click.
+        clicked => { root.clicked(); }
+    }
+}
+
+// ── Image canvas with zoom ────────────────────────────────────────────────────
+
+component ImageCanvas inherits Rectangle {
+    callback apply-brush(int, int, float, float); // x, y, radius, opacity
+    callback request-open-files();
+    in property <bool>  has-images: false;
+    in property <image> displayed-image;
+    in-out property <float> brush-size:    20.0;
+    in-out property <float> brush-opacity:  0.5;
+    in-out property <float> zoom-factor:    1.0;   // 1.0 = 100 %
+    in property <bool> show-aligned: false;
+    // Set by the main window to `App.dialog-open` (the popup's own
+    // `RetouchWindow` instantiation always passes `false` — it has no
+    // modal overlay of its own). Gates both the pan/brush TouchAreas and
+    // the pan cursor: a modal dialog sitting visually on top must make the
+    // canvas underneath fully inert, not just visually obscured — see
+    // `pan`/`brush-ta`'s `enabled` bindings below.
+    in property <bool> dialog-open: false;
+
+    // ── Brush cursor outline state ─────────────────────────────────────────
+    // Last-known pointer position over the zoomed image, in *on-screen*
+    // pixels relative to `img`'s own top-left corner, so the outline overlay
+    // below can be drawn at the right spot. Visibility is driven by
+    // `brush-ta.has-hover` rather than a separate flag. The image-space →
+    // screen-space mapping mirrors `apply-brush`'s inverse: screen position
+    // = image position * zoom-factor.
+    property <length> brush-cursor-x: 0px;
+    property <length> brush-cursor-y: 0px;
+
+    background: #1e1e1e;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: #333333;
+    // Without this, the zoomed Image child (which is deliberately sized
+    // larger than its parent via `zoom-factor` below) paints straight over
+    // whatever sits outside the canvas instead of being cropped to it —
+    // `Rectangle` does not clip its children by default.
+    clip: true;
+
+    // ── Empty state ───────────────────────────────────────────────────────
+    if (!root.has-images) : VerticalBox {
+        alignment: center;
+        Text { text: "No Image Loaded";  color: #666666; horizontal-alignment: center; font-size: 16px; }
+        Text { text: "Click to open files"; color: #444444; horizontal-alignment: center; font-size: 12px; }
+    }
+
+    // ── Displayed image with zoom ─────────────────────────────────────────
+    // ── Touch: empty state opens file dialog ─────────────────────────────
+    if (!root.has-images) : TouchArea {
+        clicked => { root.request-open-files(); }
+    }
+
+    // ── Displayed image with zoom, scroll and drag-to-pan ─────────────────
+    if (root.has-images) : Rectangle {
+        // Whether the zoomed image actually overflows the visible viewport
+        // in either axis — i.e. whether there is anything left to pan or
+        // scroll at all. Declared in this same scope as `sv`/`img` (both
+        // only exist inside this conditional block in the first place), so
+        // `pan` below can reference it directly, the same way its own
+        // handlers already reference `sv.viewport-x` etc.
+        property <bool> image-overflows: img.width > sv.width || img.height > sv.height;
+
+        sv := ScrollView {
+            width: parent.width;
+            height: parent.height;
+            viewport-width: Math.max(parent.width, img.width);
+            viewport-height: Math.max(parent.height, img.height);
+            img := Image {
+                x: (parent.width > self.width) ? (parent.width - self.width) / 2 : 0;
+                y: (parent.height > self.height) ? (parent.height - self.height) / 2 : 0;
+                source: root.displayed-image;
+                width:  root.displayed-image.width  * 1px * root.zoom-factor;
+                height: root.displayed-image.height * 1px * root.zoom-factor;
+                image-fit: contain;
+            }
+        }
+
+        // ── Brush cursor outline ─────────────────────────────────────────
+        // Pure display: shows the current brush radius at the cursor, in
+        // *canvas* screen space (same coordinate space `brush-ta` below
+        // reports `mouse-x`/`mouse-y` in, since it's a sibling of `sv` at
+        // this same level — see `brush-ta`'s doc comment for why it can no
+        // longer live inside `img`/`sv`). Sits above `brush-ta` but must
+        // never steal pointer events from it, so it's `enabled: false` —
+        // the same "overlay that doesn't intercept" pattern `pan` uses.
+        if (root.show-aligned && brush-ta.has-hover) : Rectangle {
+            x: root.brush-cursor-x - (root.brush-size * root.zoom-factor) * 1px;
+            y: root.brush-cursor-y - (root.brush-size * root.zoom-factor) * 1px;
+            width: (root.brush-size * root.zoom-factor) * 2px;
+            height: (root.brush-size * root.zoom-factor) * 2px;
+            border-radius: self.width / 2;
+            background: transparent;
+            border-width: 1.5px;
+            border-color: #ff00ffcc;
+        }
+
+        // ── Brush TouchArea ──────────────────────────────────────────────
+        // A `ScrollView` is built on `Flickable`, which intercepts every
+        // pointer/mouse event within its bounds and does NOT propagate it
+        // to child elements underneath — including a nested `TouchArea`'s
+        // `moved`/`clicked` (see slint-ui/slint#1107 and the `Flickable`
+        // reference docs). `brush-ta` used to live inside `img` (itself
+        // inside `sv`), so every drag that should have painted a stroke
+        // was silently swallowed by the ScrollView's own drag-to-scroll
+        // handling instead — the popup would show and scroll the image,
+        // but painting was a permanent no-op. Fixed by hoisting it out to
+        // be a SIBLING of `sv`, drawn on top, exactly like `pan` below
+        // already had to be for the identical reason.
+        //
+        // Being a sibling of `sv` (not of `img`) means `mouse-x`/`mouse-y`
+        // are reported in this outer `Rectangle`'s coordinate space, not
+        // image space — the image's on-screen origin is `img.x`/`img.y`
+        // (its own centering-when-smaller-than-viewport offset) shifted by
+        // the ScrollView's current scroll position `sv.viewport-x/y`, so
+        // that offset has to be subtracted before dividing out zoom-factor
+        // to recover image pixel coordinates.
+        brush-ta := TouchArea {
+            width: parent.width;
+            height: parent.height;
+            // Only intercept drags when retouching is active AND no modal
+            // dialog is sitting on top (see `dialog-open`'s doc comment) —
+            // painting through a dialog makes no more sense than panning
+            // through one.
+            enabled: root.show-aligned && !root.dialog-open;
+            moved => {
+                root.brush-cursor-x = self.mouse-x;
+                root.brush-cursor-y = self.mouse-y;
+                root.apply-brush(
+                    Math.round((self.mouse-x - img.x - sv.viewport-x) / 1px / root.zoom-factor),
+                    Math.round((self.mouse-y - img.y - sv.viewport-y) / 1px / root.zoom-factor),
+                    root.brush-size,
+                    root.brush-opacity
+                );
+            }
+            clicked => {
+                root.apply-brush(
+                    Math.round((self.mouse-x - img.x - sv.viewport-x) / 1px / root.zoom-factor),
+                    Math.round((self.mouse-y - img.y - sv.viewport-y) / 1px / root.zoom-factor),
+                    root.brush-size,
+                    root.brush-opacity
+                );
+            }
+            // `moved` only fires while a button is pressed (it rides
+            // along with drag semantics), so pure hover tracking (no
+            // button held) needs the lower-level pointer-event hook,
+            // used here only to keep `brush-cursor-{x,y}` current on
+            // hover — never to interpret drag/click gestures (that
+            // stays in `moved`/`clicked` above).
+            pointer-event(ev) => {
+                if (ev.kind == PointerEventKind.move) {
+                    root.brush-cursor-x = self.mouse-x;
+                    root.brush-cursor-y = self.mouse-y;
+                }
+            }
+        }
+
+        // ── Drag-to-pan overlay ────────────────────────────────────────────
+        // Grabs left-drags whenever the retouch brush is NOT active ("Show
+        // Aligned" off) and moves the ScrollView viewport, so the image can
+        // be panned directly instead of via the scrollbars. Deliberately a
+        // SIBLING drawn on top of the ScrollView rather than a child of the
+        // viewport: viewport children move while panning, which would feed
+        // their own motion back into the drag delta (and, as with
+        // `brush-ta` above, a `Flickable`-based `ScrollView` never
+        // forwards pointer events to a nested child in the first place).
+        pan := TouchArea {
+            width: parent.width;
+            height: parent.height;
+            // Panning (and the grab/grabbing cursor it implies) only makes
+            // sense when: the brush isn't the active surface, no modal
+            // dialog is open on top of this canvas (see `dialog-open`'s doc
+            // comment — previously nothing stopped this TouchArea from
+            // still being hit-tested, and showing its cursor, underneath
+            // e.g. the Settings overlay), and the image actually overflows
+            // the viewport (see the sibling `image-overflows` property
+            // above — previously the zoom/pan cursor showed even when the
+            // whole image already fit on screen with nothing to scroll).
+            enabled: !root.show-aligned && !root.dialog-open && image-overflows;
+            mouse-cursor: self.pressed ? MouseCursor.grabbing : MouseCursor.grab;
+            property <length> press-viewport-x;
+            property <length> press-viewport-y;
+            // Anchor the viewport position at the moment the press starts.
+            // Uses `changed pressed` + the built-in `pressed-x`/`pressed-y`
+            // press coordinates (the canonical Slint drag-scroll pattern)
+            // rather than filtering `pointer-event`, which proved unreliable
+            // for capturing the press anchor on some platforms.
+            changed pressed => {
+                if (self.pressed) {
+                    self.press-viewport-x = sv.viewport-x;
+                    self.press-viewport-y = sv.viewport-y;
+                }
+            }
+            moved => {
+                sv.viewport-x = Math.clamp(
+                    self.press-viewport-x + (self.mouse-x - self.pressed-x),
+                    Math.min(0px, sv.width - sv.viewport-width), 0px);
+                sv.viewport-y = Math.clamp(
+                    self.press-viewport-y + (self.mouse-y - self.pressed-y),
+                    Math.min(0px, sv.height - sv.viewport-height), 0px);
+            }
+            scroll-event(ev) => {
+                // Keep wheel / trackpad scrolling working through the overlay.
+                sv.viewport-x = Math.clamp(
+                    sv.viewport-x + ev.delta-x,
+                    Math.min(0px, sv.width - sv.viewport-width), 0px);
+                sv.viewport-y = Math.clamp(
+                    sv.viewport-y + ev.delta-y,
+                    Math.min(0px, sv.height - sv.viewport-height), 0px);
+                accept
+            }
+        }
+    }
+}
+
+// ── Brush settings panel ──────────────────────────────────────────────────────
+
+component BrushSettings inherits Rectangle {
+    callback undo-stroke();
+    callback redo-stroke();
+    callback show-painted-toggled(bool);
+    background: #252526; border-radius: 8px; border-width: 1px; border-color: #333333;
+    clip: true;
+    in-out property <float> brush-size:    20.0;
+    in-out property <float> brush-opacity:  0.5;
+    in property <bool> can-undo: false;
+    in property <bool> can-redo: false;
+    // Only meaningful while retouching is active — the caller passes through
+    // the same `show-aligned` value that gates the brush TouchArea itself.
+    in property <bool> retouch-active: false;
+    in-out property <bool> show-painted: false;
+
+    VerticalBox {
+        padding: 20px; spacing: 16px;
+        VerticalBox {
+            padding: 0px; spacing: 4px;
+            Text { text: "Retouch Brush"; color: white; font-weight: 700; font-size: 16px; }
+            Text { text: "Drag on the image above to paint details back in from the other algorithm pass (or touch up this result). This popup is self-contained — browsing source frames or other results in the main window won't affect it."; color: #888888; font-size: 11px; wrap: word-wrap; }
+        }
+
+        VerticalBox {
+            spacing: 8px; padding: 0px;
+            HorizontalBox {
+                padding: 0px;
+                Text { text: "Size"; color: #cccccc; font-size: 12px; }
+                Text { text: Math.round(root.brush-size) + "px"; color: #999999; font-size: 12px; horizontal-alignment: right; }
+            }
+            Slider { minimum: 1.0; maximum: 100.0; value <=> root.brush-size; }
+        }
+
+        VerticalBox {
+            spacing: 8px; padding: 0px;
+            HorizontalBox {
+                padding: 0px;
+                Text { text: "Opacity"; color: #cccccc; font-size: 12px; }
+                Text { text: Math.round(root.brush-opacity * 100) + "%"; color: #999999; font-size: 12px; horizontal-alignment: right; }
+            }
+            Slider { minimum: 0.01; maximum: 1.0; value <=> root.brush-opacity; }
+        }
+
+        if (root.retouch-active) : HorizontalBox {
+            padding: 0px; spacing: 6px;
+            Text { text: "Show painted area"; color: #cccccc; font-size: 12px; vertical-alignment: center; }
+            Switch {
+                checked <=> root.show-painted;
+                toggled => { root.show-painted-toggled(root.show-painted); }
+            }
+        }
+
+        HorizontalBox {
+            padding: 0px; spacing: 12px; alignment: center;
+            Button { text: "Undo"; enabled: root.can-undo; height: 32px; width: 120px; clicked => { root.undo-stroke(); } }
+            Button { text: "Redo"; enabled: root.can-redo; height: 32px; width: 120px; clicked => { root.redo-stroke(); } }
+        }
+    }
+}
+
+// ── Sidebar ───────────────────────────────────────────────────────────────────
+
+component Sidebar inherits Rectangle {
+    callback recalc-memory();
+    callback file-clicked(int);
+    callback move-file-up(int);
+    callback move-file-down(int);
+    callback result-clicked(int);
+    callback remove-file(int);
+    callback remove-result(int);
+    callback save-result-as(int, string);
+    callback clear-all-files();
+    // Right-click on a result row → open the always-on-top retouch popup for
+    // that result (see `RetouchWindow` and `App.retouch-result` below).
+    callback retouch-result(int);
+    // Right-click on a Source Files row → heal from this raw, aligned
+    // (pre-fusion) frame in the currently-open retouch popup, instead of
+    // only ever being able to heal from the other fusion algorithm's
+    // result. No-op in Rust if no retouch session is currently active.
+    callback use-aligned-as-retouch-source(int);
+    // Right-click on a Results row → heal from a DIFFERENT completed
+    // result (e.g. Strata instead of the currently-wired Relief) without
+    // opening that result's own popup — swaps the donor in place.
+    callback use-result-as-retouch-source(int);
+
+    in property <[string]> loaded-files;
+    // Parallel to `loaded-files` (same length, same index order): `true` for
+    // an entry the Cull button (or a cached Cull result applied by Stack)
+    // dropped. Purely cosmetic here — the underlying `loaded-files` list is
+    // NOT filtered, so culled rows stay visible but dimmed/marked, keeping
+    // the row-index contract every other callback (`file-clicked`,
+    // `move-file-up/down`, `remove-file`) already relies on intact.
+    in property <[bool]> loaded-files-culled;
+    in property <[string]> result-files;
+    // Index (into `loaded-files`) of the frame currently being processed by
+    // the Align/Stack background thread; -1 when nothing is running. Drives
+    // both the row highlight and the auto-scroll below.
+    in property <int> current-frame-index: -1;
+    // Rough peak-memory estimate for the loaded stack (see `mem_estimate.rs`
+    // for the reasoning), recomputed whenever the file list changes.
+    in property <string> memory-estimate-text: "";
+    in property <bool> memory-warning: false;
+
+    out property <string> algo-value: algo-box.current-value;
+    // Algorithm options are supplied by Rust so the "AI Model (Neural)" entry
+    // only appears when the app was built with the `nn` feature.
+    in property <[string]> algo-options: ["Relief (Depth Map)", "Apex (Laplacian)", "Strata (Soft)", "All Three (Strata, Relief & Apex)"];
+    in property <string> align-value;
+    // Fusion AI-model picker state (populated by Rust from models filtered to
+    // `ModelEntry::is_fusion()`; empty / false when no fusion models are
+    // installed or the app was built without the `nn` feature). Backs the
+    // "AI Model (Neural)" stacking-algorithm option.
+    in property <[string]> ai-model-names;
+    in property <bool> ai-models-available;
+    in property <bool> ai-show-device;
+    in property <[string]> ai-device-names;
+    in-out property <int> ai-model-index;
+    in-out property <int> ai-device-index;
+    out property <string> ai-model-value:
+        (ai-model-names.length > 0 && ai-model-index < ai-model-names.length)
+            ? ai-model-names[ai-model-index] : "";
+    out property <string> ai-device-value:
+        (ai-device-names.length > 0 && ai-device-index < ai-device-names.length)
+            ? ai-device-names[ai-device-index] : "";
+    // Alignment AI-model picker state (populated by Rust from models filtered
+    // to `ModelEntry::is_alignment()`; empty / false when no alignment models
+    // are installed or the app was built without the `nn` feature). Backs the
+    // "Neural" alignment-mode option — kept as a SEPARATE list from
+    // `ai-model-names` above so the fusion and alignment pickers never show
+    // the other kind's models (they are not interchangeable: an alignment
+    // checkpoint cannot be loaded as a fusion model or vice versa).
+    in property <[string]> alignment-model-names;
+    in property <bool> alignment-models-available;
+    in-out property <int> alignment-model-index;
+    out property <string> alignment-model-value:
+        (alignment-model-names.length > 0 && alignment-model-index < alignment-model-names.length)
+            ? alignment-model-names[alignment-model-index] : "";
+
+    background: #252526; border-width: 1px; border-color: #333333;
+
+    VerticalBox {
+        padding: 24px; spacing: 16px; alignment: start;
+
+        Text { text: "z-stackr"; color: white; font-weight: 800; font-size: 24px; }
+
+        VerticalBox {
+            spacing: 8px; padding: 0px;
+            Text { text: "Algorithm"; color: #cccccc; font-size: 14px; font-weight: 600; }
+            algo-box := ComboBox { model: root.algo-options; current-index: 0; }
+        }
+
+        // ── Fusion AI-model picker (only relevant when "AI Model (Neural)" fusion is chosen) ──
+        // Uses `ai-model-names`, pre-filtered by Rust to `ModelEntry::is_fusion()`
+        // models only — never shows an alignment-only checkpoint here.
+        if (algo-box.current-value == "AI Model (Neural)") : VerticalBox {
+            spacing: 8px; padding: 0px;
+            Text { text: "AI model"; color: #cccccc; font-size: 14px; font-weight: 600; }
+            ai-model-box := ComboBox {
+                model: root.ai-models-available ? root.ai-model-names : ["(no models found)"];
+                enabled: root.ai-models-available;
+                current-index <=> root.ai-model-index;
+            }
+            if (root.ai-show-device) : Text { text: "Device"; color: #cccccc; font-size: 12px; }
+            if (root.ai-show-device) : ai-device-box := ComboBox {
+                model: root.ai-device-names;
+                current-index <=> root.ai-device-index;
+            }
+        }
+
+        // ── Alignment AI-model picker (only relevant when Neural alignment is chosen) ──
+        // Uses the SEPARATE `alignment-model-names` list, pre-filtered by Rust
+        // to `ModelEntry::is_alignment()` models only — an alignment picker
+        // must never offer a fusion checkpoint (it would fail to load with an
+        // architecture mismatch). Coarse full-stack neural registration is
+        // experimental and requires a trained BATCHALIGN_V1 model dropped
+        // into the models/ folder; the tooltip below explains this when no
+        // such model is installed.
+        if (root.align-value == "Neural") : VerticalBox {
+            spacing: 8px; padding: 0px;
+            Text { text: "Alignment model"; color: #cccccc; font-size: 14px; font-weight: 600; }
+            alignment-model-box := ComboBox {
+                model: root.alignment-models-available ? root.alignment-model-names : ["(no alignment models found)"];
+                enabled: root.alignment-models-available;
+                current-index <=> root.alignment-model-index;
+            }
+            Text {
+                text: "Experimental: coarse neural registration (downscaled internally to a 512px longest side). Needs a trained alignment model (batchalign-v2 or fusionalign-v1) in the models/ folder.";
+                color: #999999; font-size: 11px; wrap: word-wrap;
+            }
+            if (root.ai-show-device) : Text { text: "Device"; color: #cccccc; font-size: 12px; }
+            if (root.ai-show-device) : ComboBox {
+                model: root.ai-device-names;
+                current-index <=> root.ai-device-index;
+            }
+        }
+
+        Rectangle { height: 1px; background: #333333; }
+
+        if (root.loaded-files.length > 0) : VerticalBox {
+            padding: 0px; spacing: 8px;
+            HorizontalBox {
+                padding: 0px; alignment: space-between;
+                Text { text: "Source Files (" + root.loaded-files.length + ")"; color: #cccccc; font-size: 14px; font-weight: 600; vertical-alignment: center; }
+                TouchArea {
+                    width: 40px;
+                    clicked => { root.clear-all-files(); }
+                    Text { text: "Clear"; color: #ff5555; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+                }
+            }
+            if (root.memory-estimate-text != "") : Text {
+                text: root.memory-estimate-text;
+                color: root.memory-warning ? #ffaa33 : #777777;
+                font-size: 11px;
+                wrap: word-wrap;
+            }
+            source-scroll := ScrollView {
+                vertical-stretch: 2;
+                min-height: 250px;
+                // Mirrors `root.current-frame-index` as a property native to
+                // this element, purely so `changed` (which can only observe
+                // an element's own properties) can react to it — this
+                // ScrollView lives inside a conditional (`if loaded-files.length
+                // > 0`) branch, so its id isn't reachable from a `changed`
+                // handler declared up on `root`.
+                property <int> tracked-index: root.current-frame-index;
+                // Keep the current-frame row scrolled into view whenever it
+                // changes (e.g. once per frame during Align/Stack), without
+                // fighting the user's own scrolling the rest of the time:
+                // this only nudges `viewport-y` back into range when the
+                // highlighted row would otherwise fall outside it. 28px =
+                // the row's 24px height plus the 4px spacing between rows.
+                changed tracked-index => {
+                    if (self.tracked-index >= 0) {
+                        self.viewport-y = Math.max(
+                            -(self.tracked-index * 28px),
+                            Math.min(
+                                self.viewport-y,
+                                self.visible-height - 24px - (self.tracked-index * 28px)
+                            )
+                        );
+                    }
+                }
+                VerticalBox {
+                    padding: 0px; spacing: 4px; alignment: start;
+                    for file[idx] in root.loaded-files : row-rect := Rectangle {
+                        height: 24px;
+                        border-radius: 3px;
+                        property <bool> is-culled: idx < root.loaded-files-culled.length && root.loaded-files-culled[idx];
+                        background: idx == root.current-frame-index ? #2a4d69 : transparent;
+                        opacity: row-rect.is-culled ? 0.5 : 1.0;
+                        source-ctx := ContextMenuArea {
+                            Menu {
+                                MenuItem { title: "Use as Retouch Source (aligned)"; activated => { root.use-aligned-as-retouch-source(idx); } }
+                            }
+                            HorizontalBox {
+                                padding: 0px; spacing: 8px; height: 24px;
+                                Rectangle {
+                                    width: 16px;
+                                    TouchArea { clicked => { root.move-file-up(idx); } }
+                                    Text { text: "↑"; color: idx > 0 ? #cccccc : #444444; font-size: 14px; vertical-alignment: center; horizontal-alignment: center; }
+                                }
+                                Rectangle {
+                                    width: 16px;
+                                    TouchArea { clicked => { root.move-file-down(idx); } }
+                                    Text { text: "↓"; color: idx < root.loaded-files.length - 1 ? #cccccc : #444444; font-size: 14px; vertical-alignment: center; horizontal-alignment: center; }
+                                }
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    // Click-to-view sits on top of the ContextMenuArea and
+                                    // consumes all pointer events, including right-clicks —
+                                    // see the identical pattern/comment on the Results row
+                                    // below — so right-button presses are forwarded explicitly.
+                                    TouchArea {
+                                        clicked => { root.file-clicked(idx); }
+                                        pointer-event(ev) => {
+                                            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
+                                                source-ctx.show({ x: self.mouse-x, y: self.mouse-y });
+                                            }
+                                        }
+                                    }
+                                    Text {
+                                        text: row-rect.is-culled ? file + " (culled)" : file;
+                                        color: idx == root.current-frame-index ? #ffffff : (row-rect.is-culled ? #ff8888 : #999999);
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                Rectangle {
+                                    width: 16px;
+                                    TouchArea { clicked => { root.remove-file(idx); } }
+                                    Text { text: "×"; color: #ff5555; font-size: 16px; font-weight: 800; vertical-alignment: center; horizontal-alignment: center; }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (root.result-files.length > 0) : VerticalBox {
+            padding: 0px; spacing: 8px;
+            Text { text: "Results (" + root.result-files.length + ")"; color: #cccccc; font-size: 14px; font-weight: 600; }
+            ScrollView {
+                vertical-stretch: 1;
+                min-height: 200px;
+                VerticalBox {
+                    padding: 0px; spacing: 4px; alignment: start;
+                    for file[idx] in root.result-files : Rectangle {
+                        height: 24px;
+                        border-radius: 3px;
+                        result-ctx := ContextMenuArea {
+                            Menu {
+                                MenuItem { title: "Retouch…"; activated => { root.retouch-result(idx); } }
+                                MenuItem { title: "Use as Retouch Source"; activated => { root.use-result-as-retouch-source(idx); } }
+                                MenuItem { title: "Save as PNG"; activated => { root.save-result-as(idx, "png"); } }
+                                MenuItem { title: "Save as TIFF"; activated => { root.save-result-as(idx, "tiff"); } }
+                                MenuItem { title: "Save as JPG"; activated => { root.save-result-as(idx, "jpg"); } }
+                            }
+                            HorizontalBox {
+                                padding: 0px; spacing: 8px; height: 24px;
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    // The click-to-view TouchArea sits on top of the
+                                    // ContextMenuArea and consumes ALL pointer events,
+                                    // including right-clicks — so the context menu never
+                                    // opened. Forward right-button presses explicitly.
+                                    TouchArea {
+                                        clicked => { root.result-clicked(idx); }
+                                        pointer-event(ev) => {
+                                            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
+                                                result-ctx.show({ x: self.mouse-x, y: self.mouse-y });
+                                            }
+                                        }
+                                    }
+                                    Text { text: file; color: #00ccff; font-size: 12px; vertical-alignment: center; overflow: elide; }
+                                }
+                                Rectangle {
+                                    width: 16px;
+                                    TouchArea { clicked => { root.remove-result(idx); } }
+                                    Text { text: "×"; color: #ff5555; font-size: 16px; font-weight: 800; vertical-alignment: center; horizontal-alignment: center; }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Settings dialog (popup overlay) ──────────────────────────────────────────
+
+component SettingsDialog inherits Rectangle {
+    callback recalc-memory();
+    callback apply();
+    callback cancel();
+    callback reset-defaults();
+    callback browse-output-dir();
+    callback load-config();
+    callback save-config();
+
+    // ── Existing settings properties ──────────────────────────────────────
+    // All float so sliders bind directly.
+    // Rust converts to typed fields in pull_settings_from_ui().
+    in-out property <string> align-value:       "Registration";
+    in property <[string]> align-options:       ["Affine", "Translation", "Registration", "None"];
+    in-out property <string> optimizer-value:   "Auto";
+    in property <[string]> optimizer-options:   ["Auto", "Lucas-Kanade", "Nelder-Mead"];
+    in-out property <bool>   akaze-seeding:     false;
+    in-out property <bool>   neural-refine-classically: true;
+    in-out property <bool>   correct-brightness: true;
+    in-out property <bool>   sort-by-sharpness: true;
+    in-out property <bool>   auto-cull:         true;
+    in-out property <float>  auto-cull-threshold: 2.0;
+    in-out property <bool>   crop-to-common-area: true;
+    in-out property <bool>   resize-cropped-to-original: false;
+    in-out property <float>  stack-every-nth:   1.0;
+    // 0 = the normal in-RAM path (supports Auto-Cull + live preview); >0
+    // switches to the same out-of-core tiled pipeline the CLI always uses.
+    in-out property <float>  tile-size:         0.0;
+    in-out property <float>  pyramid-levels:    6.0;
+    in-out property <bool>   use-all-channels:  false;
+    in-out property <bool>   grit-suppression:  true;
+    in-out property <float>  relief-est-radius:   5.0;
+    in-out property <float>  relief-smooth-radius: 2.0;
+    in-out property <float>  relief-contrast-pct:  0.0;
+    in-out property <bool>   relief-show-preview:  false;
+    in-out property <bool>   relief-auto-detect:   false;
+    in-out property <bool>   relief-use-multigrid: false;
+    in-out property <float>  strata-base-radius:   31.0;
+    in-out property <float>  strata-detail-focus:  3.0;
+    // Only ever `true` when Rust set it at startup because this binary was
+    // built with the `gpu` Cargo feature AND (best-effort) a wgpu adapter
+    // looked reachable — see main.rs. The checkbox below is only shown when
+    // this is `true`, mirroring how the AI model picker only appears when
+    // `ai-models-available` is set.
+    in property <bool>       gpu-available:        false;
+    in-out property <bool>   use-gpu:              true;
+    // Only ever `true` when Rust set it at startup because this binary was
+    // built with the `nn` Cargo feature — the "Refine Neural alignment
+    // classically" row below is only shown when this is `true` (a non-`nn`
+    // build cannot select Neural alignment, so the setting would be inert).
+    in property <bool>       nn-available:         false;
+
+    // ── Preprocessing properties ──────────────────────────────────────────
+    in-out property <int>    pre-rotation:       0;
+    in-out property <bool>   pre-crop-enabled:   false;
+    in-out property <string> pre-crop-spec:      "";
+    in-out property <float>  pre-resize-percent: 100.0;
+    in-out property <bool>   sort-reverse:       false;
+    in-out property <bool>   ignore-exif:        false;
+
+    // ── Image saving properties ───────────────────────────────────────────
+    in-out property <string> output-format:      "TIFF";
+    in-out property <int>    bit-depth:          16;
+    in-out property <float>  jpeg-quality:       90.0;
+    in-out property <string> filename-template:  "{name}_stacked";
+    in-out property <string> default-output-dir: "";
+    in-out property <bool>   copy-metadata:      false;
+
+    // `live-tooltip` recomputes instantly as hover state changes, same as
+    // before. `current-tooltip` (below) only updates when `live-tooltip` is
+    // non-empty, so it *latches* onto the last real tooltip instead of
+    // reverting to a placeholder the moment the mouse leaves the icon — you
+    // can hover an icon, then move the mouse down to the display area (or
+    // scroll it) to actually read the text, and it stays put until you hover
+    // a different icon.
+    property <string> live-tooltip:
+        info-align.has-hover ? "Alignment Mode:\n'Translation' solves X/Y shift + focus-breathing scale (no rotation). 'Registration' (default) adds rotation — shift + uniform scale + rotation. 'Affine' adds separate X/Y scale + shear on top of Registration — a full 6-DOF solve. 'None' skips alignment. All modes are intensity-based (RMS); use the AKAZE-seeding switch below to tune robustness." :
+        info-akaze.has-hover ? "AKAZE seeding:\nSeed the optimiser with an AKAZE feature match before intensity refinement. Helps on textured subjects with large shifts. Off = pure intensity registration, more robust on glossy/featureless subjects." :
+        info-sort-sharpness.has-hover ? "Sort by sharpness:\nSort frames by in-focus detail before stacking, putting the sharpest frame first to use as the alignment reference." :
+        info-cull.has-hover ? "Auto-Cull Frames:\nAutomatically drops frames that are completely blurred or severely misaligned before fusion. Use the Cull threshold slider below to control how aggressive this is." :
+        info-cull-threshold.has-hover ? "Cull threshold:\nFrames winning fewer than this % of the scene's detail pixels are dropped as redundant." :
+        info-crop-common.has-hover ? "Crop to common area:\nCrops the stacked output to the largest rectangle covered by every aligned frame, removing the smeared edge-replication band caused by focus breathing and excluding it from fusion processing. Off keeps the historic full-canvas output." :
+        info-resize-cropped.has-hover ? "Restretch to original size:\nResamples the cropped result back up to the original canvas resolution using a high-quality edge-clamped spline, instead of saving the smaller cropped size. Since the crop rectangle's aspect ratio can differ slightly from the canvas, this applies a slight non-uniform (X/Y) stretch — usually sub-pixel for typical focus-breathing crops. Only takes effect while Crop to common area is on." :
+        info-correct-brightness.has-hover ? "Correct Brightness:\nApplies a per-frame brightness/gamma correction to match the reference frame." :
+        info-skip.has-hover ? "Stack every Nth frame:\nSkips frames to speed up processing. Set to 1.0 to process all frames. Set to 2.0 to process every 2nd frame." :
+        info-tile-size.has-hover ? "Tile size (out-of-core):\n0 = normal in-RAM processing (supports Auto-Cull and full live preview). Above 0, switches to the same out-of-core tiled pipeline the CLI always uses (tile edge length in pixels) — bounds peak memory regardless of stack size, but Auto-Cull and full live preview are unavailable in this mode. Use this on low-memory machines or very large/many-frame stacks." :
+        info-pyr.has-hover ? "Pyramid levels:\nControls how many frequency bands are blended. More levels blend larger features but increase processing time." :
+        info-all-color.has-hover ? "Use all color channels:\nBlends all RGB channels independently instead of using Luma only. Fixes some color fringing but is 3x slower." :
+        info-grit.has-hover ? "Grit suppression:\nAggressively filters isolated high-contrast pixels (dust/noise) from dominating the blended result in Apex." :
+        info-relief-est.has-hover ? "Estimation radius:\nRadius of the box filter used to compute the Sum-Modified Laplacian focus metric. Larger = smoother but less precise depth." :
+        info-relief-smooth.has-hover ? "Smoothing radius:\nGuided-filter engine: edge-preserving filter window radius (larger = smoother transition boundaries between differently-focused areas). Multigrid engine: Gaussian-pyramid smoothing octave budget for the depth-field solver." :
+        info-relief-contrast.has-hover ? "Contrast threshold %:\nPixels below this contrast threshold will inherit background color instead of picking the 'sharpest' source." :
+        info-relief-preview.has-hover ? "Show preview during stacking:\nPauses the Relief process and shows a popup where you can adjust the contrast threshold and see the resulting mask overlaid on the image." :
+        info-relief-auto.has-hover ? "Auto-detect optimum contrast:\nWhen showing the preview, automatically suggests a threshold from the focus-measure noise floor (median + MAD of the non-zero values)." :
+        info-relief-multigrid.has-hover ? "Use Multigrid solver:\nUse the Multigrid depth-solver instead of the standard Guided Filter fusion." :
+        info-strata-base.has-hover ? "Base radius:\nBox-filter radius separating the low-frequency \"base\" layer from the high-frequency \"detail\" layer before edge-aware guided-filter blending. Larger values widen the smooth base-layer handover between frames." :
+        info-strata-detail-focus.has-hover ? "Detail focus:\nHow aggressively the detail-layer weights are re-concentrated onto the single sharpest frame per pixel. Higher = crisper depth edges and more detail retention on deep (dozens-of-frames) stacks. Lower = smoother blending with fewer artifacts on flat/glossy subjects. 1 = original soft blending, 5 = near winner-take-all." :
+        info-pre-rot.has-hover ? "Pre-rotation:\nRotates all incoming images by 90-degree increments before any alignment or processing begins." :
+        info-pre-crop.has-hover ? "Pre-crop:\nCrops all images to a specified region before processing to save time and memory." :
+        info-pre-spec.has-hover ? "Crop spec:\nDefine the crop as 'width,height' (center crop) or 'x,y,width,height' (absolute crop)." :
+        info-pre-resize.has-hover ? "Pre-resize %:\nDownscales images by this percentage before processing. Helpful for quick previews." :
+        info-sort.has-hover ? "Reverse sort order:\nReverses the alphabetical sorting of input frames. Important if your macro rail goes front-to-back instead of back-to-front." :
+        info-exif.has-hover ? "Ignore EXIF orientation:\nDisregards the camera rotation flags inside the image files." :
+        info-out-fmt.has-hover ? "Output format:\nSaves the final stacked result as a TIFF, PNG, or JPEG." :
+        info-bit.has-hover ? "Bit depth:\nSaves the file as 16-bit (preserves vast tonal range) or 8-bit (standard web format). Note: JPEG only supports 8-bit." :
+        info-jpeg.has-hover ? "JPEG quality:\nCompression quality (1-100) used when saving JPEG files." :
+        info-template.has-hover ? "Filename template:\nPattern used to name the output file. '{name}' represents the input folder or reference filename." :
+        info-def-dir.has-hover ? "Default output dir:\nIf set, files are automatically saved here instead of prompting a 'Save As' dialog." :
+        info-copy-meta.has-hover ? "Copy metadata:\nTransfers EXIF metadata (lens, aperture, shutter speed) from the first input frame to the output file." :
+        "";
+    property <string> current-tooltip: "Hover over an ⓘ icon for detailed explanations.";
+    changed live-tooltip => {
+        if (root.live-tooltip != "") {
+            root.current-tooltip = root.live-tooltip;
+        }
+    }
+
+    // Overlay background — fills entire parent window
+    background: #00000099;
+    x: 0; y: 0;
+    width: 100%; height: 100%;
+
+    // Swallows every pointer event that lands on the backdrop (outside the
+    // centred card below) so the main-window canvas underneath — hidden
+    // behind this overlay but still present in the element tree — never
+    // sees hover/click/drag while the dialog is open. Without this, nothing
+    // stopped `ImageCanvas`'s `pan`/`brush-ta` TouchAreas from still being
+    // hit-tested "through" the backdrop, which is why the zoom/pan cursor
+    // kept showing while hovering over this dialog. Mirrors the identical
+    // `TouchArea { }` backdrop-blocker `ReliefPreviewDialog` and
+    // `SortCullStaleDialog` already use.
+    TouchArea { }
+
+    // Centre card
+    Rectangle {
+        width: 540px; height: 740px;
+        x: (parent.width  - self.width)  / 2;
+        y: (parent.height - self.height) / 2;
+        background: #252526;
+        border-radius: 12px;
+        border-width: 1px;
+        border-color: #555555;
+
+        VerticalBox {
+            padding: 28px; spacing: 0px;
+
+            // ── Header ─────────────────────────────────────────────────────
+            HorizontalBox {
+                padding: 0px; alignment: space-between; height: 40px;
+                Text { text: "Stacking Settings"; color: white; font-size: 20px; font-weight: 700; vertical-alignment: center; }
+                TouchArea {
+                    width: 28px; height: 28px;
+                    clicked => { root.cancel(); }
+                    Rectangle {
+                        background: #444444; border-radius: 14px;
+                        Text { text: "×"; color: #cccccc; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+            }
+
+            // ── Scrollable settings content ────────────────────────────────
+            ScrollView {
+                height: 620px;
+                viewport-width: 484px;
+
+                VerticalBox {
+                    padding-top: 12px; padding-bottom: 12px;
+                    padding-left: 0px; padding-right: 8px;
+                    spacing: 16px;
+
+                    // ── General ────────────────────────────────────────────
+                    VerticalBox {
+                        padding: 0px; spacing: 8px;
+                        Text { text: "GENERAL"; color: #007acc; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Rectangle { height: 1px; background: #007acc44; }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Alignment Mode"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-align := InfoIcon { tip-text: "Method used to align images before stacking. Translation solves X/Y shift + focus-breathing scale. Registration (default) adds rotation. Affine adds separate X/Y scale + shear on top of Registration. None skips alignment. All modes minimise intensity (RMS) difference."; }
+                            }
+                            ComboBox {
+                                model: root.align-options;
+                                current-value <=> root.align-value;
+                                width: 150px;
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Optimizer"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-optimizer := InfoIcon { tip-text: "Which intensity-based optimiser performs subpixel alignment refinement. Auto (default) tries the faster Lucas-Kanade optimiser first and falls back to Nelder-Mead if it fails or regresses. Lucas-Kanade and Nelder-Mead force one optimiser unconditionally. This does not change which degrees of freedom are solved — that is controlled by Alignment Mode above."; }
+                            }
+                            ComboBox {
+                                model: root.optimizer-options;
+                                current-value <=> root.optimizer-value;
+                                width: 150px;
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px;
+                            Text { text: "AKAZE seeding:"; color: #cccccc; vertical-alignment: center; }
+                            info-akaze := InfoIcon { tip-text: "Seed the optimiser with an AKAZE feature match before intensity refinement. Helps on textured subjects with large shifts. Off = pure intensity registration, more robust on glossy/featureless subjects."; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Switch {
+                                checked <=> root.akaze-seeding;
+                                toggled => { root.recalc-memory(); }
+                            }
+                        }
+
+                        if root.nn-available : HorizontalBox {
+                            padding: 0px;
+                            Text { text: "Refine Neural alignment classically:"; color: #cccccc; vertical-alignment: center; }
+                            info-neural-refine := InfoIcon { tip-text: "When Alignment Mode is 'Neural', feed the network's estimate into the same classical intensity optimiser as a seed (like AKAZE seeding does) instead of applying it directly. On by default: it degrades gracefully to classical behaviour whenever the neural estimate is poor. Turn off to benchmark the network's raw output. Only shown in builds with neural support."; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Switch {
+                                checked <=> root.neural-refine-classically;
+                            }
+                        }
+
+                        if root.gpu-available : HorizontalBox {
+                            padding: 0px;
+                            Text { text: "Use GPU acceleration:"; color: #cccccc; vertical-alignment: center; }
+                            info-use-gpu := InfoIcon { tip-text: "Accelerate Apex fusion, the alignment warp, Strata saliency and the Relief engines on the GPU (wgpu/Vulkan) when this binary was built with GPU support and a compatible adapter is available. Falls back to the CPU path transparently on any GPU failure. Only shown in GPU-enabled builds."; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Switch {
+                                checked <=> root.use-gpu;
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px;
+                            Text { text: "Correct brightness:"; color: #cccccc; vertical-alignment: center; }
+                            info-correct-brightness := InfoIcon { tip-text: "Applies a per-frame brightness/gamma correction to match the reference frame."; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Switch { checked <=> root.correct-brightness; }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Auto-Cull Frames"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-cull := InfoIcon { tip-text: "Automatically remove blurry frames from the stack."; }
+                            }
+                            Switch { checked <=> root.auto-cull; }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Sort by sharpness"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-sort-sharpness := InfoIcon { tip-text: "Sort frames by in-focus detail before stacking, putting the sharpest frame first to use as the alignment reference."; }
+                            }
+                            Switch { checked <=> root.sort-by-sharpness; }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Cull threshold"; color: root.auto-cull ? #cccccc : #555555; font-size: 13px; vertical-alignment: center; }
+                                info-cull-threshold := InfoIcon { tip-text: "Frames winning fewer than this % of the scene's detail pixels are dropped as redundant."; }
+                            }
+                            HorizontalBox {
+                                padding: 0px; spacing: 8px; width: 180px;
+                                Slider { minimum: 0.1; maximum: 5.0; step: 0.1; value <=> root.auto-cull-threshold; enabled: root.auto-cull; }
+                                Text { text: Math.round(root.auto-cull-threshold * 10) / 10 + "%"; color: #999999; font-size: 12px; vertical-alignment: center; width: 36px; }
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Crop to common area"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-crop-common := InfoIcon { tip-text: "Crops the stacked output to the largest rectangle covered by every aligned frame, removing the smeared edge-replication band from focus-breathing zoom and excluding it from fusion. Off keeps the full-canvas output."; }
+                            }
+                            Switch { checked <=> root.crop-to-common-area; }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Restretch to original size"; color: root.crop-to-common-area ? #cccccc : #555555; font-size: 13px; vertical-alignment: center; }
+                                info-resize-cropped := InfoIcon { tip-text: "Resamples the cropped result back up to the original canvas resolution instead of saving it smaller. The crop's aspect ratio can differ slightly from the canvas, so this is a slight non-uniform stretch — usually sub-pixel."; }
+                            }
+                            Switch { checked <=> root.resize-cropped-to-original; enabled: root.crop-to-common-area; }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Stack every Nth frame"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-skip := InfoIcon { tip-text: "Stack only every Nth frame to save time."; }
+                            }
+                            HorizontalBox {
+                                padding: 0px; spacing: 8px; width: 180px;
+                                Slider { minimum: 1.0; maximum: 10.0; value <=> root.stack-every-nth; }
+                                Text { text: Math.round(root.stack-every-nth) + ""; color: #999999; font-size: 12px; vertical-alignment: center; width: 20px; }
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Tile size (0 = off)"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-tile-size := InfoIcon { tip-text: "0 = normal in-RAM processing (Auto-Cull + live preview). Above 0, uses the CLI's out-of-core tiled engine instead — bounded memory, but no Auto-Cull or full live preview. For low-memory machines or very large stacks."; }
+                            }
+                            HorizontalBox {
+                                padding: 0px; spacing: 8px; width: 180px;
+                                Slider { minimum: 0.0; maximum: 2048.0; value <=> root.tile-size; }
+                                Text { text: Math.round(root.tile-size) + ""; color: #999999; font-size: 12px; vertical-alignment: center; width: 32px; }
+                            }
+                        }
+                    }
+
+                    // ── Apex ───────────────────────────────────────────────
+                    VerticalBox {
+                        padding: 0px; spacing: 8px;
+                        Text { text: "APEX (LAPLACIAN PYRAMID)"; color: #007acc; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Rectangle { height: 1px; background: #007acc44; }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Pyramid levels"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-pyr := InfoIcon { tip-text: "Number of Laplacian pyramid levels. Higher values preserve larger structures but may increase halos."; }
+                            }
+                            HorizontalBox {
+                                padding: 0px; spacing: 8px; width: 180px;
+                                Slider { minimum: 2.0; maximum: 12.0; value <=> root.pyramid-levels; }
+                                Text { text: Math.round(root.pyramid-levels) + ""; color: #999999; font-size: 12px; vertical-alignment: center; width: 20px; }
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Use all color channels"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-all-color := InfoIcon { tip-text: "Compute focus measure using all color channels (slower but more accurate on colored details) instead of just luminance."; }
+                            }
+                            Switch { checked <=> root.use-all-channels; }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Grit suppression"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-grit := InfoIcon { tip-text: "Apply spatial smoothing to the highest frequency band to suppress grit and noise."; }
+                            }
+                            Switch { checked <=> root.grit-suppression; }
+                        }
+                    }
+
+                    // ── Relief ───────────────────────────────────────────────
+                    VerticalBox {
+                        padding: 0px; spacing: 8px;
+                        Text { text: "RELIEF (DEPTH MAP)"; color: #007acc; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Rectangle { height: 1px; background: #007acc44; }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Estimation radius"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-relief-est := InfoIcon { tip-text: "Radius for Sum-Modified-Laplacian (SML) focus measure estimation. Higher values handle noisier images better but reduce precision."; }
+                            }
+                            HorizontalBox {
+                                padding: 0px; spacing: 8px; width: 180px;
+                                Slider { minimum: 0.0; maximum: 100.0; value <=> root.relief-est-radius; }
+                                Text { text: Math.round(root.relief-est-radius) + ""; color: #999999; font-size: 12px; vertical-alignment: center; width: 28px; }
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Smoothing radius"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-relief-smooth := InfoIcon { tip-text: "Guided-filter engine: filter window radius. Multigrid engine: Gaussian-pyramid smoothing octave budget. Higher values reduce artifacts at object boundaries."; }
+                            }
+                            HorizontalBox {
+                                padding: 0px; spacing: 8px; width: 180px;
+                                Slider { minimum: 0.0; maximum: 50.0; value <=> root.relief-smooth-radius; }
+                                Text { text: Math.round(root.relief-smooth-radius) + ""; color: #999999; font-size: 12px; vertical-alignment: center; width: 28px; }
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Contrast threshold %"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-relief-contrast := InfoIcon { tip-text: "Threshold percentage for determining in-focus pixels. Lower values include more out-of-focus background."; }
+                            }
+                            HorizontalBox {
+                                padding: 0px; spacing: 8px; width: 180px;
+                                Slider { minimum: 0.0; maximum: 1.0; value <=> root.relief-contrast-pct; }
+                                Text { text: Math.round(root.relief-contrast-pct * 100) + "%"; color: #999999; font-size: 12px; vertical-alignment: center; width: 28px; }
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Show preview during stacking"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-relief-preview := InfoIcon { tip-text: "Show live preview of the depth map mask during adjustments. Only applies to GUI."; }
+                            }
+                            Switch { checked <=> root.relief-show-preview; }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Auto-detect optimum contrast"; color: root.relief-show-preview ? #cccccc : #555555; font-size: 13px; vertical-alignment: center; }
+                                info-relief-auto := InfoIcon { tip-text: "Automatically detect the contrast threshold from the focus-measure noise floor (median + MAD of the non-zero values)."; }
+                            }
+                            Switch { checked <=> root.relief-auto-detect; enabled: root.relief-show-preview; }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Use Multigrid solver"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-relief-multigrid := InfoIcon { tip-text: "Use the Multigrid depth-solver instead of the standard Guided Filter fusion."; }
+                            }
+                            Switch { checked <=> root.relief-use-multigrid; }
+                        }
+                    }
+
+                    // ── Strata ─────────────────────────────────────────────
+                    VerticalBox {
+                        padding: 0px; spacing: 8px;
+                        Text { text: "STRATA (GUIDED FUSION)"; color: #007acc; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Rectangle { height: 1px; background: #007acc44; }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Base radius"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-strata-base := InfoIcon { tip-text: "Box-filter radius separating the base (low-frequency) layer from the detail (high-frequency) layer. Soft edge-aware blending of all frames; fewer halos at depth edges; best for subjects between Relief's smooth surfaces and Apex's dense bristles."; }
+                            }
+                            HorizontalBox {
+                                padding: 0px; spacing: 8px; width: 180px;
+                                Slider { minimum: 8.0; maximum: 64.0; value <=> root.strata-base-radius; }
+                                Text { text: Math.round(root.strata-base-radius) + ""; color: #999999; font-size: 12px; vertical-alignment: center; width: 28px; }
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Detail focus"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-strata-detail-focus := InfoIcon { tip-text: "How aggressively the detail-layer weights are re-concentrated onto the single sharpest frame per pixel. Higher = crisper depth edges and more detail retention on deep stacks. Lower = smoother blending with fewer artifacts on flat/glossy subjects. 1 = original soft blending, 5 = near winner-take-all."; }
+                            }
+                            HorizontalBox {
+                                padding: 0px; spacing: 8px; width: 180px;
+                                Slider { minimum: 1.0; maximum: 5.0; value <=> root.strata-detail-focus; }
+                                Text { text: Math.round(root.strata-detail-focus) + ""; color: #999999; font-size: 12px; vertical-alignment: center; width: 28px; }
+                            }
+                        }
+                    }
+
+                    // ── Preprocessing ──────────────────────────────────────
+                    VerticalBox {
+                        padding: 0px; spacing: 8px;
+                        Text { text: "PREPROCESSING"; color: #007acc; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Rectangle { height: 1px; background: #007acc44; }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Pre-rotation"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-pre-rot := InfoIcon { tip-text: "Rotate images by a fixed angle before processing."; }
+                            }
+                            ComboBox {
+                                // index 0=0°, 1=90°, 2=180°, 3=270° — wired to pre-rotation as index*90
+                                model: ["0°", "90°", "180°", "270°"];
+                                current-index: root.pre-rotation / 90;
+                                selected(val) => {
+                                    if (val == "0°")   { root.pre-rotation = 0;   }
+                                    if (val == "90°")  { root.pre-rotation = 90;  }
+                                    if (val == "180°") { root.pre-rotation = 180; }
+                                    if (val == "270°") { root.pre-rotation = 270; }
+                                }
+                                width: 100px;
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Pre-crop"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-pre-crop := InfoIcon { tip-text: "Enable cropping images before processing."; }
+                            }
+                            Switch { checked <=> root.pre-crop-enabled; }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Crop spec (w,h or x,y,w,h)"; color: root.pre-crop-enabled ? #cccccc : #555555; font-size: 13px; vertical-alignment: center; }
+                                info-pre-spec := InfoIcon { tip-text: "Crop specification: either 'width,height' for a centered crop, or 'x,y,width,height' for a specific region."; }
+                            }
+                            LineEdit {
+                                text <=> root.pre-crop-spec;
+                                enabled: root.pre-crop-enabled;
+                                placeholder-text: "e.g. 1920,1080";
+                                width: 160px;
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Pre-resize %"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-pre-resize := InfoIcon { tip-text: "Scale images down to a percentage of their original size before processing."; }
+                            }
+                            HorizontalBox {
+                                padding: 0px; spacing: 8px; width: 180px;
+                                Slider { minimum: 10.0; maximum: 100.0; value <=> root.pre-resize-percent; }
+                                Text { text: Math.round(root.pre-resize-percent) + "%"; color: #999999; font-size: 12px; vertical-alignment: center; width: 36px; }
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Reverse sort order"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-sort := InfoIcon { tip-text: "Reverse the order of frames during stacking. Useful if the stack was shot front-to-back."; }
+                            }
+                            Switch { checked <=> root.sort-reverse; }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Ignore EXIF orientation"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-exif := InfoIcon { tip-text: "Ignore EXIF orientation tags and process images as stored. Required for some raw converters."; }
+                            }
+                            Switch { checked <=> root.ignore-exif; }
+                        }
+                    }
+
+                    // ── Image Saving ───────────────────────────────────────
+                    VerticalBox {
+                        padding: 0px; spacing: 8px;
+                        Text { text: "IMAGE SAVING"; color: #007acc; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Rectangle { height: 1px; background: #007acc44; }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Output format"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-out-fmt := InfoIcon { tip-text: "File format for the final stacked image."; }
+                            }
+                            ComboBox {
+                                model: ["TIFF", "PNG", "JPEG"];
+                                current-value <=> root.output-format;
+                                width: 100px;
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Bit depth"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-bit := InfoIcon { tip-text: "Color bit depth. 16-bit preserves more tonal detail but creates larger files."; }
+                            }
+                            ComboBox {
+                                // index 0 = 16-bit, index 1 = 8-bit
+                                model: ["16-bit", "8-bit"];
+                                current-index: root.bit-depth == 16 ? 0 : 1;
+                                selected(val) => {
+                                    if (val == "16-bit") { root.bit-depth = 16; }
+                                    if (val == "8-bit")  { root.bit-depth = 8;  }
+                                }
+                                width: 100px;
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "JPEG quality"; color: root.output-format == "JPEG" ? #cccccc : #555555; font-size: 13px; vertical-alignment: center; }
+                                info-jpeg := InfoIcon { tip-text: "Quality level for JPEG output. 100 is best quality, largest file."; }
+                            }
+                            HorizontalBox {
+                                padding: 0px; spacing: 8px; width: 180px;
+                                Slider {
+                                    minimum: 1.0; maximum: 100.0;
+                                    value <=> root.jpeg-quality;
+                                    enabled: root.output-format == "JPEG";
+                                }
+                                Text { text: Math.round(root.jpeg-quality) + ""; color: #999999; font-size: 12px; vertical-alignment: center; width: 28px; }
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Filename template"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-template := InfoIcon {}
+                            }
+                            LineEdit {
+                                text <=> root.filename-template;
+                                placeholder-text: "{name}_stacked";
+                                width: 160px;
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Default output dir"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-def-dir := InfoIcon {}
+                            }
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px; width: 220px;
+                                LineEdit {
+                                    text <=> root.default-output-dir;
+                                    placeholder-text: "Ask each time";
+                                    horizontal-stretch: 1;
+                                }
+                                Button {
+                                    text: "Browse…";
+                                    height: 28px;
+                                    clicked => { root.browse-output-dir(); }
+                                }
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px; alignment: space-between;
+                            HorizontalBox {
+                                padding: 0px; spacing: 6px;
+                                Text { text: "Copy metadata to output"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                                info-copy-meta := InfoIcon {}
+                            }
+                            Switch { checked <=> root.copy-metadata; }
+                        }
+                    }
+                }
+            }
+
+            // ── Tooltip Display ────────────────────────────────────────────
+            // Taller than a typical one-line status bar, and scrollable, so
+            // even the longest tooltip text is always fully reachable rather
+            // than clipped against the dialog's edge.
+            //
+            // Layout note: a bare Text inside a ScrollView defaults to the
+            // viewport's (visible) height, so long wrapped tooltips were
+            // CLIPPED instead of scrollable. Pinning `viewport-width` to the
+            // visible width and wrapping the Text in a VerticalLayout makes
+            // the viewport height track the wrapped text's real height, so
+            // the ScrollView actually scrolls.
+            Rectangle {
+                height: 96px;
+                background: #1e1e1e;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: #444444;
+                ScrollView {
+                    x: 6px; y: 6px;
+                    width: parent.width - 12px; height: parent.height - 12px;
+                    viewport-width: self.width - 12px;
+                    VerticalLayout {
+                        padding: 0px;
+                        Text {
+                            text: root.current-tooltip;
+                            color: #e0e0e0;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+
+            // ── Buttons ────────────────────────────────────────────────────
+            HorizontalBox {
+                padding-top: 12px; padding-bottom: 0px;
+                padding-left: 0px; padding-right: 0px;
+                spacing: 12px; alignment: space-between;
+                HorizontalBox {
+                    padding: 0px; spacing: 12px;
+                    Button { text: "Load Config"; height: 36px; clicked => { root.load-config(); } }
+                    Button { text: "Save Config"; height: 36px; clicked => { root.save-config(); } }
+                }
+                HorizontalBox {
+                    padding: 0px; spacing: 12px;
+                    Button { text: "Reset to Defaults"; height: 36px; clicked => { root.reset-defaults(); } }
+                    Button { text: "Cancel"; height: 36px; clicked => { root.cancel(); } }
+                    Button { text: "Apply"; primary: true; height: 36px; clicked => { root.apply(); } }
+                }
+            }
+        }
+    }
+}
+
+// ── Sort/Cull stale-cache confirmation dialog ─────────────────────────────────
+// Structured like `ReliefPreviewDialog` below: a dimming backdrop behind a
+// centred card, with the two possible responses as buttons. Shown when the
+// Stack background thread finds a cached Sort/Cull result whose fingerprint
+// no longer matches the current inputs/settings (see `SortCullPromptContext`
+// and `decide_sort_cull` in main.rs).
+component SortCullStaleDialog inherits Rectangle {
+    in property <string> reason;
+    callback run-again();
+    callback keep-as-is();
+
+    // Overlay backdrop — fills the entire parent window, same explicit
+    // full-fill pattern `SettingsDialog` uses (rather than relying on the
+    // implicit top-level-child fill Slint applies here anyway), so the
+    // centered card below has a well-defined `parent.width`/`parent.height`
+    // to centre itself against.
+    background: #000000aa;
+    x: 0; y: 0;
+    width: 100%; height: 100%;
+    TouchArea { }
+
+    // Compact centred card. Previously this had no `x`/`y` (so it rendered
+    // pinned at the top-left instead of centred) and no `height` (so its
+    // only sizing came from content, with nothing stopping it from being
+    // stretched) — together these made the dialog appear to span the full
+    // main window instead of a small centred box. Mirrors
+    // `SettingsDialog`'s centred-card pattern: explicit `x`/`y` centring.
+    // NOTE: this card is a plain Rectangle positioned via explicit x/y, not
+    // managed by any enclosing layout — `preferred-height`/`max-height`
+    // hints (the previous approach here) are non-binding on an element
+    // like that; nothing actually enforces them, so the card fell back to
+    // being stretched by its VerticalBox child to fill most of the window
+    // (tall vertical buttons and all). `SettingsDialog`/`ReliefPreviewDialog`
+    // both use a plain fixed `height:` for exactly this reason — matching
+    // that proven pattern here instead.
+    Rectangle {
+        width: 460px;
+        height: 220px;
+        x: (parent.width  - self.width)  / 2;
+        y: (parent.height - self.height) / 2;
+        background: #252526;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: #333333;
+
+        VerticalBox {
+            padding: 20px;
+            spacing: 16px;
+
+            Text {
+                text: "Sort/Cull results are out of date";
+                color: white; font-weight: 700; font-size: 16px;
+                wrap: word-wrap;
+            }
+            Text {
+                text: "Input files or settings changed since Sort/Cull ran" + (root.reason != "" ? " (" + root.reason + ")" : "") + " — run again?";
+                color: #cccccc; font-size: 13px; wrap: word-wrap;
+            }
+
+            HorizontalBox {
+                alignment: end;
+                spacing: 16px;
+                Button { text: "Keep as is"; clicked => { root.keep-as-is(); } }
+                Button { text: "Run again"; primary: true; clicked => { root.run-again(); } }
+            }
+        }
+    }
+}
+
+// Save-options popup for picture-set project files (see `src/project.rs`).
+// Same backdrop + centred-card pattern as `SortCullStaleDialog` above; the
+// three axes (settings/sources/outputs) are each independently optional,
+// per the requirement that none of them is forced.
+component SaveProjectDialog inherits Rectangle {
+    // include-settings, embed-sources, embed-outputs, include-rebrush-history
+    callback save(bool, bool, bool, bool);
+    callback cancel();
+
+    // Set by `App` from `can-save-rebrush-history`, itself computed fresh
+    // by Rust right before this dialog opens (see `on_request_save_project`
+    // in `callbacks/project.rs`) — `false` whenever there's no retouch
+    // session, or one exists but nothing has actually been painted yet.
+    in property <bool> show-rebrush-history-option: false;
+
+    property <bool> include-settings: true;
+    property <bool> embed-sources: false;
+    property <bool> embed-outputs: true;
+    property <bool> include-rebrush-history: false;
+
+    background: #000000aa;
+    x: 0; y: 0;
+    width: 100%; height: 100%;
+    TouchArea { }
+
+    Rectangle {
+        width: 440px;
+        // Plain fixed height, not preferred-height/max-height: this card is
+        // a plain Rectangle positioned via explicit x/y, not managed by an
+        // enclosing layout, so those hints wouldn't self-enforce here (see
+        // the identical bug just fixed on `SortCullStaleDialog` above) —
+        // matching `SettingsDialog`/`ReliefPreviewDialog`'s proven fixed-
+        // size pattern instead.
+        height: root.show-rebrush-history-option ? 340px : 300px;
+        x: (parent.width  - self.width)  / 2;
+        y: (parent.height - self.height) / 2;
+        background: #252526;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: #333333;
+
+        VerticalBox {
+            padding: 20px;
+            spacing: 14px;
+
+            Text {
+                text: "Save Picture Set";
+                color: white; font-weight: 700; font-size: 16px;
+            }
+            Text {
+                text: "Sources and outputs are always referenced by their current file path. Embedding additionally copies the bytes into the project file, so it stays fully openable even if the originals move or are deleted.";
+                color: #999999; font-size: 12px; wrap: word-wrap;
+            }
+
+            CheckBox { text: "Include settings"; checked <=> root.include-settings; }
+            CheckBox { text: "Embed source images"; checked <=> root.embed-sources; }
+            CheckBox { text: "Embed output image(s)"; checked <=> root.embed-outputs; }
+            if (root.show-rebrush-history-option) : CheckBox {
+                text: "Save rebrush (undo/redo) history";
+                checked <=> root.include-rebrush-history;
+            }
+
+            HorizontalBox {
+                alignment: end;
+                spacing: 16px;
+                Button { text: "Cancel"; clicked => { root.cancel(); } }
+                Button {
+                    text: "Save…";
+                    primary: true;
+                    clicked => {
+                        root.save(
+                            root.include-settings,
+                            root.embed-sources,
+                            root.embed-outputs,
+                            root.show-rebrush-history-option && root.include-rebrush-history,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Root App window ───────────────────────────────────────────────────────────
+
+component ReliefPreviewDialog inherits Rectangle {
+    in-out property <float> contrast-pct;
+    in property <image> preview-image;
+    callback apply();
+    callback cancel();
+    callback auto-detect();
+    callback contrast-changed();
+
+    background: #000000aa;
+    TouchArea { }
+
+    Rectangle {
+        width: 800px;
+        height: 600px;
+        background: #252526;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: #333333;
+
+        VerticalBox {
+            padding: 16px;
+            spacing: 16px;
+
+            Text { text: ""; color: white; font-weight: 700; font-size: 16px; }
+
+            Image {
+                source: root.preview-image;
+                image-fit: contain;
+                vertical-stretch: 1;
+            }
+
+            HorizontalBox {
+                alignment: start;
+                spacing: 16px;
+                Text { text: "Contrast Threshold:"; color: #cccccc; vertical-alignment: center; }
+                Slider {
+                    minimum: 0.0;
+                    maximum: 1.0;
+                    width: 300px;
+                    value <=> root.contrast-pct;
+                    changed => { root.contrast-changed(); }
+                }
+                Text { text: Math.round(root.contrast-pct * 100) + "%"; color: white; vertical-alignment: center; }
+                
+                Button {
+                    text: "Auto-Detect";
+                    clicked => { root.auto-detect(); }
+                }
+            }
+
+            HorizontalBox {
+                alignment: end;
+                spacing: 16px;
+                Button { text: "Cancel Pipeline"; clicked => { root.cancel(); } }
+                Button { text: "Continue"; primary: true; clicked => { root.apply(); } }
+            }
+        }
+    }
+}
+
+export component App inherits Window {
+    // ── Callbacks ─────────────────────────────────────────────────────────
+    callback request-open-files();
+    callback recalc-memory();
+    callback move-file-up(int);
+    callback move-file-down(int);
+    callback remove-result(int);
+    callback save-result-as(int, string);
+    callback file-clicked(int);
+    callback result-clicked(int);
+    // Right-click on a result row (forwarded from `Sidebar.retouch-result`)
+    // opens the always-on-top `RetouchWindow` popup for that result — see
+    // `callbacks::retouch_window::wire` in Rust. The brush itself (apply/
+    // undo/redo/show-painted) is wired directly against `RetouchWindow`'s
+    // own callbacks/properties now, not `App`'s — see that component below.
+    callback retouch-result(int);
+    callback use-aligned-as-retouch-source(int);
+    callback use-result-as-retouch-source(int);
+    callback save-current-image();
+    callback save-current-image-as(string); // "png" | "tiff" | "jpg"
+    callback remove-file(int);
+    callback clear-all-files();
+    // AI integration state, set from Rust (cfg `nn`); inert otherwise.
+    in property <[string]> algo-options: ["Relief (Depth Map)", "Apex (Laplacian)", "Strata (Soft)", "All Three (Strata, Relief & Apex)"];
+    in property <[string]> ai-model-names;
+    in property <bool> ai-models-available;
+    in property <bool> ai-show-device;
+    in property <[string]> ai-device-names;
+    in property <[string]> alignment-model-names;
+    in property <bool> alignment-models-available;
+    in property <[string]> align-options: ["Affine", "Translation", "Registration", "None"];
+    in property <[string]> optimizer-options: ["Auto", "Lucas-Kanade", "Nelder-Mead"];
+    // GPU integration state, set from Rust (cfg `gpu`); inert otherwise —
+    // mirrors the `ai-models-available` pattern above.
+    in property <bool> gpu-available;
+    // NN build capability, set from Rust (cfg `nn`); inert otherwise. Gates
+    // settings UI that only makes sense when Neural alignment is selectable.
+    in property <bool> nn-available;
+    callback request-stack(string, string, string, string);   // algo, ai-model, ai-device, alignment-model
+    callback align-clicked(string, string);             // run alignment-only pass (alignment-model, ai-device)
+    // Run the sort-by-sharpness ordering pass standalone (aligning first, or
+    // reusing a matching AlignedCache) and reorder `loaded-files` to match.
+    // Independent of the "Sort by sharpness" / "Auto-Cull Frames" Settings
+    // toggles: this always sorts, and preserves an existing fresh Cull
+    // result rather than reading either toggle (see `button_run_flags` in
+    // main.rs). Stack will reuse this result (skip its own Sort pass) as
+    // long as the Sort-Cull fingerprint still matches when Stack is pressed.
+    callback request-sort(string, string);               // alignment-model, ai-device
+    // Run the auto-cull scoring pass standalone (threshold from
+    // `set-auto-cull-threshold-pct`) and mark culled entries in
+    // `loaded-files-culled`. Independent of the Settings toggles the same
+    // way `request-sort` is (always culls; preserves an existing fresh Sort
+    // result). Stack will reuse this result the same way `request-sort` is
+    // reused.
+    callback request-cull(string, string);                // alignment-model, ai-device
+    callback settings-apply();
+    callback settings-cancel();
+    callback settings-reset-defaults();
+    callback open-settings();
+    callback zoom-in();
+    callback zoom-out();
+    callback zoom-100();
+    callback browse-output-dir();
+    callback start-monitor();
+    callback stop-monitor();
+    callback load-config();
+    callback save-config();
+    // Requests that whichever long-running background operation is currently
+    // in flight (Align or Stack) stop at its next checkpoint. A single
+    // callback is enough since only one such operation can run at a time —
+    // both buttons that start one are disabled while `is-processing` is true.
+    callback cancel-processing();
+
+    // ── Display properties ────────────────────────────────────────────────
+    in-out property <bool>     has-images;
+    in-out property <[string]> loaded-files;
+    // Parallel to `loaded-files` — see `Sidebar.loaded-files-culled`.
+    in-out property <[bool]>   loaded-files-culled;
+    in-out property <[string]> result-files;
+    in-out property <image>    displayed-image;
+    in-out property <float>    progress;
+    in-out property <float>    step-progress;
+    in-out property <string>   status: "Ready";
+    in-out property <int>      frame-count: 0;
+    in-out property <string>   elapsed-text: "";
+    in-out property <float>    zoom-factor: 1.0;
+    // ── Auto-fit on image load ────────────────────────────────────────────
+    // Whenever a *differently sized* image arrives (file selected, result
+    // opened, crop-changing live preview), reset the zoom so the whole image
+    // is visible ("Fit"). Same-size updates — retouch brush strokes, Apex
+    // preview refreshes — keep the user's current zoom untouched.
+    property <int> auto-fit-src-w: 0;
+    property <int> auto-fit-src-h: 0;
+    changed displayed-image => {
+        if (self.displayed-image.width > 0 && self.displayed-image.height > 0
+            && (self.displayed-image.width != self.auto-fit-src-w
+                || self.displayed-image.height != self.auto-fit-src-h)) {
+            self.auto-fit-src-w = self.displayed-image.width;
+            self.auto-fit-src-h = self.displayed-image.height;
+            self.zoom-factor = Math.min(
+                canvas.width  / (self.displayed-image.width  * 1px),
+                canvas.height / (self.displayed-image.height * 1px));
+        }
+    }
+    in-out property <bool>     is-monitoring: false;
+    // True while the Align-only or Stack pipeline is running in its
+    // background thread; drives the Cancel button and disables the buttons
+    // that would start a second, overlapping run.
+    in-out property <bool>     is-processing: false;
+    // Index (into `loaded-files`) of the frame the Align/Stack background
+    // thread is currently working on; -1 when idle. Forwarded to the
+    // Sidebar to highlight + auto-scroll to that row.
+    in-out property <int>      current-frame-index: -1;
+    // Rough peak-memory estimate for the loaded stack; forwarded to the
+    // Sidebar. See `mem_estimate.rs` for what it does and doesn't account for.
+    in-out property <string>   memory-estimate-text: "";
+    in-out property <bool>     memory-warning: false;
+
+    // ── Existing settings properties (all float for direct slider binding) ─
+    in-out property <string> set-alignment:              "Affine";
+    in-out property <string> set-optimizer:              "Auto";
+    in-out property <bool>   set-akaze-seeding:          false;
+    in-out property <bool>   set-neural-refine-classically: true;
+    in-out property <bool>   set-correct-brightness:     true;
+    in-out property <bool>   set-auto-cull:              true;
+    in-out property <bool>   set-sort-by-sharpness:      true;
+    in-out property <float>  set-auto-cull-threshold-pct: 2.0;
+    in-out property <bool>   set-crop-to-common-area:    true;
+    in-out property <bool>   set-resize-cropped-to-original: false;
+    in-out property <float>  set-stack-every-nth:        1.0;
+    in-out property <float>  set-tile-size:              0.0;
+    in-out property <float>  set-pyramid-levels:         6.0;
+    in-out property <bool>   set-use-all-color-channels: false;
+    in-out property <bool>   set-grit-suppression:       true;
+    in-out property <float>  set-relief-estimation-radius: 5.0;
+    in-out property <float>  set-relief-smoothing-radius:  2.0;
+    in-out property <float>  set-relief-contrast-pct:      0.0;
+    in-out property <bool>   set-relief-show-preview:      false;
+    in-out property <bool>   set-relief-auto-detect:       false;
+    in-out property <bool>   set-relief-use-multigrid:     false;
+    in-out property <float>  set-strata-base-radius:       31.0;
+    in-out property <float>  set-strata-detail-focus:      3.0;
+    in-out property <bool>   set-use-gpu:                  true;
+
+    // ── Relief Preview properties ───────────────────────────────────────────
+    in-out property <bool> relief-preview-open: false;
+    in-out property <image> relief-preview-image;
+    callback relief-preview-apply();
+    callback relief-preview-cancel();
+    callback relief-preview-auto-detect();
+    callback relief-preview-contrast-changed();
+
+    // ── Sort/Cull stale-cache confirmation popup ──────────────────────────
+    // Opened by the Stack background thread (via `SortCullPromptContext`,
+    // mirroring the Relief preview popup's cross-thread pattern) when a
+    // cached Sort/Cull result exists but its fingerprint no longer matches
+    // the current inputs/settings.
+    in-out property <bool> sort-cull-stale-open: false;
+    // Human-readable reason the cache went stale (e.g. "Source files
+    // changed" or "Settings changed"), set by Rust before opening the popup.
+    in-out property <string> sort-cull-stale-reason: "";
+    callback sort-cull-stale-run-again();
+    callback sort-cull-stale-keep-as-is();
+
+    // ── Picture-set project save/load (see `src/project.rs`) ─────────────
+    in-out property <bool> save-project-open: false;
+    // Whether the active retouch session has any actually-painted pixels —
+    // computed fresh by Rust in `on_request_save_project`, just before the
+    // dialog opens, and used to gate whether it even offers the "save
+    // rebrush history" checkbox at all.
+    in-out property <bool> can-save-rebrush-history: false;
+    callback request-save-project();
+    // include-settings, embed-sources, embed-outputs, include-rebrush-history
+    callback confirm-save-project(bool, bool, bool, bool);
+    callback load-project-requested();
+
+    // ── Preprocessing properties ──────────────────────────────────────────
+    in-out property <int>    set-pre-rotation:       0;
+    in-out property <bool>   set-pre-crop-enabled:   false;
+    in-out property <string> set-pre-crop-spec:      "";
+    in-out property <float>  set-pre-resize-percent: 100.0;
+    in-out property <bool>   set-sort-reverse:       false;
+    in-out property <bool>   set-ignore-exif:        false;
+
+    // ── Image saving properties ───────────────────────────────────────────
+    in-out property <string> set-output-format:      "TIFF";
+    in-out property <int>    set-bit-depth:          16;
+    in-out property <float>  set-jpeg-quality:       90.0;
+    in-out property <string> set-filename-template:  "{name}_stacked";
+    in-out property <string> set-default-output-dir: "";
+    in-out property <bool>   set-copy-metadata:      false;
+
+    // ── Align / show-aligned ──────────────────────────────────────────────
+    in-out property <bool> show-aligned: false;
+    // Emitted when the Show-Aligned switch flips so the currently-viewed image
+    // can be re-rendered immediately (aligned vs. source) without re-clicking.
+    callback refresh-view();
+
+    // ── Dialog visibility ─────────────────────────────────────────────────
+    in-out property <bool> dialog-open: false;
+
+    // Use preferred-* (not fixed width/height) so the window is resizable; a
+    // generous default plus a sensible minimum keeps the bottom status/
+    // progress panel fully visible. The retouch brush panel that used to
+    // sit alongside it now lives only in the `RetouchWindow` popup.
+    preferred-width: 1680px; preferred-height: 1080px;
+    min-width: 1120px; min-height: 900px;
+    title: "z-stackr"; background: #181818;
+
+    VerticalBox {
+        padding: 0px; spacing: 0px;
+
+        // ── Top toolbar ───────────────────────────────────────────────────
+        Rectangle {
+            height: 52px;
+            background: #2d2d2d;
+
+            HorizontalBox {
+                padding-left: 16px; padding-right: 16px; padding-top: 8px; padding-bottom: 8px;
+                spacing: 8px; alignment: start;
+
+                Button {
+                    text: "Open Files";
+                    height: 36px;
+                    clicked => { root.request-open-files(); }
+                }
+
+                Button {
+                    text: "Settings";
+                    height: 36px;
+                    clicked => {
+                        root.dialog-open = true;
+                        root.open-settings();
+                    }
+                }
+
+                Rectangle { width: 8px; }
+
+                Button {
+                    text: "Start Stacking";
+                    primary: true;
+                    height: 36px;
+                    enabled: root.has-images && !root.is-monitoring && !root.is-processing;
+                    clicked => { root.request-stack(sidebar.algo-value, sidebar.ai-model-value, sidebar.ai-device-value, sidebar.alignment-model-value); }
+                }
+
+                Button {
+                    text: root.is-monitoring ? "Stop Monitor" : "Live Monitor";
+                    height: 36px;
+                    clicked => {
+                        if (root.is-monitoring) {
+                            root.stop-monitor();
+                        } else {
+                            root.start-monitor();
+                        }
+                    }
+                }
+
+                Rectangle { width: 8px; }
+
+                Button {
+                    text: "Align";
+                    height: 36px;
+                    enabled: root.has-images && !root.is-monitoring && !root.is-processing;
+                    clicked => { root.align-clicked(sidebar.alignment-model-value, sidebar.ai-device-value); }
+                }
+
+                ToolbarButtonWithTip {
+                    text: "Sort";
+                    height: 36px;
+                    enabled: root.has-images && !root.is-monitoring && !root.is-processing;
+                    // Runs the sort-by-sharpness ordering pass standalone
+                    // (aligning first if needed) and reorders the file list
+                    // to match. Independent of the "Sort by sharpness" /
+                    // "Auto-Cull Frames" Settings toggles — this button
+                    // always sorts regardless of how they're set. Stack
+                    // reuses this result instead of re-sorting, as long as
+                    // nothing relevant changed.
+                    tip: "Sort by sharpness now and reorder the file list — runs independently of the Sort/Auto-Cull toggles in Settings. Stack will reuse this result instead of re-sorting, as long as the files/settings haven't changed since.";
+                    clicked => { root.request-sort(sidebar.alignment-model-value, sidebar.ai-device-value); }
+                }
+
+                ToolbarButtonWithTip {
+                    text: "Cull";
+                    height: 36px;
+                    enabled: root.has-images && !root.is-monitoring && !root.is-processing;
+                    // Runs the auto-cull scoring pass standalone, using the
+                    // Cull-threshold slider in Settings, and marks the
+                    // dropped frames in the file list (dimmed, "(culled)").
+                    // Independent of the "Sort by sharpness" / "Auto-Cull
+                    // Frames" Settings toggles — this button always culls
+                    // regardless of how they're set. Stack reuses this
+                    // result instead of re-culling, as long as nothing
+                    // relevant changed.
+                    tip: "Auto-cull low-detail frames now (using the Cull-threshold slider in Settings) and mark them in the file list — runs independently of the Sort/Auto-Cull toggles in Settings. Stack will reuse this result instead of re-culling, as long as the files/settings haven't changed since.";
+                    clicked => { root.request-cull(sidebar.alignment-model-value, sidebar.ai-device-value); }
+                }
+
+                if (root.is-processing) : Button {
+                    text: "Cancel";
+                    height: 36px;
+                    clicked => { root.cancel-processing(); }
+                }
+
+                HorizontalBox {
+                    padding: 0px; spacing: 6px; alignment: center;
+                    Text { text: "Show Aligned"; color: #cccccc; font-size: 13px; vertical-alignment: center; }
+                    Switch { checked <=> root.show-aligned; toggled => { root.refresh-view(); } }
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                ContextMenuArea {
+                    Menu {
+                        MenuItem { title: "Save as PNG"; activated => { root.save-current-image-as("png"); } }
+                        MenuItem { title: "Save as TIFF"; activated => { root.save-current-image-as("tiff"); } }
+                        MenuItem { title: "Save as JPG"; activated => { root.save-current-image-as("jpg"); } }
+                    }
+                    Button {
+                        text: "Save";
+                        height: 36px;
+                        clicked => { root.save-current-image(); }
+                    }
+                }
+
+                Rectangle { width: 8px; }
+
+                Button {
+                    text: "Save Project…";
+                    height: 36px;
+                    clicked => { root.request-save-project(); }
+                }
+                Button {
+                    text: "Load Project…";
+                    height: 36px;
+                    clicked => { root.load-project-requested(); }
+                }
+            }
+
+            // Bottom separator line
+            Rectangle {
+                y: parent.height - 1px;
+                height: 1px;
+                background: #3a3a3a;
+            }
+        }
+
+        // ── Main content row ──────────────────────────────────────────────
+        HorizontalBox {
+            padding: 0px; spacing: 0px;
+            vertical-stretch: 1;
+
+            sidebar := Sidebar {
+                width: 280px;
+                loaded-files: root.loaded-files;
+                loaded-files-culled: root.loaded-files-culled;
+                result-files: root.result-files;
+                current-frame-index: root.current-frame-index;
+                memory-estimate-text: root.memory-estimate-text;
+                memory-warning: root.memory-warning;
+                algo-options: root.algo-options;
+                align-value: root.set-alignment;
+                ai-model-names: root.ai-model-names;
+                ai-models-available: root.ai-models-available;
+                ai-show-device: root.ai-show-device;
+                ai-device-names: root.ai-device-names;
+                alignment-model-names: root.alignment-model-names;
+                alignment-models-available: root.alignment-models-available;
+                recalc-memory       => { root.recalc-memory(); }
+                file-clicked(idx)   => { root.file-clicked(idx); }
+                move-file-up(idx)   => { root.move-file-up(idx); }
+                move-file-down(idx) => { root.move-file-down(idx); }
+                result-clicked(idx) => { root.result-clicked(idx); }
+                remove-file(idx)    => { root.remove-file(idx); }
+                remove-result(idx)  => { root.remove-result(idx); }
+                save-result-as(idx, fmt) => { root.save-result-as(idx, fmt); }
+                retouch-result(idx) => { root.retouch-result(idx); }
+                use-aligned-as-retouch-source(idx) => { root.use-aligned-as-retouch-source(idx); }
+                use-result-as-retouch-source(idx)  => { root.use-result-as-retouch-source(idx); }
+                clear-all-files     => { root.clear-all-files(); }
+            }
+
+            VerticalBox {
+                padding: 16px; spacing: 12px;
+
+                // ── Canvas ─────────────────────────────────────────────
+                // The retouch brush now lives exclusively in the
+                // `RetouchWindow` popup (see below) — this main-window
+                // canvas is browse-only: the brush TouchArea, its cursor
+                // outline, and the drag-to-pan-vs-brush gate all key off
+                // `ImageCanvas.show-aligned`, so it is hard-pinned to
+                // `false` here rather than bound to `root.show-aligned`
+                // (which remains the donor "Show Aligned" *preview* toggle
+                // used by the sidebar/file-click flow, now fully decoupled
+                // from brush activation). Panning is therefore always on
+                // in this canvas, regardless of the Show Aligned switch.
+                canvas := ImageCanvas {
+                    has-images:      root.has-images;
+                    displayed-image: root.displayed-image;
+                    zoom-factor:     root.zoom-factor;
+                    show-aligned:    false;
+                    dialog-open:     root.dialog-open;
+                    request-open-files      => { root.request-open-files(); }
+                }
+
+                // ── Zoom controls ───────────────────────────────────────
+                HorizontalBox {
+                    padding: 0px; spacing: 8px; alignment: center; height: 36px;
+                    // Computed here (not round-tripped through Rust) because the
+                    // fit ratio depends on the canvas's on-screen size and the
+                    // loaded image's intrinsic pixel size, both of which are
+                    // only naturally available on the Slint side.
+                    Button {
+                        text: "Fit"; height: 32px; width: 48px;
+                        clicked => {
+                            if (canvas.displayed-image.width > 0 && canvas.displayed-image.height > 0) {
+                                root.zoom-factor = Math.min(
+                                    canvas.width  / (canvas.displayed-image.width  * 1px),
+                                    canvas.height / (canvas.displayed-image.height * 1px)
+                                );
+                            }
+                        }
+                    }
+                    Button { text: "100%"; height: 32px; width: 52px; clicked => { root.zoom-100(); } }
+                    Button { text: "-";    height: 32px; width: 32px; clicked => { root.zoom-out(); } }
+                    Text {
+                        text: Math.round(root.zoom-factor * 100) + "%";
+                        color: #999999; font-size: 13px; vertical-alignment: center;
+                        width: 44px; horizontal-alignment: center;
+                    }
+                    Button { text: "+"; height: 32px; width: 32px; clicked => { root.zoom-in(); } }
+                }
+
+                // ── Progress panel ───────────────────────────────────────
+                // The brush panel that used to sit alongside this (undo/
+                // redo, size/opacity, "show painted area") now lives only
+                // in the `RetouchWindow` popup — see "Right-click on a
+                // Results entry" in the README's retouch section.
+                Rectangle {
+                    height: 260px;
+                    background: #252526; border-radius: 8px; border-width: 1px; border-color: #333333;
+                    VerticalBox {
+                        padding: 16px; spacing: 12px;
+                        Text { text: "Status"; color: white; font-weight: 700; font-size: 16px; }
+                        Rectangle {
+                            vertical-stretch: 1;
+                            background: #1e1e1e;
+                            border-radius: 4px;
+                            border-width: 1px;
+                            border-color: #333333;
+                            VerticalBox {
+                                padding: 12px;
+                                alignment: center;
+                                Text {
+                                    text: root.status; color: #4fc1ff; font-size: 16px; font-weight: 600;
+                                    horizontal-alignment: center; wrap: word-wrap;
+                                }
+                            }
+                        }
+                        HorizontalBox {
+                            padding: 0px;
+                            Text { text: "Total Progress"; color: #888888; font-size: 12px; vertical-alignment: center; }
+                            Text { text: Math.round(root.progress * 100) + "%"; color: #007acc; font-size: 14px; font-weight: 600; horizontal-alignment: right; }
+                        }
+                        Rectangle {
+                            height: 8px; background: #333333; border-radius: 4px;
+                            Rectangle { x: 0; width: parent.width * root.progress; height: 100%; background: #007acc; border-radius: 4px; }
+                        }
+                        HorizontalBox {
+                            padding: 0px;
+                            Text { text: "Step Progress"; color: #888888; font-size: 12px; vertical-alignment: center; }
+                            Text { text: Math.round(root.step-progress * 100) + "%"; color: #007acc; font-size: 14px; font-weight: 600; horizontal-alignment: right; }
+                        }
+                        Rectangle {
+                            height: 8px; background: #333333; border-radius: 4px;
+                            Rectangle { x: 0; width: parent.width * root.step-progress; height: 100%; background: #007acc; border-radius: 4px; }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Status bar ────────────────────────────────────────────────────
+        Rectangle {
+            height: 28px;
+            background: #1a1a1a;
+
+            // Top separator line
+            Rectangle {
+                y: 0;
+                height: 1px;
+                background: #333333;
+            }
+
+            HorizontalBox {
+                padding-left: 16px; padding-right: 16px; padding-top: 5px; padding-bottom: 4px;
+                spacing: 16px; alignment: start;
+
+                Text { text: root.status; color: #888888; font-size: 11px; vertical-alignment: center; horizontal-stretch: 1; }
+
+                if (root.frame-count > 0) : Text {
+                    text: root.frame-count + " frames";
+                    color: #666666; font-size: 11px; vertical-alignment: center;
+                }
+                if (root.elapsed-text != "") : Text {
+                    text: root.elapsed-text;
+                    color: #666666; font-size: 11px; vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    // ── Settings dialog overlay ───────────────────────────────────────────
+    if (root.dialog-open) : SettingsDialog {
+        recalc-memory => { root.recalc-memory(); }
+        // Existing bindings
+        align-value        <=> root.set-alignment;
+        align-options      : root.align-options;
+        optimizer-value    <=> root.set-optimizer;
+        optimizer-options  : root.optimizer-options;
+        akaze-seeding      <=> root.set-akaze-seeding;
+        neural-refine-classically <=> root.set-neural-refine-classically;
+        correct-brightness <=> root.set-correct-brightness;
+        sort-by-sharpness  <=> root.set-sort-by-sharpness;
+        auto-cull          <=> root.set-auto-cull;
+        auto-cull-threshold <=> root.set-auto-cull-threshold-pct;
+        crop-to-common-area <=> root.set-crop-to-common-area;
+        resize-cropped-to-original <=> root.set-resize-cropped-to-original;
+        stack-every-nth    <=> root.set-stack-every-nth;
+        tile-size          <=> root.set-tile-size;
+        pyramid-levels     <=> root.set-pyramid-levels;
+        use-all-channels   <=> root.set-use-all-color-channels;
+        grit-suppression   <=> root.set-grit-suppression;
+        relief-est-radius    <=> root.set-relief-estimation-radius;
+        relief-smooth-radius <=> root.set-relief-smoothing-radius;
+        relief-contrast-pct  <=> root.set-relief-contrast-pct;
+        relief-show-preview  <=> root.set-relief-show-preview;
+        relief-auto-detect   <=> root.set-relief-auto-detect;
+        relief-use-multigrid <=> root.set-relief-use-multigrid;
+        strata-base-radius <=> root.set-strata-base-radius;
+        strata-detail-focus <=> root.set-strata-detail-focus;
+        gpu-available      : root.gpu-available;
+        nn-available       : root.nn-available;
+        use-gpu            <=> root.set-use-gpu;
+
+        // Preprocessing bindings
+        pre-rotation       <=> root.set-pre-rotation;
+        pre-crop-enabled   <=> root.set-pre-crop-enabled;
+        pre-crop-spec      <=> root.set-pre-crop-spec;
+        pre-resize-percent <=> root.set-pre-resize-percent;
+        sort-reverse       <=> root.set-sort-reverse;
+        ignore-exif        <=> root.set-ignore-exif;
+
+        // Image saving bindings
+        output-format      <=> root.set-output-format;
+        bit-depth          <=> root.set-bit-depth;
+        jpeg-quality       <=> root.set-jpeg-quality;
+        filename-template  <=> root.set-filename-template;
+        default-output-dir <=> root.set-default-output-dir;
+        copy-metadata      <=> root.set-copy-metadata;
+
+        apply() => {
+            root.dialog-open = false;
+            root.settings-apply();
+        }
+        cancel() => {
+            root.dialog-open = false;
+            root.settings-cancel();
+        }
+        reset-defaults() => {
+            root.settings-reset-defaults();
+        }
+        browse-output-dir() => {
+            root.browse-output-dir();
+        }
+        load-config() => {
+            root.load-config();
+        }
+        save-config() => {
+            root.save-config();
+        }
+    }
+
+    if (root.relief-preview-open) : ReliefPreviewDialog {
+        contrast-pct <=> root.set-relief-contrast-pct;
+        preview-image <=> root.relief-preview-image;
+        apply => { root.relief-preview-apply(); }
+        cancel => { root.relief-preview-cancel(); }
+        auto-detect => { root.relief-preview-auto-detect(); }
+        contrast-changed => { root.relief-preview-contrast-changed(); }
+    }
+
+    if (root.sort-cull-stale-open) : SortCullStaleDialog {
+        reason: root.sort-cull-stale-reason;
+        run-again => { root.sort-cull-stale-run-again(); }
+        keep-as-is => { root.sort-cull-stale-keep-as-is(); }
+    }
+
+    if (root.save-project-open) : SaveProjectDialog {
+        show-rebrush-history-option: root.can-save-rebrush-history;
+        save(inc, emb-src, emb-out, inc-history) => {
+            root.save-project-open = false;
+            root.confirm-save-project(inc, emb-src, emb-out, inc-history);
+        }
+        cancel => { root.save-project-open = false; }
+    }
+}
+
+// ── Retouch popup window ───────────────────────────────────────────────────────
+// A separate always-on-top top-level window (instantiated from Rust via
+// `RetouchWindow::new()` — see `callbacks::retouch_window::wire`) hosting the
+// retouch brush UI that used to live inline in the main `App` window: the
+// live composite (reusing `ImageCanvas`, brush always active here — unlike
+// the main window's canvas, which now hard-disables it), and the
+// `BrushSettings` panel (size/opacity/undo/redo/"show painted area").
+//
+// Donor selection stays entirely in the main window (source-file clicks +
+// "Show Aligned" preview); this window only ever displays and paints the
+// live retouch composite for whichever result the user right-clicked. Rust
+// keeps exactly one instance alive across opens (see the Rust doc comment on
+// `wire`) rather than constructing a new window per right-click.
+export component RetouchWindow inherits Window {
+    callback apply-brush(int, int, float, float);
+    callback undo-stroke();
+    callback redo-stroke();
+    callback show-painted-toggled(bool);
+    // Emitted when the window is closed (titlebar close button, Alt+F4,
+    // etc.) so Rust can park/end the retouch session exactly the way
+    // leaving retouch mode already does today — see the Rust wiring's doc
+    // comment for the exact semantics preserved here.
+    callback closed();
+
+    in property <bool> has-images: false;
+    in property <image> retouch-image;
+    in-out property <float> brush-size: 20.0;
+    in-out property <float> brush-opacity: 0.5;
+    in property <bool> can-undo: false;
+    in property <bool> can-redo: false;
+    in-out property <bool> show-painted: false;
+    in-out property <float> zoom-factor: 1.0;
+
+    // Always-on-top is NOT a declarative Slint `Window` property in 1.17 —
+    // it is applied from Rust after construction via
+    // `i_slint_backend_winit::WinitWindowAccessor::with_winit_window` +
+    // `winit::window::Window::set_window_level(WindowLevel::AlwaysOnTop)`
+    // (see `callbacks::retouch_window::wire`).
+    title: "Retouch";
+    preferred-width: 900px;
+    preferred-height: 760px;
+    min-width: 560px;
+    min-height: 520px;
+    background: #181818;
+
+    VerticalBox {
+        padding: 16px; spacing: 12px;
+
+        canvas := ImageCanvas {
+            vertical-stretch: 1;
+            has-images:      root.has-images;
+            displayed-image: root.retouch-image;
+            zoom-factor:     root.zoom-factor;
+            brush-size    <=> root.brush-size;
+            brush-opacity <=> root.brush-opacity;
+            // Always active in this popup — this is the ONLY place the
+            // brush lives now, so it is never gated behind a separate
+            // toggle the way the old in-window canvas gated it behind
+            // "Show Aligned".
+            show-aligned: true;
+            apply-brush(x, y, r, o) => { root.apply-brush(x, y, r, o); }
+        }
+
+        HorizontalBox {
+            padding: 0px; spacing: 8px; alignment: center; height: 36px;
+            Button {
+                text: "Fit"; height: 32px; width: 48px;
+                clicked => {
+                    if (canvas.displayed-image.width > 0 && canvas.displayed-image.height > 0) {
+                        root.zoom-factor = Math.min(
+                            canvas.width  / (canvas.displayed-image.width  * 1px),
+                            canvas.height / (canvas.displayed-image.height * 1px)
+                        );
+                    }
+                }
+            }
+            Button { text: "100%"; height: 32px; width: 52px; clicked => { root.zoom-factor = 1.0; } }
+            Text {
+                text: Math.round(root.zoom-factor * 100) + "%";
+                color: #999999; font-size: 13px; vertical-alignment: center;
+                width: 44px; horizontal-alignment: center;
+            }
+        }
+
+        BrushSettings {
+            height: 260px;
+            brush-size    <=> root.brush-size;
+            brush-opacity <=> root.brush-opacity;
+            can-undo: root.can-undo;
+            can-redo: root.can-redo;
+            // Always the active retouch surface — no "only meaningful
+            // while retouch-active" gate is needed here, unlike the old
+            // in-window instantiation (which gated it on `show-aligned`).
+            retouch-active: true;
+            show-painted <=> root.show-painted;
+            undo-stroke => { root.undo-stroke(); }
+            redo-stroke => { root.redo-stroke(); }
+            show-painted-toggled(v) => { root.show-painted-toggled(v); }
+        }
+    }
+
+    // Note: there is no Slint-side "on close requested" element to wire up
+    // here — Rust intercepts the real windowing-system close request
+    // directly via `RetouchWindow::window().on_close_requested(...)`
+    // (`slint::Window::on_close_requested`, called once right after
+    // construction in `callbacks::retouch_window::wire`), decides there
+    // whether to hide the window immediately or first park/end the retouch
+    // session, and only then calls `.hide()`. The `closed()` callback
+    // declared above is available for any future Slint-side "Close" button
+    // inside this window to trigger the exact same Rust-side cleanup path;
+    // none is added in this window today since the OS titlebar's close
+    // button already covers it.
+}

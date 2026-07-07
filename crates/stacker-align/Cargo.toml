@@ -1,0 +1,62 @@
+[package]
+name = "z-stackr-align"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "Subpixel image alignment for the z-stackr focus-stacking suite: bounded multi-scale intensity registration, optional AKAZE+RANSAC seeding, focus-breathing correction and per-frame brightness matching"
+readme = "README.md"
+repository = { workspace = true }
+keywords = ["focus-stacking", "image-registration", "alignment", "macro"]
+categories = ["multimedia::images", "computer-vision"]
+
+[lib]
+name = "stacker_align"
+
+[dependencies]
+z-stackr-core = { workspace = true }
+akaze = { version = "0.7.0", optional = true }
+# `akaze` 0.7 is pinned to image 0.23 and its `extract()` takes that
+# version's `DynamicImage`. The workspace is on image 0.25, so the AKAZE
+# boundary converts via raw bytes into this version-scoped dependency —
+# see `akaze_match::luma_to_akaze_input`. Only pulled in with the `akaze`
+# feature; no codecs needed (default-features off).
+image023 = { package = "image", version = "0.23.14", default-features = false, optional = true }
+## Pinned to the exact line `akaze` 0.7.0 depends on (`^0.2.3`) — `bitarray`
+## is not semver-linked across its 0.x lines (0.10.0 and 0.2.x are separate,
+## mutually-incompatible types despite sharing the crate name), and this
+## crate's own `pub type Descriptor = BitArray<64>` alias (`akaze_match.rs`)
+## must resolve to the SAME `BitArray<64>` that `Akaze::extract()` returns,
+## or every call site in `akaze_match.rs` fails to type-check (`cargo clippy
+## --workspace --all-targets`, which builds this crate with the `akaze`
+## feature on via the GUI's default features, catches this immediately).
+bitarray = "0.2.6"
+inlier = { version = "0.1", optional = true }
+imageproc = "0.27.0"
+nalgebra = { workspace = true }
+image = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
+
+[features]
+default = []
+# GPU-accelerated production warp (`transform::gpu`, engaged internally by
+# `transform::warp_image_clamped`), gated so a default build stays pure-CPU/
+# SIMD. Forwards `z-stackr-core/gpu` — see that crate's `gpu` module docs for
+# why the wgpu context helper is shared rather than duplicated per crate.
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "z-stackr-core/gpu"]
+akaze = ["dep:akaze", "dep:inlier", "dep:image023"]
+# Marker feature mirroring `z-stackr-core/nn`: exists so this crate's
+# `AlignmentModeSetting` matches can name the `Neural` variant explicitly
+# (via `#[cfg(feature = "nn")]`) and stay exhaustive whenever a downstream
+# crate (GUI/CLI/pipeline built with `--features nn`) unifies `z-stackr-core`'s
+# `nn` feature on across the build graph. This crate never dispatches neural
+# alignment itself — that stays the caller's responsibility (see
+# `align_frame`'s docs) — so enabling this feature pulls in no ML deps.
+nn = ["z-stackr-core/nn"]
+
+[lints]
+workspace = true

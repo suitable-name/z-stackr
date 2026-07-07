@@ -1,0 +1,67 @@
+[package]
+name = "z-stackr-cli"
+version = "1.0.0"
+edition = { workspace = true }
+license = { workspace = true }
+description = "Command-line focus stacking: align and fuse macro/micro image stacks (Apex, dual-engine Relief, optional neural mode) with bounded out-of-core memory use"
+readme = "README.md"
+repository = { workspace = true }
+keywords = ["focus-stacking", "macro", "photography", "cli"]
+categories = ["command-line-utilities", "multimedia::images"]
+
+[lib]
+name = "stacker_cli"
+
+[[bin]]
+name = "z-stackr"
+path = "src/main.rs"
+
+[dependencies]
+toml = { workspace = true }
+z-stackr-core = { workspace = true }
+# The out-of-core tiled pipeline itself (alignment, fusion, tiling, encode)
+# lives in z-stackr-pipeline so the CLI and GUI call exactly the same code —
+# see that crate's docs. The CLI no longer depends on z-stackr-align /
+# z-stackr-algo / z-stackr-nn directly; it only builds `PipelineParams` and
+# renders progress.
+z-stackr-pipeline = { workspace = true }
+clap = { version = "4.6.1", features = ["derive"] }
+image = { workspace = true }
+smol = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+notify = { workspace = true }
+indicatif = "0.18.6"
+
+[features]
+default = []
+akaze = ["z-stackr-pipeline/akaze"]
+# AI ("neural") stacking mode on the CPU (ndarray) backend.
+nn = ["z-stackr-pipeline/nn"]
+# Adds the wgpu/Vulkan GPU backend to the AI mode (implies `nn`).
+nn-gpu = ["nn", "z-stackr-pipeline/nn-gpu"]
+# Pure-Rust RAW image support (see `z-stackr-core::io`'s module docs). The
+# CLI depends only on `z-stackr-pipeline` (never `z-stackr-core` directly),
+# so forwarding through that single edge is enough — unlike the GUI, which
+# must forward through both.
+raw = ["z-stackr-pipeline/raw"]
+# GPU-accelerated tiled/batch Apex fusion, production warp, Strata saliency
+# and Relief guided-filter/multigrid (see
+# `docs/gpu_acceleration_summary.md`). Forwards `z-stackr-pipeline/gpu` (the
+# actual compute paths, via `z-stackr-algo`/`z-stackr-align`) AND
+# `z-stackr-core/gpu` directly, since `main.rs` calls
+# `stacker_core::gpu::set_enabled` itself (the runtime `--no-gpu`/
+# `use_gpu`-setting toggle) and `z-stackr-core` is already a direct
+# dependency of this crate (for `StackingSettings`) — both edges must be
+# forwarded or the toggle call site fails to compile under `--features gpu`.
+gpu = ["z-stackr-pipeline/gpu", "z-stackr-core/gpu"]
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+tikv-jemallocator = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+mimalloc = { workspace = true }
+
+[lints]
+workspace = true

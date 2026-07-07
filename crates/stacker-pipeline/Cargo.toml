@@ -1,0 +1,57 @@
+[package]
+name = "z-stackr-pipeline"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "The shared out-of-core tiled focus-stacking pipeline for the z-stackr suite: alignment pre-pass, tile store, per-tile fusion orchestration and output encoding"
+readme = "README.md"
+repository = { workspace = true }
+keywords = ["focus-stacking", "image-processing", "out-of-core", "tiling"]
+categories = ["multimedia::images", "computer-vision"]
+
+[lib]
+name = "stacker_pipeline"
+
+[dependencies]
+z-stackr-core = { workspace = true }
+z-stackr-align = { workspace = true }
+z-stackr-algo = { workspace = true }
+z-stackr-nn = { workspace = true, optional = true, default-features = false, features = ["ndarray"] }
+image = { workspace = true }
+rayon = { workspace = true }
+smol = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Bulk byte<->typed-slice casts for the RAW frame-cache blob format
+# (`src/cache.rs`), mirroring `stacker_core::memory::TileManager`'s style.
+bytemuck = "1.25"
+
+[features]
+default = []
+akaze = ["z-stackr-align/akaze"]
+# AI ("neural") stacking mode on the CPU (ndarray) backend.
+# `z-stackr-align/nn` must be enabled together with `z-stackr-core/nn`:
+# feature unification makes core's `Neural` variant exist for every crate in
+# the build graph, and stacker-align's exhaustive `AlignmentModeSetting`
+# matches only compile their `Neural` arms under its own `nn` marker feature.
+nn = ["dep:z-stackr-nn", "z-stackr-core/nn", "z-stackr-align/nn"]
+# Adds the wgpu/Vulkan GPU backend to the AI mode (implies `nn`).
+nn-gpu = ["nn", "z-stackr-nn/wgpu"]
+# Pure-Rust RAW image support (see `z-stackr-core::io`'s module docs). This
+# crate owns the decode-once cache that makes RAW practical for the tiled
+# pipeline (see `src/cache.rs`'s `FrameCache` docs) but the actual `rawler`
+# dependency lives in `z-stackr-core`, so this is a pure forward.
+raw = ["z-stackr-core/raw"]
+# GPU-accelerated tiled/batch Apex fusion, production warp, Strata saliency
+# and Relief guided-filter/multigrid (see
+# `docs/gpu_acceleration_summary.md`). Forwards `z-stackr-algo/gpu` and
+# `z-stackr-align/gpu` (the actual compute paths) AND `z-stackr-core/gpu`
+# directly, since `run_pipeline` itself calls
+# `stacker_core::gpu::set_enabled` once per run (the
+# `StackingSettings::use_gpu` runtime toggle) before any stacking work
+# starts. Never in this crate's own default set, so a default pipeline
+# build stays pure-CPU/SIMD and has no `wgpu` dependency at all.
+gpu = ["z-stackr-algo/gpu", "z-stackr-align/gpu", "z-stackr-core/gpu"]
+
+[lints]
+workspace = true

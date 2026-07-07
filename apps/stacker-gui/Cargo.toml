@@ -1,0 +1,107 @@
+[package]
+name = "z-stackr-gui"
+version = "1.0.1"
+edition = { workspace = true }
+build = "build.rs"
+license = { workspace = true }
+description = "Slint-based desktop GUI for the z-stackr focus-stacking suite: visual alignment, live fusion previews, Relief threshold tuning and retouching"
+readme = "README.md"
+repository = { workspace = true }
+keywords = ["focus-stacking", "macro", "photography", "gui"]
+categories = ["multimedia::images", "gui"]
+
+[lib]
+name = "stacker_gui"
+
+[dependencies]
+nalgebra = { workspace = true }
+z-stackr-core = { workspace = true }
+z-stackr-align = { workspace = true }
+z-stackr-algo = { workspace = true }
+z-stackr-pipeline = { workspace = true }
+z-stackr-nn = { workspace = true, optional = true, default-features = false, features = ["ndarray"] }
+slint = "1.17.0"
+# Used only to put the retouch popup window into always-on-top mode via
+# `WinitWindowAccessor::with_winit_window` + `winit::window::Window::
+# set_window_level` (see `src/callbacks/retouch_window.rs`) — the public
+# `slint::Window` API has no cross-platform "always on top" call. Version-
+# pinned to match the `slint` dependency above, per this crate's own
+# semver-exempt version-pinning requirement.
+i-slint-backend-winit = "1.17.0"
+smol = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+rfd = "0.17.2"
+image = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+directories = "6.0.0"
+notify = "8.2.0"
+# Only used to read total system RAM for the peak-memory estimate/warning
+# shown next to the loaded file list (see `mem_estimate.rs`).
+sysinfo = "0.39.5"
+# Picture-set project files (`.zsproj`, see `src/project.rs`). The original
+# `bincode` crate is unmaintained (its maintainer stepped away following a
+# harassment incident; the final crates.io release is a deliberate compiler
+# error to flag this) — `bincode-next` is a wire-compatible community fork
+# under active maintenance. It's a young, small-maintainer project (not the
+# decades-long track record `zstd`/`serde` have), so worth re-evaluating
+# this pin if it goes quiet; `rkyv` was the other candidate but its
+# zero-copy design buys nothing here (the manifest is read/written whole,
+# never memory-mapped) at the cost of a stricter schema-evolution story for
+# a format meant to stay readable across app versions.
+bincode-next = { version = "3.1.1", features = ["serde"] }
+# Compresses only the project manifest (settings/paths/retouch alpha
+# floats) — embedded image bytes are stored raw, see `src/project.rs`'s
+# module doc comment for why. The standard bindings to the C `zstd`
+# library: mature, extremely widely used, safe choice; pulls in a C
+# compiler at build time same as this crate's `rawler`/`wgpu` deps already
+# do indirectly, so it's not a new category of build requirement.
+zstd = "0.13"
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+tikv-jemallocator = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+mimalloc = { workspace = true }
+
+[features]
+# AKAZE feature matching is an *optional accelerator* that seeds the
+# intensity-based aligner. It is on by default but the GUI builds and aligns
+# correctly with `--no-default-features` (pure intensity registration).
+default = ["akaze"]
+akaze = ["z-stackr-align/akaze", "z-stackr-pipeline/akaze"]
+# AI ("neural") stacking mode on the CPU (ndarray) backend.
+# Enables the marker/forwarding features across the whole build graph —
+# `z-stackr-align/nn` so its `AlignmentModeSetting` matches stay exhaustive
+# once core's `Neural` variant exists, and `z-stackr-pipeline/nn` so the
+# tiled pipeline path offers the same neural modes as the in-RAM GUI path.
+nn = ["dep:z-stackr-nn", "z-stackr-core/nn", "z-stackr-align/nn", "z-stackr-pipeline/nn"]
+# Adds the wgpu/Vulkan GPU backend to the AI mode (implies `nn`).
+nn-gpu = ["nn", "z-stackr-nn/wgpu"]
+# Pure-Rust RAW image support (see `z-stackr-core::io`'s module docs). The
+# GUI depends on both `z-stackr-core` (its own in-RAM load path) and
+# `z-stackr-pipeline` (the tiled path) directly, so both edges must be
+# forwarded — an incomplete forward here would silently give the two load
+# paths different RAW capability within the same binary.
+raw = ["z-stackr-core/raw", "z-stackr-pipeline/raw"]
+# GPU-accelerated tiled/batch Apex fusion, production warp, Strata saliency
+# and Relief guided-filter/multigrid (see
+# `docs/gpu_acceleration_summary.md`). The GUI depends on `z-stackr-align`
+# and `z-stackr-algo` directly (its own in-RAM path) as well as
+# `z-stackr-pipeline` (the tiled path) and `z-stackr-core` (both paths, plus
+# the runtime `set_enabled`/`gpu_available` toggle calls in `main.rs`), so
+# all four edges are forwarded — same reasoning as the `raw` forward above:
+# an incomplete forward would silently give the two Stack paths different
+# GPU capability within the same binary. The "Use GPU acceleration" Settings
+# checkbox (`gpu-available` in app.slint) is only ever shown in a build with
+# this feature on.
+gpu = ["z-stackr-align/gpu", "z-stackr-algo/gpu", "z-stackr-pipeline/gpu", "z-stackr-core/gpu"]
+
+[build-dependencies]
+slint-build = "1.17.0"
+
+[lints]
+workspace = true
