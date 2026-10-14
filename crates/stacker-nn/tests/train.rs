@@ -1,25 +1,22 @@
 //! Integration tests for the rollout training primitives in
 //! [`stacker_nn::train`].
+#![cfg(all(feature = "ndarray", feature = "autodiff"))]
 
 use burn::{
     backend::{Autodiff, NdArray},
+    optim::AdamWConfig,
     prelude::{Backend, Tensor},
     tensor::Distribution,
 };
-use image::RgbImage;
 use stacker_nn::{
-    data::{AlignSequence, MergeSample},
-    loss::{BatchAlignmentLossConfig, FocusFusionLossConfig, PairAlignmentLossConfig},
-    model::{BatchAlignNetConfig, FocusMergeNetConfig, FusionAlignNetConfig},
-    train::{align_loss, cosine_lr, fusion_align_loss, rollout_loss, scheduled_sampling_prob},
+    data::MergeSample,
+    loss::FocusFusionLossConfig,
+    model::{FocusMergeNet, FocusMergeNetConfig, ModelSize},
+    train::{cosine_lr, rollout_loss, rollout_train, scheduled_sampling_prob},
 };
 
 /// Build a random `MergeSample<Bk>` of spatial size `h x w`.
-fn rand_sample<Bk: Backend>(
-    h: usize,
-    w: usize,
-    device: &burn::prelude::Device<Bk>,
-) -> MergeSample<Bk> {
+fn rand_sample<Bk: Backend>(h: usize, w: usize, device: &Bk::Device) -> MergeSample<Bk> {
     let rgb =
         |c: usize| Tensor::<Bk, 3>::random([c, h, w], Distribution::Uniform(0.0, 1.0), device);
     MergeSample {
@@ -35,7 +32,7 @@ fn rand_sample<Bk: Backend>(
 #[test]
 fn rollout_loss_forward_finite() {
     type B = NdArray;
-    let device = burn::prelude::Device::<B>::default();
+    let device = <B as Backend>::Device::default();
 
     let model = FocusMergeNetConfig::new().init::<B>(&device);
     let loss = FocusFusionLossConfig::new().init();
@@ -47,8 +44,8 @@ fn rollout_loss_forward_finite() {
     ];
     let use_prediction = [false, false, false];
 
-    let total = rollout_loss(&model, &loss, &steps, &use_prediction);
-    assert!(total.into_scalar().is_finite());
+    let terms = rollout_loss(&model, &loss, &steps, &use_prediction);
+    assert!(terms.total.into_scalar().is_finite());
 }
 
 #[test]
@@ -56,7 +53,7 @@ fn rollout_loss_scheduled_sampling_backward() {
     // With scheduled sampling enabled (feed back predictions), the rollout must
     // still be differentiable end-to-end.
     type Ab = Autodiff<NdArray>;
-    let device = burn::prelude::Device::<Ab>::default();
+    let device = <Ab as Backend>::Device::default();
 
     let model = FocusMergeNetConfig::new().init::<Ab>(&device);
     let loss = FocusFusionLossConfig::new().init();
@@ -68,11 +65,66 @@ fn rollout_loss_scheduled_sampling_backward() {
     // Step 1 feeds back the model's own prediction.
     let use_prediction = [false, true];
 
-    let total = rollout_loss(&model, &loss, &steps, &use_prediction);
-    let scalar: f32 = total.clone().into_scalar();
+    let terms = rollout_loss(&model, &loss, &steps, &use_prediction);
+    let scalar: f32 = terms.total.clone().into_scalar();
     assert!(scalar.is_finite(), "rollout total {scalar} not finite");
 
-    let _grads = total.backward();
+    let _grads = terms.total.backward();
+}
+
+#[test]
+fn rollout_train_updates_once_per_step_with_finite_losses() {
+    // NN-8: backward + optimiser step per rollout step (one graph at a time).
+    type Ab = Autodiff<NdArray>;
+    let device = <Ab as Backend>::Device::default();
+
+    let model = FocusMergeNetConfig::from_size(ModelSize::Xs).init::<Ab>(&device);
+    let loss = FocusFusionLossConfig::new().init();
+    let mut optim = AdamWConfig::new().init::<Ab, FocusMergeNet<Ab>>();
+
+    let steps = vec![
+        rand_sample::<Ab>(12, 12, &device),
+        rand_sample::<Ab>(12, 12, &device),
+        rand_sample::<Ab>(12, 12, &device),
+    ];
+    let probe = |m: &FocusMergeNet<Ab>| -> f32 {
+        let s = &steps[0];
+        m.forward(
+            s.target.clone().unsqueeze_dim::<4>(0),
+            s.target_conf.clone().unsqueeze_dim::<4>(0),
+            s.source.clone().unsqueeze_dim::<4>(0),
+        )
+        .merged
+        .mean()
+        .into_scalar()
+    };
+    let before = probe(&model);
+
+    // Step 2 is fed the model's own (detached) prediction.
+    let (model, stats) = rollout_train(
+        model,
+        &mut optim,
+        1e-2,
+        &loss,
+        &steps,
+        &[false, false, true],
+    );
+
+    assert_eq!(stats.updates, 3, "one optimiser update per rollout step");
+    for (name, v) in [
+        ("total", stats.total),
+        ("charbonnier", stats.charbonnier),
+        ("gradient", stats.gradient),
+        ("sharpness", stats.sharpness),
+        ("confidence", stats.confidence),
+    ] {
+        assert!(v.is_finite() && v >= 0.0, "{name} = {v}");
+    }
+    let after = probe(&model);
+    assert!(
+        (after - before).abs() > 1e-7,
+        "three AdamW updates must change the model ({before} -> {after})"
+    );
 }
 
 #[test]
@@ -111,159 +163,4 @@ fn scheduled_sampling_ramps_from_zero_to_max() {
     assert!(a <= b);
     // Degenerate single-epoch run → 0.
     assert!((scheduled_sampling_prob(0, 1, max) - 0.0).abs() < 1e-12);
-}
-
-// ---------------------------------------------------------------------------
-// align_loss + alignment dataset loader round trip
-// ---------------------------------------------------------------------------
-
-/// Write a plain RGB PNG with all pixels set to `rgb` (sRGB u8).
-fn write_rgb_png(path: &std::path::Path, w: u32, h: u32, rgb: [u8; 3]) {
-    let img = RgbImage::from_fn(w, h, |_, _| image::Rgb(rgb));
-    img.save(path).expect("write rgb png");
-}
-
-/// Build a tiny 2-frame alignment scene on disk: two 8x8 PNGs plus a
-/// `metadata.json` matching [`stacker_nn::data::AlignSceneMeta`]'s schema
-/// (`n_planes`, `stack`, `alignment_gt`, `cropped_dims`). Ground-truth
-/// matrices are both identity for simplicity.
-fn write_align_scene(dir: &std::path::Path) {
-    let (w, h) = (8u32, 8u32);
-    write_rgb_png(&dir.join("frame_000.png"), w, h, [200, 100, 50]);
-    write_rgb_png(&dir.join("frame_001.png"), w, h, [50, 100, 200]);
-
-    #[rustfmt::skip]
-    let identity = [
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0],
-    ];
-    let meta = serde_json::json!({
-        "n_planes": 2,
-        "stack": ["frame_000.png", "frame_001.png"],
-        "alignment_gt": [identity, identity],
-        "cropped_dims": [w, h],
-    });
-    std::fs::write(
-        dir.join("metadata.json"),
-        serde_json::to_string_pretty(&meta).unwrap(),
-    )
-    .unwrap();
-}
-
-/// Full round trip: disk -> `AlignSceneMeta`/`AlignSequence` -> `AlignSample`
-/// -> [`align_loss`]. Verifies the alignment dataset loader and `align_loss`
-/// compose correctly end-to-end with a fresh (untrained) `BatchAlignNet`.
-#[test]
-fn align_loss_round_trips_from_disk_scene() {
-    type B = NdArray;
-    let device = burn::prelude::Device::<B>::default();
-
-    let tmp = tempfile::tempdir().unwrap();
-    let scene_dir = tmp.path().join("scene0");
-    std::fs::create_dir(&scene_dir).unwrap();
-    write_align_scene(&scene_dir);
-
-    let seq = AlignSequence::new(scene_dir).unwrap();
-    let sample = seq.get::<B>(&device, None).unwrap();
-
-    assert_eq!(sample.stack.dims(), [2, 3, 8, 8]);
-    assert_eq!(sample.gt_matrices.dims(), [2, 3, 3]);
-
-    let model = BatchAlignNetConfig::new().init::<B>(&device);
-    let loss = BatchAlignmentLossConfig::new().init();
-
-    let total: f32 = align_loss(&model, &loss, &sample).into_scalar();
-    assert!(total.is_finite(), "align_loss result {total} is not finite");
-    assert!(total >= 0.0, "align_loss result {total} is negative");
-}
-
-// ---------------------------------------------------------------------------
-// fusion_align_loss + pairwise-alignment dataset loader round trip
-// ---------------------------------------------------------------------------
-
-/// Full round trip: disk -> `AlignSceneMeta`/`AlignSequence::get_pair` ->
-/// `PairAlignSample` -> [`fusion_align_loss`]. Reuses the SAME on-disk scene
-/// format/fixture as `align_loss_round_trips_from_disk_scene` (see
-/// `docs/fusionalign-design.md` for why `FusionAlignNet` trains from
-/// identical scene data to `BatchAlignNet`, just sliced into pairs) —
-/// verifies the pairwise dataset loader and `fusion_align_loss` compose
-/// correctly end-to-end with a fresh (untrained) `FusionAlignNet`.
-#[test]
-fn fusion_align_loss_round_trips_from_disk_scene() {
-    type B = NdArray;
-    let device = burn::prelude::Device::<B>::default();
-
-    let tmp = tempfile::tempdir().unwrap();
-    let scene_dir = tmp.path().join("scene0");
-    std::fs::create_dir(&scene_dir).unwrap();
-    write_align_scene(&scene_dir);
-
-    let seq = AlignSequence::new(scene_dir).unwrap();
-    // frame_index = 1: register stack[1] against the reference stack[0].
-    let sample = seq.get_pair::<B>(1, &device, None).unwrap();
-
-    assert_eq!(sample.reference.dims(), [3, 8, 8]);
-    assert_eq!(sample.frame.dims(), [3, 8, 8]);
-    assert_eq!(sample.gt_matrix.dims(), [3, 3]);
-
-    let model = FusionAlignNetConfig::new().init::<B>(&device);
-    let loss = PairAlignmentLossConfig::new().init();
-
-    let total: f32 = fusion_align_loss(&model, &loss, &sample).into_scalar();
-    assert!(
-        total.is_finite(),
-        "fusion_align_loss result {total} is not finite"
-    );
-    assert!(total >= 0.0, "fusion_align_loss result {total} is negative");
-}
-
-/// `get_pair`'s `frame_index = 0` self-pair (reference registered against
-/// itself) must also round-trip cleanly through `fusion_align_loss` — the
-/// legitimate "identity" training example documented on
-/// [`stacker_nn::data::AlignSequence::get_pair`].
-#[test]
-fn fusion_align_loss_round_trips_for_self_pair() {
-    type B = NdArray;
-    let device = burn::prelude::Device::<B>::default();
-
-    let tmp = tempfile::tempdir().unwrap();
-    let scene_dir = tmp.path().join("scene0");
-    std::fs::create_dir(&scene_dir).unwrap();
-    write_align_scene(&scene_dir);
-
-    let seq = AlignSequence::new(scene_dir).unwrap();
-    let sample = seq.get_pair::<B>(0, &device, None).unwrap();
-
-    assert_eq!(sample.reference.dims(), [3, 8, 8]);
-    assert_eq!(sample.frame.dims(), [3, 8, 8]);
-
-    let model = FusionAlignNetConfig::new().init::<B>(&device);
-    let loss = PairAlignmentLossConfig::new().init();
-
-    let total: f32 = fusion_align_loss(&model, &loss, &sample).into_scalar();
-    assert!(
-        total.is_finite(),
-        "fusion_align_loss result {total} is not finite"
-    );
-}
-
-/// `get_pair` with an out-of-range `frame_index` must error rather than
-/// panic (index into `meta.stack`/`meta.alignment_gt` is guarded up front).
-#[test]
-fn get_pair_out_of_range_frame_index_errors() {
-    type B = NdArray;
-    let device = burn::prelude::Device::<B>::default();
-
-    let tmp = tempfile::tempdir().unwrap();
-    let scene_dir = tmp.path().join("scene0");
-    std::fs::create_dir(&scene_dir).unwrap();
-    write_align_scene(&scene_dir); // n_planes = 2
-
-    let seq = AlignSequence::new(scene_dir).unwrap();
-    let err = seq.get_pair::<B>(5, &device, None).unwrap_err();
-    assert!(
-        matches!(err, stacker_nn::data::DataError::InvalidMetadata { .. }),
-        "expected InvalidMetadata for out-of-range frame_index, got: {err:?}"
-    );
 }

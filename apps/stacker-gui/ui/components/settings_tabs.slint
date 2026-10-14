@@ -1,0 +1,68 @@
+import { Theme } from "../theme.slint";
+
+// One tab pill: 28 px, small radius, 1 px border; the selected pill is filled with
+// the accent, a hovered one with the hover surface. Same look as the flagship
+// app's tab pills, drawn with z-stackr's own tokens.
+component SettingsTabPill inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    callback activate();
+
+    height: 28px;
+    background: root.selected ? Theme.accent : (touch.has-hover ? Theme.bg-hover : Theme.bg-input);
+    border-radius: Theme.radius-sm;
+    border-width: Theme.hairline;
+    border-color: root.selected ? Theme.accent-hover : Theme.border-control;
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        accessible-role: tab;
+        accessible-label: root.label;
+        accessible-item-selectable: true;
+        accessible-item-selected: root.selected;
+        accessible-action-default => { root.activate(); }
+        clicked => { root.activate(); }
+    }
+
+    HorizontalLayout {
+        padding-left: Theme.space-md;
+        padding-right: Theme.space-md;
+        alignment: center;
+        Text {
+            text: root.label;
+            font-size: Theme.font-xs;
+            font-weight: 600;
+            color: root.selected ? Theme.text-on-accent : Theme.text-secondary;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// The one table of tab indices. `AppModel.settings-tab` holds one of these; the
+// dialog shows a tab with `if AppModel.settings-tab == SettingsTabIndex.<name>`
+// and the pill row below is built from `labels`, so the two cannot drift apart.
+// Keep `labels` in the order of the indices.
+export global SettingsTabIndex {
+    out property <int> general: 0;
+    out property <int> apex: 1;
+    out property <int> relief: 2;
+    out property <int> strata: 3;
+    out property <int> input: 4;
+    out property <int> output: 5;
+    out property <[string]> labels: ["General", "Apex", "Relief", "Strata", "Input", "Output"];
+}
+
+// The settings dialog's tab row. `active` is two-way bound by the dialog.
+export component SettingsTabs inherits HorizontalLayout {
+    in-out property <int> active: 0;
+
+    height: 28px;
+    spacing: 6px;
+
+    for name[index] in SettingsTabIndex.labels : SettingsTabPill {
+        label: name;
+        selected: root.active == index;
+        activate => { root.active = index; }
+    }
+    Rectangle { horizontal-stretch: 1; }
+}

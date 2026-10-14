@@ -1,0 +1,7 @@
+# Settings for the PGO workload (scripts/pgo-workload.sh / .ps1): the full six-parameter
+# affine model (shift, scale, rotation, aspect, shear) with the automatic optimiser and the
+# identity gate, so the bounded Lucas-Kanade path and its simplex fallback are both exercised.
+settings_version = 2
+alignment_mode = "affine"
+optimizer = "auto"
+correct_brightness = true

@@ -1,0 +1,95 @@
+import { Theme } from "../theme.slint";
+import { AppModel } from "../models/app_model.slint";
+import { ActivityModel } from "../models/activity.slint";
+import { ActivityChip } from "activity_chip.slint";
+
+// The one-line strip along the bottom: a state dot, the status text, one chip per
+// running activity, a progress bar with its percentage while a pass is in flight,
+// then the frame count and the elapsed time. It reads `AppModel` and
+// `ActivityModel` directly; `App.status` / `App.progress` are two-way bound to
+// `AppModel`, so writing either drives the strip.
+export component StatusStrip inherits Rectangle {
+    height: Theme.statusbar-height;
+    background: Theme.bg-statusbar;
+
+    // Top separator line.
+    Rectangle {
+        y: 0;
+        height: Theme.hairline;
+        background: Theme.border-subtle;
+    }
+
+    HorizontalLayout {
+        padding-left: Theme.space-lg;
+        padding-right: Theme.space-lg;
+        spacing: Theme.space-md;
+
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 7px;
+                height: 7px;
+                border-radius: 3.5px;
+                background: AppModel.busy ? Theme.accent : Theme.success;
+            }
+        }
+
+        Text {
+            horizontal-stretch: 1;
+            text: AppModel.status;
+            font-size: Theme.font-xs;
+            color: Theme.text-muted;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        for activity in ActivityModel.activities: VerticalLayout {
+            alignment: center;
+            ActivityChip {
+                item: activity;
+                now-ms: ActivityModel.now-ms;
+                cancel(id) => { ActivityModel.cancel(id); }
+            }
+        }
+
+        if AppModel.progress > 0.0 && AppModel.progress < 1.0: HorizontalLayout {
+            spacing: Theme.space-sm;
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 140px;
+                    height: Theme.space-sm;
+                    background: Theme.bg-track;
+                    border-radius: Theme.radius-sm;
+                    Rectangle {
+                        x: 0;
+                        width: parent.width * AppModel.progress;
+                        height: 100%;
+                        background: Theme.accent;
+                        border-radius: Theme.radius-sm;
+                    }
+                }
+            }
+            Text {
+                text: Math.round(AppModel.progress * 100) + "%";
+                font-size: Theme.font-xs;
+                font-weight: 600;
+                color: Theme.accent;
+                vertical-alignment: center;
+            }
+        }
+
+        if AppModel.frame-count > 0: Text {
+            text: AppModel.frame-count + " frames";
+            color: Theme.text-dim;
+            font-size: Theme.font-xs;
+            vertical-alignment: center;
+        }
+        if AppModel.elapsed-text != "": Text {
+            text: AppModel.elapsed-text;
+            color: Theme.text-dim;
+            font-size: Theme.font-xs;
+            vertical-alignment: center;
+        }
+    }
+}

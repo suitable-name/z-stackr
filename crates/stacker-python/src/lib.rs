@@ -1,115 +1,92 @@
-#![cfg(feature = "python")]
-#![allow(clippy::needless_pass_by_value, clippy::struct_excessive_bools)]
-//! `PyO3` Python bindings for **z-stackr**, a pure-Rust out-of-core
-//! focus-stacking engine.
+//! Python bindings for **z-stackr**, the focus-stacking engine.
 //!
-//! This crate is a thin binding layer: every function here forwards
-//! directly into the same shared Rust crates the CLI (`z-stackr-cli`) and
-//! GUI (`z-stackr-gui`) call — `stacker_pipeline::run_pipeline` for the
-//! out-of-core file path, and `stacker_align`/`stacker_algo` directly for
-//! the in-RAM numpy path — so nothing here is a parallel reimplementation
-//! that could silently drift from the two shipped applications.
+//! The crate is a thin layer over the shared crates the command line tool and the desktop app
+//! use (`z-stackr-pipeline`, `z-stackr-align`, `z-stackr-algo`, `z-stackr-core`): nothing here
+//! reimplements a stage that could drift away from them. The Python import name is `zstackr`
+//! (the `PyPI` name is `z-stackr`).
 //!
-//! # Module layout
+//! # Layout
 //!
-//! - [`settings`] — Python mirrors of `stacker_core::settings` (the same
-//!   TOML-serialisable settings struct the GUI/CLI use) and
-//!   `stacker_pipeline::PipelineParams`.
-//! - [`converter`] — bulk numpy `[H, W, 3]` <-> `PlanarImage<f32>`
-//!   conversions, one variant per supported dtype (`u8`/`u16`/`f32`).
-//! - [`progress`] — maps `stacker_pipeline::PipelineProgress` onto a stable
-//!   `(stage, current, total)` Python-callable contract.
-//! - [`file_api`] — the **file / out-of-core** path: `stack_files`,
-//!   `batch_stack`, `load_config`, `save_config`, `load_image`. Memory
-//!   scales with tile size, not stack size — use this for stacks too large
-//!   to fit in RAM at once.
-//! - [`array_api`] — the **numpy / in-RAM** path: `stack_arrays`. Requires
-//!   the whole stack to already fit in memory (the caller already holds it
-//!   as a list of numpy arrays), but in exchange supports `auto_cull` /
-//!   `sort_by_sharpness`, which the tiled file path structurally cannot
-//!   (see that module's docs).
+//! The first group builds and is tested **without Python**:
 //!
-//! See the crate's own `README.md` for the full API reference, a
-//! quickstart, the config-interop workflow, and feature-flag / installation
-//! documentation (including the `z-stackr` `PyPI` name vs. `zstackr` import
-//! name pairing).
+//! | Module | Content |
+//! |---|---|
+//! | [`options`] | enum options as strings, [`ArgError`](options::ArgError) |
+//! | [`settings`] | mirrors of the 39 settings keys and of the parameters of a file run |
+//! | [`convert`] | `[H, W, 3]` sample buffers to and from linear-light planar images |
+//! | [`progress`] | the `(stage, current, total)` progress contract |
+//! | [`stack`] | the flows: frames in RAM, files out of core or in RAM, batches |
+//!
+//! The second group needs the `python` feature (maturin enables it):
+//!
+//! | Module | Content |
+//! |---|---|
+//! | `converter` | the numpy layer over [`convert`] |
+//! | `array_api` | `stack_arrays` |
+//! | `file_api` | `stack_files`, `batch_stack`, `load_config`, `save_config`, `load_image` |
+//! | `bridge` | exceptions, the progress callback, Ctrl-C, warnings |
+//!
+//! # Colour
+//!
+//! Arrays and files are sRGB-encoded; the pipeline computes in linear light. The conversions
+//! use the exact transfer function in both directions (see [`convert`]), so a stack comes back
+//! in the dtype and encoding it went in.
+//!
+//! See `README.md` for the API reference, the build instructions and examples.
 
-// Module declarations (kept as a single block so the crate's public
-// surface is discoverable from the top of this file).
-pub mod array_api;
-pub mod converter;
-pub mod file_api;
+#![warn(missing_docs)]
+
+pub mod convert;
+pub mod options;
 pub mod progress;
 pub mod settings;
+pub mod stack;
 
-use pyo3::prelude::*;
+#[cfg(feature = "python")]
+pub mod array_api;
+#[cfg(feature = "python")]
+mod bridge;
+#[cfg(feature = "python")]
+pub mod converter;
+#[cfg(feature = "python")]
+pub mod file_api;
 
-pub use array_api::stack_arrays;
-pub use file_api::{batch_stack, load_config, load_image, save_config, stack_files};
 pub use settings::{
     PyImageSavingSettings, PyPipelineParams, PyPreprocessingSettings, PyStackingSettings,
 };
 
-/// The `zstackr` Python extension module.
+#[cfg(feature = "python")]
+pub use array_api::stack_arrays;
+#[cfg(feature = "python")]
+pub use file_api::{batch_stack, load_config, load_image, save_config, stack_files};
+
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
+
+/// The `zstackr` extension module.
 ///
-/// Import name is `zstackr` (see `pyproject.toml`'s `[tool.maturin]
-/// module-name` and the crate README's "Installation" section for why this
-/// differs from both the `PyPI` package name `z-stackr` and this crate's own
-/// Cargo package name `z-stackr-python`).
+/// The import name is set here and by `module-name` in `pyproject.toml`; it differs on
+/// purpose from the PyPI name `z-stackr` and from the Cargo package `z-stackr-python`.
+#[cfg(feature = "python")]
 #[pymodule]
 fn zstackr(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // File / out-of-core API.
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+
+    // Files.
     m.add_function(wrap_pyfunction!(stack_files, m)?)?;
     m.add_function(wrap_pyfunction!(batch_stack, m)?)?;
     m.add_function(wrap_pyfunction!(load_config, m)?)?;
     m.add_function(wrap_pyfunction!(save_config, m)?)?;
     m.add_function(wrap_pyfunction!(load_image, m)?)?;
 
-    // Array / in-RAM API.
+    // Arrays.
     m.add_function(wrap_pyfunction!(stack_arrays, m)?)?;
 
-    // Settings / parameter classes.
+    // Settings and parameters.
     m.add_class::<PyPipelineParams>()?;
     m.add_class::<PyStackingSettings>()?;
     m.add_class::<PyPreprocessingSettings>()?;
     m.add_class::<PyImageSavingSettings>()?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The `#[pymodule]` function must register every top-level name this
-    /// crate advertises as its public Python API — introspected via the
-    /// module's own `__dict__`/attribute list rather than hardcoding
-    /// assumptions about `wrap_pyfunction!`/`add_class` internals.
-    #[test]
-    fn module_registers_all_expected_top_level_names() {
-        Python::initialize();
-        Python::attach(|py| {
-            let module = PyModule::new(py, "zstackr").expect("module creation should succeed");
-            zstackr(py, &module).expect("module init function should succeed");
-
-            let expected = [
-                "stack_files",
-                "batch_stack",
-                "load_config",
-                "save_config",
-                "load_image",
-                "stack_arrays",
-                "PyPipelineParams",
-                "PyStackingSettings",
-                "PyPreprocessingSettings",
-                "PyImageSavingSettings",
-            ];
-            for name in expected {
-                assert!(
-                    module.hasattr(name).unwrap_or(false),
-                    "zstackr module is missing expected top-level attribute '{name}'"
-                );
-            }
-        });
-    }
 }

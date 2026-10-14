@@ -1,0 +1,111 @@
+# The coverage gate's allow list for tests/ui.rs: items no scenario reaches, each with a
+# reason. A key is `Model.name` for a global callback, or `file.slint|Component|id`,
+# `file.slint|Component|"label"` or `file.slint|Component|<Type@line>` for an element
+# (files relative to ui/); a trailing `*` makes it a prefix. An entry that matches
+# nothing in the inventory is reported as stale. The report's Coverage section prints
+# every key the gate knows and what it counted; narrow the file-wide prefixes below
+# from it once a run has been read.
+
+# ── Global callbacks ──────────────────────────────────────────────────────────────
+
+[[allow]]
+key = "ActivityModel.cancel"
+reason = "needs a running job's chip on screen; the in-crate flow tests cancel a job"
+
+[[allow]]
+key = "DialogModel.confirm_secondary"
+reason = "only the unsaved-changes guard has a secondary button; in-crate flow tests"
+
+[[allow]]
+key = "DialogModel.confirm_tertiary"
+reason = "only the unsaved-changes guard has a third button; in-crate flow tests"
+
+[[allow]]
+key = "FilesModel.recompute_aligned"
+reason = "needs a stale Align cache; in-crate flow tests"
+
+[[allow]]
+key = "FilesModel.recompute_result"
+reason = "needs a stale result; in-crate flow tests"
+
+[[allow]]
+key = "ProjectModel.open_path"
+reason = "a project file dropped on the window; the OS drop event cannot be sent"
+
+[[allow]]
+key = "ProjectModel.clear_recent"
+reason = "only reachable through the File > Open Recent menu, which is a native menu"
+
+[[allow]]
+key = "ProjectModel.save_project_as"
+reason = "only reachable through the File menu and Ctrl+Shift+S; Save Project covers the picker"
+
+[[allow]]
+key = "RetouchModel.source_chosen"
+reason = "needs the retouch source box, a combo box popup over a stacked result"
+
+[[allow]]
+key = "ViewportModel.layout_changed"
+reason = "emitted by dragging the sidebar split handle (a pointer gesture)"
+
+[[allow]]
+key = "ViewportModel.canvas_resized"
+reason = "emitted by the canvas itself when it changes size, not driven by a scenario"
+
+[[allow]]
+key = "ViewportModel.image_changed"
+reason = "emitted by the canvas itself when its image changes, not driven by a scenario"
+
+[[allow]]
+key = "ViewportModel.brush_down"
+reason = "retouch brush pointer gesture on the canvas"
+
+[[allow]]
+key = "ViewportModel.brush_moved"
+reason = "retouch brush pointer gesture on the canvas"
+
+[[allow]]
+key = "ViewportModel.brush_up"
+reason = "retouch brush pointer gesture on the canvas"
+
+[[allow]]
+key = "ViewportModel.wheel"
+reason = "mouse wheel zoom on the canvas"
+
+[[allow]]
+key = "ViewportModel.pan_by"
+reason = "drag-to-pan on the canvas"
+
+# ── Interactive elements ──────────────────────────────────────────────────────────
+
+[[allow]]
+key = "components/sidebar.slint|Sidebar|ai-model-box"
+reason = "only shown for the AI (neural) algorithm, which needs the nn feature"
+
+[[allow]]
+key = "components/sidebar.slint|Sidebar|ai-device-box"
+reason = "only shown for the AI (neural) algorithm, which needs the nn feature"
+
+[[allow]]
+key = "components/retouch_bar.slint|*"
+reason = "brush sliders, source box and Undo/Redo need strokes on a result; the in-crate flow tests paint"
+
+[[allow]]
+key = "components/relief_preview_dialog.slint|*"
+reason = "the depth-map preview card needs the Relief preview setting; in-crate flow tests"
+
+[[allow]]
+key = "components/stale_badge.slint|*"
+reason = "the Recompute badges need a stale cache or result; in-crate flow tests"
+
+[[allow]]
+key = "components/confirm_dialog.slint|*"
+reason = "the Clear dialog is driven (Cancel and Clear); the other buttons belong to the unsaved-changes guard"
+
+[[allow]]
+key = "components/export_dialog.slint|*"
+reason = "the dialog is opened, swept and saved from; its folder, template, format and quality controls are not driven"
+
+[[allow]]
+key = "components/settings_dialog.slint|*"
+reason = "every tab is swept and smoked; sliders, spin boxes and text fields are not clickable in the smoke pass"

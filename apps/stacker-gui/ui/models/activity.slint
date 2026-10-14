@@ -1,0 +1,39 @@
+// A single list of running background operations (alignment, stacking, the live
+// monitor, a save) instead of one busy flag per feature. The Rust side is the only
+// writer: it pushes one `ActivityItem` here while an operation runs and removes it
+// when it finishes; no `.slint` file writes into `activities`/`now_ms` directly.
+//
+// `progress` is `-1.0` for "indeterminate" (no fraction known) and a value in
+// `[0.0, 1.0]` otherwise. `started_ms` is milliseconds on an arbitrary monotonic
+// per-session epoch (NOT wall-clock time), paired with `now_ms`, which the Rust side
+// ticks about once a second while `activities` is non-empty, so a `.slint` file can
+// show "N s elapsed" as `(ActivityModel.now_ms - item.started_ms) / 1000` without a
+// clock of its own.
+//
+// `eta_text` is the ready-made "about 40 s left" string (empty until the estimator
+// has enough history), recomputed on every tick, so no `.slint` file does the math.
+export struct ActivityItem {
+    id: int,
+    kind: string,
+    label: string,
+    progress: float,
+    cancellable: bool,
+    started_ms: int,
+    eta_text: string,
+}
+
+export global ActivityModel {
+    in-out property <[ActivityItem]> activities: [];
+    in-out property <int> now_ms: 0;
+    // How many running activities block the Run / Align buttons. Written by Rust:
+    // the folder monitor's watcher is an activity too, but it is not a blocker, so
+    // the "Stop Monitor" button stays usable while it runs.
+    in-out property <int> blocking_count: 0;
+    // Derived, not written: true whenever a blocking activity is running. The
+    // buttons and the status strip key their "something is running" affordances off
+    // this single property.
+    out property <bool> busy: blocking_count > 0;
+    // Requests cancellation of the activity with this `id`. A no-op if the id is no
+    // longer registered or was started with `cancellable: false`.
+    callback cancel(int);
+}

@@ -1,0 +1,35 @@
+// State of the export dialog (File > Export…).
+//
+// The dialog edits three stacking settings straight through `SettingsModel`
+// (the output folder, the file-name template, and the format / bit depth / JPEG
+// quality): a control writes the property and fires `settings-edited()`, the
+// same contract as the settings dialog. This global only carries what is not a
+// setting: whether the dialog is open, the note about what will be written, the
+// template variables and the live preview.
+//
+// Like the settings contract, the tree holds no default of its own for text that
+// Rust owns: `placeholders` and `target-note` are pushed from Rust.
+export global ExportModel {
+    in-out property <bool> open: false;
+    // What the Save button will write ("the full-precision result, retouch
+    // included" / "a re-encode of frame_01.jpg: ..."), pushed when the dialog opens.
+    in-out property <string> target-note: "";
+    // The template variables, space-separated and braced, pushed from Rust.
+    in-out property <string> placeholders: "";
+
+    // The user asked for the dialog (menu, Ctrl+E, toolbar). Rust checks that
+    // there is something to write, refreshes the preview context, and sets `open`.
+    callback request-open();
+    // Save with the current dialog values. Rust closes the dialog and writes.
+    callback save();
+
+    // The file-name stem a template gives right now (sanitised, no extension) and
+    // the placeholders in it that are not recognised (", "-joined, empty when
+    // there are none). Pure: Rust answers from a context cached at open time.
+    pure callback preview-name(string) -> string;
+    pure callback unknown-placeholders(string) -> string;
+
+    public function close() {
+        open = false;
+    }
+}

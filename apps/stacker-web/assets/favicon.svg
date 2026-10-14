@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>z-stackr</title>
+  <rect width="64" height="64" rx="12" fill="#111417"/>
+  <rect x="14" y="40" width="36" height="5" rx="2.5" fill="#19c37d" opacity="0.25"/>
+  <rect x="14" y="31" width="36" height="5" rx="2.5" fill="#19c37d" opacity="0.5"/>
+  <rect x="14" y="22" width="36" height="5" rx="2.5" fill="#19c37d" opacity="0.75"/>
+  <rect x="14" y="13" width="36" height="5" rx="2.5" fill="#19c37d"/>
+  <path d="M18 51 H46" stroke="#e9edef" stroke-width="3" stroke-linecap="round"/>
+</svg>

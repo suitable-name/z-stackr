@@ -1,0 +1,35 @@
+[package]
+name = "z-stackr-web-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The Web Worker of the z-stackr browser app: decodes a message, runs the stacking pipeline, posts the reply. Built by Trunk as a worker next to apps/stacker-web."
+
+# `cdylib` for wasm-bindgen/Trunk; `rlib` so a native `cargo check`/`clippy` of the
+# workspace type-checks this crate as an ordinary (empty) library.
+[lib]
+name = "stacker_web_worker"
+crate-type = ["cdylib", "rlib"]
+
+# Everything lives under the wasm32 target section: on a native build this crate is
+# empty (see `src/lib.rs`), so declaring the dependencies here would only make them
+# unused there.
+[dependencies]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+z-stackr-core = { workspace = true }
+z-stackr-algo = { workspace = true }
+z-stackr-align = { workspace = true }
+z-stackr-gpu = { workspace = true }
+z-stackr-pipeline = { workspace = true }
+z-stackr-web-core = { workspace = true }
+# A Rust panic as a readable `console.error` line instead of "unreachable executed".
+console_error_panic_hook = { workspace = true }
+js-sys = { workspace = true }
+wasm-bindgen = { workspace = true }
+# `spawn_local`: the Worker's jobs are tasks on its event loop.
+wasm-bindgen-futures = { workspace = true }
+web-sys = { version = "0.3.106", default-features = false, features = ["DedicatedWorkerGlobalScope", "MessageEvent", "WorkerGlobalScope", "console", "Performance"] }
+
+[lints]
+workspace = true

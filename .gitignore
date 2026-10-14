@@ -1,4 +1,3 @@
-binaries
 target
-.vscode
+MyStacker.jar
 .cargo

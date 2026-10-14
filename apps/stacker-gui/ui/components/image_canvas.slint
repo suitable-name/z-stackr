@@ -1,0 +1,185 @@
+import { Theme } from "../theme.slint";
+import { ViewportModel } from "../models/viewport.slint";
+import { EmptyState } from "empty_state.slint";
+
+// The image view: the displayed frame placed by `ViewportModel` (Rust computes the
+// fit / zoom / pan rule once, in `viewport_map::Frame`), clipped to the canvas, with
+// ONE `TouchArea` that routes the pointer:
+//   * left button, Retouch tool on  -> brush stroke (`brush-down` / `brush-moved` /
+//                                      `brush-up`)
+//   * left button, Retouch tool off -> pan (`pan-by`, incremental canvas-pixel deltas)
+//   * middle button, or Space + left button -> pan, whatever the tool
+//   * wheel                          -> zoom about the pointer (`wheel`)
+// All coordinates handed to Rust are canvas pixels (divided by `1px`); Rust maps them
+// to raster pixels, so no component here needs to know the zoom.
+export component ImageCanvas inherits Rectangle {
+    callback request-open-files();
+    // A button went down on the image. The window hands the keyboard back to its
+    // shortcuts, wherever a click on a combo box or a button had put it.
+    callback pressed();
+    in property <bool> has-images: false;
+    in property <image> displayed-image;
+    // The Retouch tool is on: a left-drag paints and the brush ring follows the
+    // pointer. Off, the image is only looked at, and a left-drag pans it.
+    in property <bool> retouch-on: false;
+    // Brush radius in RASTER pixels; only the cursor ring reads it here.
+    in property <float> brush-size: 20.0;
+
+    // 0 = idle, 1 = brush stroke, 2 = pan drag. Fixed when the button goes down, so
+    // pressing or releasing Space mid-drag cannot change what the drag means.
+    property <int> drag-mode: 0;
+    property <length> last-x: 0px;
+    property <length> last-y: 0px;
+    // The toolkit reports a wheel notch as 60 logical pixels.
+    property <length> wheel-notch: 60px;
+
+    background: Theme.bg-canvas;
+    border-radius: Theme.radius-md;
+    clip: true;
+
+    function report-image() {
+        ViewportModel.image-changed(
+            root.has-images ? root.displayed-image.width : 0,
+            root.has-images ? root.displayed-image.height : 0
+        );
+    }
+
+    // The canvas size is pushed on mount as well as on change: a fresh instance
+    // never fires `changed` for its first size.
+    init => {
+        ViewportModel.canvas-width = self.width / 1px;
+        ViewportModel.canvas-height = self.height / 1px;
+        ViewportModel.canvas-resized();
+        root.report-image();
+    }
+    changed width => {
+        ViewportModel.canvas-width = self.width / 1px;
+        ViewportModel.canvas-resized();
+    }
+    changed height => {
+        ViewportModel.canvas-height = self.height / 1px;
+        ViewportModel.canvas-resized();
+    }
+    changed has-images => { root.report-image(); }
+    changed displayed-image => { root.report-image(); }
+    // Leaving the tool mid-drag (Esc) must still close the open stroke.
+    changed retouch-on => {
+        if !root.retouch-on && root.drag-mode == 1 {
+            ViewportModel.brush-up();
+            root.drag-mode = 0;
+        }
+    }
+
+    // ── The displayed frame, placed by Rust ───────────────────────────────
+    Image {
+        visible: root.has-images && ViewportModel.place-width > 0;
+        source: root.displayed-image;
+        x: ViewportModel.place-x * 1px;
+        y: ViewportModel.place-y * 1px;
+        width: ViewportModel.place-width * 1px;
+        height: ViewportModel.place-height * 1px;
+        image-fit: fill;
+        // Past 2x magnification show true pixels instead of a smoothed blur.
+        image-rendering: ViewportModel.place-scale >= 2.0 ? ImageRendering.pixelated : ImageRendering.smooth;
+    }
+
+    // ── The one pointer surface ───────────────────────────────────────────
+    touch := TouchArea {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        enabled: root.has-images;
+        mouse-cursor: root.drag-mode == 2 ? MouseCursor.grabbing
+            : ((ViewportModel.pan-armed || !root.retouch-on) ? MouseCursor.grab : MouseCursor.crosshair);
+
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down {
+                root.pressed();
+                root.last-x = self.mouse-x;
+                root.last-y = self.mouse-y;
+                if event.button == PointerEventButton.middle
+                    || (event.button == PointerEventButton.left && (ViewportModel.pan-armed || !root.retouch-on)) {
+                    root.drag-mode = 2;
+                } else if event.button == PointerEventButton.left {
+                    root.drag-mode = 1;
+                    ViewportModel.brush-down(self.mouse-x / 1px, self.mouse-y / 1px);
+                }
+            } else if event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel {
+                if root.drag-mode == 1 {
+                    ViewportModel.brush-up();
+                }
+                root.drag-mode = 0;
+            }
+        }
+
+        moved => {
+            if root.drag-mode == 2 {
+                ViewportModel.pan-by((self.mouse-x - root.last-x) / 1px, (self.mouse-y - root.last-y) / 1px);
+            } else if root.drag-mode == 1 {
+                ViewportModel.brush-moved(self.mouse-x / 1px, self.mouse-y / 1px);
+            }
+            root.last-x = self.mouse-x;
+            root.last-y = self.mouse-y;
+        }
+
+        // A lost grab or a disabled area mid-stroke must still close the stroke.
+        changed enabled => {
+            if !self.enabled && root.drag-mode != 0 {
+                if root.drag-mode == 1 {
+                    ViewportModel.brush-up();
+                }
+                root.drag-mode = 0;
+            }
+        }
+
+        scroll-event(event) => {
+            ViewportModel.wheel(event.delta-y / root.wheel-notch, self.mouse-x / 1px, self.mouse-y / 1px);
+            accept
+        }
+    }
+
+    // ── Brush cursor ring: the brush radius at the current zoom ────────────
+    if root.has-images && root.retouch-on && touch.has-hover && root.drag-mode != 2 && !ViewportModel.pan-armed : Rectangle {
+        width: max(4px, 2 * root.brush-size * ViewportModel.place-scale * 1px);
+        height: self.width;
+        x: touch.mouse-x - self.width / 2;
+        y: touch.mouse-y - self.height / 2;
+        border-radius: self.width / 2;
+        border-width: Theme.hairline;
+        border-color: Theme.text-strong;
+        background: transparent;
+
+        // A dark inner line keeps the ring visible on bright frames.
+        Rectangle {
+            x: Theme.hairline;
+            y: Theme.hairline;
+            width: parent.width - 2 * Theme.hairline;
+            height: parent.height - 2 * Theme.hairline;
+            border-radius: self.width / 2;
+            border-width: Theme.hairline;
+            border-color: Theme.overlay-backdrop;
+            background: transparent;
+        }
+    }
+
+    // ── Empty state: a click opens the file dialog ────────────────────────
+    if (!root.has-images) : EmptyState {
+        width: root.width;
+        height: root.height;
+        title: "No Image Loaded";
+        hint: "Click to open files";
+        clicked => { root.request-open-files(); }
+    }
+
+    // The outline is drawn on top of the clipped content so the image never
+    // overpaints it.
+    Rectangle {
+        width: root.width;
+        height: root.height;
+        border-radius: Theme.radius-md;
+        border-width: Theme.hairline;
+        border-color: Theme.border-subtle;
+        background: transparent;
+    }
+}

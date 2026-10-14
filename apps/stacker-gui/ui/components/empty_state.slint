@@ -1,0 +1,96 @@
+import { Theme } from "../theme.slint";
+import { ProjectModel } from "../models/project.slint";
+
+// One start-here card: a rounded button-like row with a single line of text.
+component StartCard inherits Rectangle {
+    in property <string> label: "";
+    callback clicked();
+
+    height: Theme.control-height;
+    border-radius: Theme.radius-md;
+    border-width: Theme.hairline;
+    border-color: touch.has-hover ? Theme.accent : Theme.border-control;
+    background: touch.has-hover ? Theme.bg-hover : Theme.bg-panel;
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        accessible-role: button;
+        accessible-label: root.label;
+        accessible-action-default => { root.clicked(); }
+        clicked => { root.clicked(); }
+    }
+
+    Text {
+        x: Theme.space-md;
+        width: parent.width - 2 * Theme.space-md;
+        height: parent.height;
+        text: root.label;
+        color: Theme.text-primary;
+        font-size: Theme.font-md;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+}
+
+// A centred "nothing here yet" panel: a title, a one-line hint and a click action
+// (the whole panel opens the file dialog), then the project starts: a New Project
+// card and up to four recent projects. Fills its parent, so mount it inside the
+// area it stands in for.
+export component EmptyState inherits Rectangle {
+    in property <string> title: "";
+    in property <string> hint: "";
+    callback clicked();
+
+    // The background click comes first so the cards above it take their own.
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    VerticalLayout {
+        alignment: center;
+        spacing: Theme.space-xs;
+        Text {
+            text: root.title;
+            color: Theme.text-dim;
+            horizontal-alignment: center;
+            font-size: Theme.font-lg;
+        }
+        Text {
+            text: root.hint;
+            color: Theme.text-faint;
+            horizontal-alignment: center;
+            font-size: Theme.font-sm;
+        }
+
+        VerticalLayout {
+            padding-top: Theme.space-xl;
+            spacing: Theme.space-sm;
+
+            HorizontalLayout {
+                alignment: center;
+                StartCard {
+                    width: min(380px, root.width - 2 * Theme.space-xl);
+                    label: "New project";
+                    clicked => { ProjectModel.new-project(); }
+                }
+            }
+
+            if ProjectModel.recent-cards.length > 0 : Text {
+                text: "Recent projects";
+                color: Theme.text-muted;
+                horizontal-alignment: center;
+                font-size: Theme.font-sm;
+            }
+
+            for card[index] in ProjectModel.recent-cards : HorizontalLayout {
+                alignment: center;
+                StartCard {
+                    width: min(380px, root.width - 2 * Theme.space-xl);
+                    label: card;
+                    clicked => { ProjectModel.open-recent(index); }
+                }
+            }
+        }
+    }
+}

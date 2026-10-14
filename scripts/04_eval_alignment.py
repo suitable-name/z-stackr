@@ -17,8 +17,9 @@ predicted and ground-truth alignment matrices for up to three methods:
     (a) "neural"        -- the trained alignment network run alone
     (b) "neural_refine" -- the network's output refined by the classical
                             (AKAZE/RANSAC/intensity) refinement pass
-    (c) "classical"      -- classical AKAZE-seeded alignment alone, used as
-                            the baseline the neural methods are judged against
+    (c) "classical"      -- the classical registration refiner alone (seeded
+                            from the identity), used as the baseline the
+                            neural methods are judged against
 
 It then aggregates per-scene numbers into a report (mean / median / worst
 scene, both in raw full-resolution pixels and normalized to a 3000px-wide
@@ -45,57 +46,35 @@ the exact same convention: ``pred[k]`` maps reference-frame pixel coordinates
 to frame-k pixel coordinates, in ``cropped_dims`` space. This lets predicted
 and ground-truth matrices be compared directly without any change of basis.
 
-WHY THIS SCRIPT SHELLS OUT (dependency on an eval-inference binary)
+WHY THIS SCRIPT SHELLS OUT (the ``stacker-nn-eval`` binary)
 ---------------------------------------------------------------------
-There is no Python binding for the Rust ``z-stackr-nn`` / ``z-stackr-align``
-crates. The only way to invoke the trained model (and the classical
-refinement machinery that sits on top of it) from Python is to shell out to
-a compiled Rust CLI binary.
+There is no Python binding for the Rust ``stacker-nn`` / ``stacker-align``
+crates' alignment network. The script therefore shells out to the
+``stacker-nn-eval`` binary of the ``z-stackr-nn`` package, which implements
+the JSON I/O contract documented in ``run_eval_binary()`` below. Build it
+with (the ``eval`` feature is on by default):
 
-``stacker-nn-train`` (the existing training binary) does not expose an
-inference-only mode, so this script assumes a **dedicated eval-inference
-binary** which, as of this writing, DOES NOT YET EXIST and must be built by
-whoever runs this evaluation. This is a documented TODO / dependency, not a
-bug in this script:
+    cargo build --release -p z-stackr-nn --bin stacker-nn-eval
 
-    TODO(z-stackr-nn): build a small Rust binary (suggested name:
-    "stacker-nn-eval", suggested location: crates/z-stackr-nn/examples/ or a
-    new crates/z-stackr-nn-eval/ bin target) that implements the JSON I/O
-    contract documented in ``run_eval_binary()`` below.
+The "neural alone" and "neural + refine" columns are computed independently
+and either one can come back as "unavailable" (with a clear, actionable
+stderr message) without crashing the rest of the comparison.
 
-Because that binary does not exist yet, this script is designed to fail
-*gracefully* and *per-column* if it is missing or errors: the "neural alone"
-and "neural + refine" columns are computed independently and either one can
-come back as "unavailable" (with a clear, actionable stderr message) without
-crashing the rest of the comparison.
+CLASSICAL BASELINE
+-------------------
+The classical column runs the same binary WITHOUT a model: a request whose
+``model_path`` is ``null`` makes ``stacker-nn-eval`` run the classical
+registration refiner (the pyramid search behind the app's ``registration``
+alignment mode) from the identity seed, which is exactly the baseline the
+neural methods are judged against. The binary prints the solved per-frame
+matrices in the same ``alignment_gt`` convention, so no extra CLI flag is
+needed. If the binary is missing, the column degrades to "unavailable" like
+the other two.
 
-CLASSICAL BASELINE: DOCUMENTED AS TODO, NOT IMPLEMENTED
----------------------------------------------------------
-The design doc explicitly allows the classical-baseline column to be either
-(a) shelled out to ``z-stackr-cli`` with some invented flag convention to
-recover solved matrices, or (b) marked "not implemented" with documented
-reasoning, provided the other two columns (neural alone, neural + refine)
-are fully implemented.
-
-This script takes choice (b). Rationale, spelled out here and repeated as an
-inline comment at the call site in ``run_classical_baseline()``:
-
-    ``z-stackr-cli`` (the ``z-stackr`` command) aligns and stacks a folder of
-    images end-to-end, but has no flag today that dumps the *solved
-    per-frame alignment matrices* as machine-readable output -- it only
-    produces a final fused image. Inventing an "inferred flag convention"
-    against a CLI surface that does not actually support this would mean
-    guessing at (and hard-coding around) behavior that doesn't exist, which
-    is more likely to silently rot into a misleading result than to save
-    real work. A future patch that adds a `--dump-alignment-json` (or
-    similar) mode to z-stackr-cli / z-stackr-align is the correct fix; at
-    that point ``run_classical_baseline()`` below is the single function
-    that needs to change.
-
-The classical column therefore always reports ``None`` / "N/A -- classical
-baseline not implemented" in this version of the script, but is fully wired
-into the aggregation, statistics, and verdict logic so that plugging in a
-real implementation later requires no structural changes elsewhere.
+(The alignment modes of the apps are ``translation``, ``registration``,
+``affine``, ``none`` and, in ``nn`` builds, ``neural``; the fusion modes are
+Apex, Relief and Strata. This script evaluates alignment only, so no fusion
+mode is involved.)
 
 CORNER-ERROR METRIC
 --------------------
@@ -169,24 +148,33 @@ the "neural_refine" and "classical" columns:
     median paired difference and the fraction of scenes where neural+refine
     beat classical, and explicitly labels this fallback as such rather than
     fabricating a p-value.
-  - If either column has no data (e.g. classical is the documented TODO
-    stub, or the neural binary is unavailable), the comparison is skipped
+  - If either column has no data (e.g. the eval binary is unavailable), the
+    comparison is skipped
     and the report says so explicitly, rather than crashing.
 
 DEPENDENCIES
 --------------
 Only ``numpy`` + Python stdlib are required. ``scipy.stats`` is optional and
 guarded by a try/except; see STATISTICAL COMPARISON above for the documented
-fallback when it's absent.
+fallback when it's absent. The ``stacker-nn-eval`` binary must be built (see
+above).
 
 USAGE
 -------
+    cargo build --release -p z-stackr-nn --bin stacker-nn-eval
     python scripts/04_eval_alignment.py \
         --scenes-dir data/held_out_scenes \
-        --model models/batchalign_v2.onnx \
+        --model models/batchalign_final.mpk \
         --eval-binary target/release/stacker-nn-eval \
         --output reports/alignment_eval.json \
         --verbose
+
+``--model`` is a weights file (``.mpk``), its manifest (``.json``), a
+directory (its best alignment model) or the name of a model found in the
+``models/`` folder. The binary can also evaluate scenes by itself
+(``stacker-nn-eval --scenes-dir DIR --model PATH --classical --json``); this
+script adds the paired statistics, the wall-clock extrapolation and the
+acceptance verdict.
 """
 
 from __future__ import annotations
@@ -423,22 +411,20 @@ class EvalBinaryUnavailable(Exception):
 
 def run_eval_binary(
     eval_binary: str,
-    model_path: str,
+    model_path: Optional[str],
     scene_dir: Path,
     meta: dict[str, Any],
     refine: bool,
     verbose: bool = False,
 ) -> tuple[list[Optional[np.ndarray]], float]:
-    """Invoke the (assumed) dedicated Rust eval-inference binary for one scene.
+    """Invoke the Rust ``stacker-nn-eval`` binary for one scene.
 
-    JSON I/O CONTRACT (invented here; this is the authoritative spec the
-    binary must implement -- there is no existing binary as of this writing,
-    see the module docstring's TODO):
+    JSON I/O CONTRACT (implemented by crates/stacker-nn/src/bin/eval.rs):
 
     The script writes a JSON *request* to the binary's stdin:
 
         {
-          "model_path": "<value of --model>",
+          "model_path": "<value of --model>" | null,   // null = classical only
           "ref_index": 0,
           "output_dims": [width, height],       // == metadata's cropped_dims
           "refine": true | false,                 // apply classical refinement pass?
@@ -454,9 +440,10 @@ def run_eval_binary(
     predict, for every frame, the 3x3 matrix mapping reference-frame pixel
     coordinates to that frame's pixel coordinates (same convention as
     `alignment_gt`, see module docstring). When `refine` is true, the binary
-    should run its classical refinement pass on top of the network's raw
-    output before returning; when false, it should return the network's raw
-    output unmodified.
+    runs its classical refinement pass on top of the network's raw output
+    before returning; when false, it returns the network's raw output
+    unmodified. With `model_path` null it runs the classical refiner alone,
+    seeded from the identity.
 
     The binary is expected to write a JSON *response* to stdout:
 
@@ -504,7 +491,9 @@ def run_eval_binary(
     request_json = json.dumps(request)
 
     if verbose:
-        mode = "neural+refine" if refine else "neural alone"
+        mode = (
+            "classical" if model_path is None else ("neural+refine" if refine else "neural alone")
+        )
         print(
             f"    [eval-binary] invoking '{eval_binary}' ({mode}) for scene "
             f"{scene_dir.name} ({len(frame_paths)} frames)...",
@@ -524,11 +513,9 @@ def run_eval_binary(
     except FileNotFoundError as exc:
         raise EvalBinaryUnavailable(
             f"Eval-inference binary '{eval_binary}' was not found on disk / in PATH. "
-            "This binary is expected to be a dedicated Rust CLI (suggested name "
-            "'stacker-nn-eval') that does NOT yet exist in this repository as of "
-            "this script's authoring -- see the TODO in this script's module "
-            "docstring for the JSON I/O contract it must implement. Build it, or "
-            "pass --eval-binary pointing at wherever you've built it."
+            "Build it with `cargo build --release -p z-stackr-nn --bin "
+            "stacker-nn-eval`, or pass --eval-binary pointing at wherever you "
+            "have built it."
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise EvalBinaryUnavailable(
@@ -587,43 +574,27 @@ def run_eval_binary(
 
 
 # ---------------------------------------------------------------------------
-# Classical baseline (TODO stub -- see module docstring for rationale)
+# Classical baseline (the eval binary without a model)
 # ---------------------------------------------------------------------------
 
 
 def run_classical_baseline(
-    scene_dir: Path, meta: dict[str, Any], verbose: bool = False
-) -> Optional[list[Optional[np.ndarray]]]:
-    """Compute (or fail to compute) the classical AKAZE-seeded baseline
-    alignment for one scene.
+    eval_binary: str, scene_dir: Path, meta: dict[str, Any], verbose: bool = False
+) -> list[Optional[np.ndarray]]:
+    """Compute the classical baseline alignment for one scene.
 
-    NOT IMPLEMENTED. This is a deliberate, documented choice (see the
-    "CLASSICAL BASELINE" section of this script's module docstring for full
-    rationale): ``z-stackr-cli`` has no existing flag that dumps solved
-    per-frame alignment matrices as machine-readable JSON, only a final
-    fused image. Inventing an ad hoc flag/parsing convention against a CLI
-    surface that doesn't support this would be guesswork dressed up as an
-    implementation, so this function always returns None (meaning: "no data
-    for this scene"), and the rest of the script treats the classical
-    column as globally unavailable, reporting "N/A -- classical baseline
-    not implemented" wherever it would otherwise show a number.
+    Runs ``stacker-nn-eval`` with ``model_path = null``: the classical
+    registration refiner (the pyramid search behind the apps' ``registration``
+    alignment mode) is started from the identity for every frame and the solved
+    matrices come back in the ``alignment_gt`` convention.
 
-    TODO(z-stackr-align / z-stackr-cli): add a `--dump-alignment-json <path>`
-    (or similar) flag to z-stackr-cli that writes out the solved per-frame
-    3x3 matrices (in the same [x_k,y_k,1]^T = M_k @ [x_ref,y_ref,1]^T
-    convention documented in this script's module docstring) alongside the
-    normal fused-image output. Once that exists, this function should shell
-    out to it the same way ``run_eval_binary`` shells out to the neural
-    binary, and parse the dumped JSON directly -- no format invention
-    needed at that point.
+    Raises ``EvalBinaryUnavailable`` like ``run_eval_binary``; the caller
+    records the scene as missing for this column.
     """
-    if verbose:
-        print(
-            f"    [classical] skipping scene {scene_dir.name}: classical baseline "
-            "is not implemented in this script (see run_classical_baseline docstring).",
-            file=sys.stderr,
-        )
-    return None
+    matrices, _ = run_eval_binary(
+        eval_binary, None, scene_dir, meta, refine=False, verbose=verbose
+    )
+    return matrices
 
 
 # ---------------------------------------------------------------------------
@@ -805,6 +776,7 @@ def evaluate(
 
     neural_errors: list[str] = []
     refine_errors: list[str] = []
+    classical_errors: list[str] = []
 
     wallclock_record: Optional[dict[str, Any]] = None
     # Prefer a scene that actually matches the reference shape (40 frames);
@@ -854,27 +826,17 @@ def evaluate(
             per_scene_refine[scene_name] = None
             refine_errors.append(f"{scene_name}: {exc}")
 
-        # --- (c) classical alone (AKAZE seed) -- documented TODO stub ---
-        # See run_classical_baseline() docstring and the module docstring's
-        # "CLASSICAL BASELINE" section for why this is intentionally not
-        # implemented: z-stackr-cli has no matrix-dumping mode to shell out
-        # to today, and inventing one would be undocumented guesswork.
-        classical_matrices = run_classical_baseline(scene_dir, meta, verbose=verbose)
-        if classical_matrices is not None:
+        # --- (c) classical alone (the eval binary without a model) ---
+        try:
+            classical_matrices = run_classical_baseline(eval_binary, scene_dir, meta, verbose=verbose)
             per_scene_classical[scene_name] = scene_corner_error(classical_matrices, gt_matrices, cropped_dims)
-        else:
+        except EvalBinaryUnavailable as exc:
             per_scene_classical[scene_name] = None
+            classical_errors.append(f"{scene_name}: {exc}")
 
     neural_summary = summarize_column(per_scene_neural, actual_widths)
     refine_summary = summarize_column(per_scene_refine, actual_widths)
     classical_summary = summarize_column(per_scene_classical, actual_widths)
-    # classical is a documented global stub, not a per-scene failure; label distinctly.
-    classical_summary["not_implemented"] = True
-    classical_summary["not_implemented_reason"] = (
-        "z-stackr-cli has no flag today to dump solved per-frame alignment matrices "
-        "as machine-readable output; see run_classical_baseline() docstring for the "
-        "documented TODO."
-    )
 
     # --- statistical comparison: neural+refine vs classical ---
     common_scenes = [
@@ -886,9 +848,8 @@ def evaluate(
         stat_comparison = {
             "available": False,
             "reason": (
-                "Cannot compare neural+refine against classical-alone: classical baseline "
-                "is not implemented (see run_classical_baseline docstring), so there is no "
-                "classical data to pair against."
+                "Cannot compare neural+refine against classical-alone: the classical "
+                "column has no usable data (see column_errors)."
                 if classical_summary["scenes_evaluated"] == 0
                 else "No scenes have valid results for both neural+refine and classical."
             ),
@@ -953,6 +914,7 @@ def evaluate(
         "column_errors": {
             "neural": neural_errors,
             "neural_refine": refine_errors,
+            "classical": classical_errors,
         },
         "statistical_comparison_refine_vs_classical": stat_comparison,
         "wallclock": wallclock_report,
@@ -991,12 +953,7 @@ def build_verdict(
         }
 
     # Bullet 2a: neural+refine statistically indistinguishable from classical-alone
-    if classical_summary.get("not_implemented"):
-        verdicts["neural_refine_vs_classical"] = {
-            "verdict": "N/A",
-            "detail": "N/A -- classical baseline not implemented, see classical column notes.",
-        }
-    elif not stat_comparison.get("available"):
+    if not stat_comparison.get("available"):
         verdicts["neural_refine_vs_classical"] = {
             "verdict": "FAIL",
             "detail": stat_comparison.get("reason", "Statistical comparison unavailable."),
@@ -1051,7 +1008,7 @@ def build_verdict(
     elif "INCONCLUSIVE" in relevant_for_overall:
         overall = "INCONCLUSIVE"
     elif "N/A" in relevant_for_overall:
-        overall = "INCOMPLETE (classical baseline not implemented; see per-bullet detail)"
+        overall = "INCOMPLETE (see per-bullet detail)"
     else:
         overall = "PASS"
     verdicts["overall"] = overall
@@ -1088,9 +1045,6 @@ def print_report(results: dict[str, Any]) -> None:
     print("-" * len(header))
     for key, label in (("neural", "neural"), ("neural_refine", "neural+refine"), ("classical", "classical")):
         col = results["columns"][key]
-        if col.get("not_implemented"):
-            print(f"{label:<16} {'--':>4}  N/A -- classical baseline not implemented (see column notes)")
-            continue
         if not col.get("available"):
             print(
                 f"{label:<16} {'--':>4}  UNAVAILABLE "
@@ -1185,9 +1139,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Evaluate z-stackr's alignment network against held-out synthetic scenes "
-            "per design doc §7. Requires a dedicated Rust eval-inference binary that "
-            "does not yet exist -- see this script's module docstring for the JSON I/O "
-            "contract it must implement."
+            "per design doc §7. Requires the stacker-nn-eval binary "
+            "(cargo build --release -p z-stackr-nn --bin stacker-nn-eval); see this "
+            "script's module docstring for the JSON I/O contract."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -1209,10 +1163,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="target/release/stacker-nn-eval",
         help=(
-            "Path to the dedicated Rust eval-inference binary implementing this script's JSON "
-            "I/O contract (see module docstring). NOTE: this binary does not exist in the "
-            "repository as of this script's authoring and must be built separately; the default "
-            "path assumes a cargo release build at that conventional location."
+            "Path to the stacker-nn-eval binary (see module docstring). The default "
+            "path assumes a cargo release build at the conventional location."
         ),
     )
     parser.add_argument(

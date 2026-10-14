@@ -1,0 +1,47 @@
+import { Theme } from "../theme.slint";
+
+// A small "i" glyph that shows a hand-drawn tooltip card on hover. Use it only where
+// there is no control to hang a native `Tooltip { }` on; everywhere else prefer the
+// native element.
+export component InfoIcon inherits Rectangle {
+    in property <string> tip-text: "";
+    width: 14px;
+    height: 14px;
+    out property <bool> has-hover: ta.has-hover;
+
+    Text {
+        text: "ⓘ";
+        color: root.has-hover ? Theme.text-strong : Theme.text-muted;
+        font-size: Theme.font-label;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        mouse-cursor: help;
+    }
+
+    // Tooltip overlay
+    if (ta.has-hover && root.tip-text != "") : Rectangle {
+        x: 20px;
+        y: -10px;
+        z: 1000;
+        background: Theme.bg-tooltip;
+        border-color: Theme.border-dialog;
+        border-width: Theme.hairline;
+        border-radius: Theme.radius-sm;
+        drop-shadow-blur: 4px;
+        drop-shadow-color: Theme.shadow;
+        width: tip-label.preferred-width + 2 * Theme.space-sm;
+        height: tip-label.preferred-height + Theme.space-md;
+
+        tip-label := Text {
+            x: Theme.space-sm;
+            y: Theme.space-xs + 2px;
+            text: root.tip-text;
+            color: Theme.text-tooltip;
+            font-size: Theme.font-sm;
+            wrap: word-wrap;
+            width: min(300px, self.preferred-width);
+        }
+    }
+}

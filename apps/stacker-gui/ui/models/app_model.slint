@@ -1,0 +1,64 @@
+import { ActivityModel } from "activity.slint";
+
+// App-wide status, progress and view state. The `App` window mirrors the same
+// values through two-way bindings (`App.status <=> AppModel.status`, ...), so
+// `app.set_status(..)` and `app.global::<AppModel>()` write the same storage.
+export global AppModel {
+    // True in the browser build (stacker-web). It hides what a browser cannot do
+    // (live folder monitor, quit, output folder, compute device, recent projects),
+    // relabels the export buttons and swaps the browser-owned Ctrl+N for Alt+N.
+    // False on the desktop, where nothing depends on it.
+    in-out property <bool> web-build: false;
+
+    // ── Status line and progress ─────────────────────────────────────────────
+    in-out property <string> status: "Ready";
+    // 0.0 ..= 1.0. Values outside (0, 1) mean "no pass is running".
+    in-out property <float> progress: 0.0;
+    in-out property <int> frame-count: 0;
+    in-out property <string> elapsed-text: "";
+    // True while the live folder monitor is watching for new frames.
+    in-out property <bool> is-monitoring: false;
+    // Derived: a determinate pass is in flight, or any registered activity runs.
+    out property <bool> busy: ActivityModel.busy || (progress > 0.0 && progress < 1.0);
+
+    // ── View state ───────────────────────────────────────────────────────────
+    in-out property <bool> show-aligned: false;
+    // 1.0 = 100 %.
+    in-out property <float> zoom-factor: 1.0;
+
+    // ── Dialog visibility ────────────────────────────────────────────────────
+    in-out property <bool> settings-open: false;
+    // The settings dialog's selected tab (an index of `SettingsTabIndex` in
+    // `components/settings_tabs.slint`: 0 General, 1 Apex, 2 Relief, 3 Strata,
+    // 4 Input, 5 Output), kept for the session so the dialog reopens where it
+    // was left. Not persisted to disk.
+    in-out property <int> settings-tab: 0;
+    in-out property <bool> relief-preview-open: false;
+    in-out property <image> relief-preview-image;
+
+    // ── Pipeline options supplied by Rust ────────────────────────────────────
+    // The "AI Model (Neural)" entry only appears when the app was built with the
+    // `nn` feature, so Rust owns the list.
+    in property <[string]> algo-options: [
+        "Relief (Depth Map)", "Apex (Laplacian)", "Strata (Guided Fusion)",
+        "Both (Relief & Apex)", "All Three (Strata, Relief & Apex)"
+    ];
+    in property <[string]> ai-model-names;
+    in property <bool> ai-models-available;
+    in property <bool> ai-show-device;
+    in property <[string]> ai-device-names;
+
+    // ── Neural alignment model (Settings > General, Alignment Mode "Neural") ──
+    // Alignment models are not the AI fusion models above: Rust fills this list
+    // from `discover_default_alignment_models()`, and only in a build with the
+    // `nn` feature (it stays empty, and the picker hidden, everywhere else).
+    // The choice is a session choice like the sidebar's AI model; it is not a
+    // settings key.
+    in property <[string]> align-model-names;
+    in property <bool> align-models-available;
+    in-out property <int> align-model-index: 0;
+    // The chosen model's name; empty when none is installed.
+    out property <string> align-model-value:
+        (align-model-names.length > 0 && align-model-index >= 0 && align-model-index < align-model-names.length)
+            ? align-model-names[align-model-index] : "";
+}

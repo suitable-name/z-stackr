@@ -8,9 +8,12 @@ merge network needs to be trained with prefix-composite supervision:
 
   focus_00.png .. focus_10.png   the defocus STACK (focus swept in 10% z-steps)
   allfocus.png                   ground-truth all-in-focus (DoF disabled)
-  mask_00.png .. mask_10.png     per-frame soft IN-FOCUS weight (0..1) per pixel
-  occlusion.png                  depth-discontinuity map (down-weight loss here)
+  mask_00.png .. mask_10.png     per-frame soft IN-FOCUS weight per pixel
+                                 (8-bit: 0..1 stored as 0..255)
+  occlusion.png                  depth-discontinuity map (8-bit, 255 = edge;
+                                 down-weight loss here)
   metadata.json                  focus schedule, fstop, geometry, merge order
+                                 (the trainer reads every file name from it)
 
 Usage (one invocation PER photo):
     blender -b -P 02_blender_focus_stack.py -- \
@@ -18,6 +21,7 @@ Usage (one invocation PER photo):
         --depth  depth/scene_depth.npy \
         --out    dataset/scene \
         --focus-step-pct 10 --fstop 2.8 --depth-scale 2.0 --cam-dist 10 \
+        --subdiv 400 --merge-order shuffle \
         --gpu                 # optional: render on the GPU (OptiX/CUDA/HIP/Metal/oneAPI)
 
 Then point the trainer at the parent folder:
@@ -43,8 +47,20 @@ What changed vs the original (to raise training-data quality)
   * CLEANER DEFOCUS: Cycles denoising (OpenImageDenoise) is enabled and the
     default sample count is raised, so out-of-focus regions aren't noisy (noise
     would otherwise be learned as a texture).
-  * 8-bit sRGB output by default to match the Rust data loader (which reads
-    8-bit); use --color-depth 16 if you ever switch the loader to 16-bit.
+  * 8-bit PNGs: the Rust data loader (crates/stacker-nn/src/data) decodes every
+    PNG to 8 bits, so frames default to 8-bit and the masks / occlusion map are
+    always written as 8-bit (0..1 stored as 0..255). --color-depth 16 only
+    enlarges the frame files; the loader narrows them on read.
+  * No OpenCV: Blender's bundled Python has numpy but not cv2, so depth is
+    read, and masks are written, through Blender's own image API, and the
+    occlusion dilation is a numpy max-filter. Nothing extra is installed into
+    Blender. (Stage 1, outside Blender, does need the packages listed in
+    scripts/requirements.txt.)
+  * No stray files: the displacement texture lives in memory; the output folder
+    holds only the dataset files below.
+  * merge_order is a random permutation per scene by default (--merge-order
+    shuffle, --seed to fix it), so training sees the fold orders the apps
+    produce; --merge-order sweep keeps the focus order.
 
 How the masks define the training targets
 ------------------------------------------
@@ -63,6 +79,7 @@ loss can ignore them; for top quality, render true 3-D scenes instead.
 import argparse
 import json
 import os
+import random
 import sys
 
 import numpy as np
@@ -84,7 +101,17 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--fstop", type=float, default=2.8, help="smaller = more blur")
     ap.add_argument("--depth-scale", type=float, default=2.0, help="world-units of relief")
     ap.add_argument("--cam-dist", type=float, default=10.0)
-    ap.add_argument("--subdiv", type=int, default=400)
+    ap.add_argument("--subdiv", type=int, default=400,
+                    help="grid subdivisions per side of the displaced plane. The rendered "
+                         "geometry resolves depth only at this resolution (depth edges are "
+                         "smoothed to it), while the masks use the full depth map; raise it "
+                         "for sharper geometry (cost grows with its square)")
+    ap.add_argument("--merge-order", choices=["sweep", "shuffle"], default="shuffle",
+                    help="order recorded in metadata.json for the pairwise fold: 'shuffle' "
+                         "(default) draws a random permutation per scene, 'sweep' keeps the "
+                         "focus order 0..N-1")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="seed for --merge-order shuffle (default: a fresh random order)")
     ap.add_argument("--samples", type=int, default=128,
                     help="Cycles samples per frame (raised from 64; denoised)")
     ap.add_argument("--edge-thresh", type=float, default=0.04,
@@ -92,7 +119,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--occl-dilate", type=int, default=3,
                     help="dilate the occlusion mask by N px to cover the defocus-error band")
     ap.add_argument("--color-depth", choices=["8", "16"], default="8",
-                    help="PNG bit depth for rendered frames (8 matches the Rust loader)")
+                    help="PNG bit depth for rendered frames. The Rust loader decodes every "
+                         "PNG to 8 bits, so 16 only enlarges the files; masks and the "
+                         "occlusion map are always written as 8-bit")
     ap.add_argument("--no-denoise", action="store_true",
                     help="disable Cycles denoising (on by default)")
     ap.add_argument("--gpu", action="store_true",
@@ -100,29 +129,95 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args(argv)
 
 
-# ── depth helpers (numpy; Blender bundles numpy) ────────────────────────────────
+# ── depth / image helpers (numpy + Blender's own image API) ─────────────────────
+# Blender's bundled Python ships numpy but NOT OpenCV, so nothing here imports
+# cv2: images are read and written through bpy.data.images, and the occlusion
+# dilation is a numpy max-filter. (Stage 1 runs in a normal Python environment
+# and may use OpenCV; see requirements.txt.)
 
 def load_depth(depth_path: str) -> np.ndarray:
+    """Depth map as float32 [H, W] normalised to 0=near .. 1=far.
+
+    A .npy file (stage 1's output) keeps full float precision. Any other file is
+    read through Blender's image loader as non-colour data, which is limited to
+    what Blender decodes (typically 8 or 16 bit); prefer the .npy.
+    """
     if depth_path.endswith(".npy"):
         d = np.load(depth_path).astype(np.float32)
+        if d.ndim == 3:
+            d = d[..., 0]
     else:
-        import cv2
-        raw = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
-        d = raw if raw.ndim == 2 else raw[..., 0]
+        img = bpy.data.images.load(depth_path)
+        img.colorspace_settings.name = "Non-Color"
+        w, h = img.size
+        px = np.empty(w * h * 4, dtype=np.float32)
+        img.pixels.foreach_get(px)
+        bpy.data.images.remove(img)
+        # Blender stores rows bottom-to-top; flip to the usual top-to-bottom.
+        d = np.ascontiguousarray(np.flipud(px.reshape(h, w, 4)[..., 0]))
     d = (d - d.min()) / max(d.max() - d.min(), 1e-8)
     return d  # 0=near, 1=far
 
 
-def depth_to_displace_png(depth: np.ndarray, out_dir: str) -> str:
-    import cv2
-    png = os.path.join(out_dir, "_depth_displace.png")
-    cv2.imwrite(png, (depth * 65535).astype(np.uint16))
-    return png
+def depth_to_blender_image(depth: np.ndarray):
+    """In-memory float image of `depth` for the Displace modifier (no file on disk)."""
+    h, w = depth.shape
+    img = bpy.data.images.new("depth_displace", width=w, height=h, alpha=False,
+                              float_buffer=True, is_data=True)
+    rgba = np.ones((h, w, 4), dtype=np.float32)
+    rgba[..., :3] = np.flipud(depth.astype(np.float32))[..., None]
+    img.pixels.foreach_set(rgba.ravel())
+    img.colorspace_settings.name = "Non-Color"
+    return img
 
 
 def write_png_gray(arr01: np.ndarray, path: str) -> None:
-    import cv2
-    cv2.imwrite(path, (np.clip(arr01, 0, 1) * 65535).astype(np.uint16))
+    """Write `arr01` (values 0..1) as an 8-bit PNG, the loader's native depth.
+
+    The Rust loader decodes every PNG to 8 bits, so a 16-bit mask would only be
+    narrowed on load. The image is created as non-colour data, so the stored
+    value is exactly round(255 * arr01) with no transfer curve applied.
+    """
+    a = np.clip(arr01, 0.0, 1.0).astype(np.float32)
+    h, w = a.shape
+    img = bpy.data.images.new("_label_tmp", width=w, height=h, alpha=False,
+                              float_buffer=False, is_data=True)
+    rgba = np.ones((h, w, 4), dtype=np.float32)
+    rgba[..., :3] = np.flipud(a)[..., None]
+    img.pixels.foreach_set(rgba.ravel())
+    img.file_format = "PNG"
+    img.filepath_raw = path
+    img.save()
+    bpy.data.images.remove(img)
+
+
+def dilate_square(mask: np.ndarray, radius: int) -> np.ndarray:
+    """Max-filter `mask` with a (2*radius+1)^2 square (separable, numpy only)."""
+    if radius <= 0:
+        return mask
+    out = mask
+    for axis in (0, 1):
+        n = out.shape[axis]
+        pad = [(0, 0), (0, 0)]
+        pad[axis] = (radius, radius)
+        padded = np.pad(out, pad)
+        acc = out
+        for s in range(2 * radius + 1):
+            sl = [slice(None), slice(None)]
+            sl[axis] = slice(s, s + n)
+            acc = np.maximum(acc, padded[tuple(sl)])
+        out = acc
+    return out
+
+
+def make_merge_order(n: int, mode: str, seed) -> list:
+    """Order the frames are folded in. 'sweep' = focus order; 'shuffle' = a random
+    permutation per scene so the network is trained on the orders it will meet
+    (the apps re-order frames, e.g. by auto-cull)."""
+    order = list(range(n))
+    if mode == "shuffle":
+        random.Random(seed).shuffle(order)
+    return order
 
 
 def emit_masks_and_meta(depth: np.ndarray, focus_t: list, args, out_dir: str) -> None:
@@ -143,10 +238,7 @@ def emit_masks_and_meta(depth: np.ndarray, focus_t: list, args, out_dir: str) ->
     occ = (grad > args.edge_thresh).astype(np.float32)
     # Defocus is wrong in a *band* around each edge, not a 1-px line — dilate so
     # the loss actually ignores the affected region.
-    if args.occl_dilate > 0:
-        import cv2
-        k = np.ones((2 * args.occl_dilate + 1, 2 * args.occl_dilate + 1), np.uint8)
-        occ = cv2.dilate(occ, k, iterations=1)
+    occ = dilate_square(occ, args.occl_dilate)
     write_png_gray(occ, os.path.join(out_dir, "occlusion.png"))
 
     meta = {
@@ -165,7 +257,11 @@ def emit_masks_and_meta(depth: np.ndarray, focus_t: list, args, out_dir: str) ->
         "masks": mask_files,
         "allfocus": "allfocus.png",
         "occlusion": "occlusion.png",
-        "merge_order": list(range(len(focus_t))),
+        "merge_order": make_merge_order(len(focus_t), args.merge_order, args.seed),
+        "merge_order_mode": args.merge_order,
+        "subdiv": args.subdiv,
+        "color_depth": int(args.color_depth),
+        "mask_bit_depth": 8,
         "note": "prefix composite of {0..k}: allfocus where any included mask>thr, "
                 "else least-defocused included frame (argmin |depth - focus_fraction|).",
     }
@@ -179,17 +275,21 @@ def reset_scene() -> None:
     bpy.ops.wm.read_factory_settings(use_empty=True)
 
 
-def build_plane(img_path: str, depth_png: str, subdiv: int, depth_scale: float):
+def build_plane(img_path: str, depth: np.ndarray, subdiv: int, depth_scale: float):
     img = bpy.data.images.load(img_path)
     img.colorspace_settings.name = "sRGB"        # photo is sRGB-encoded
     w, h = img.size
     aspect = w / h
+    # NOTE: the displaced mesh is a subdiv x subdiv grid, so the rendered geometry
+    # resolves depth at (at most) that resolution however large the depth map is;
+    # the masks and the occlusion map, in contrast, are computed from the full
+    # depth map. Raise --subdiv for sharper depth edges (memory and time grow
+    # with its square).
     bpy.ops.mesh.primitive_grid_add(x_subdivisions=subdiv, y_subdivisions=subdiv, size=2.0)
     plane = bpy.context.active_object
     plane.scale = (aspect, 1.0, 1.0)
 
-    depth_img = bpy.data.images.load(depth_png)
-    depth_img.colorspace_settings.name = "Non-Color"
+    depth_img = depth_to_blender_image(depth)
     tex = bpy.data.textures.new("depth_tex", type="IMAGE")
     tex.image = depth_img
     mod = plane.modifiers.new("displace", type="DISPLACE")
@@ -299,7 +399,6 @@ def main() -> None:
     os.makedirs(args.out, exist_ok=True)
 
     depth = load_depth(args.depth)
-    displace_png = depth_to_displace_png(depth, args.out)
 
     # Focus schedule: planes every focus_step_pct, 0..100 inclusive (10% => 11 planes).
     step = args.focus_step_pct / 100.0
@@ -308,7 +407,7 @@ def main() -> None:
         focus_t.append(1.0)
 
     reset_scene()
-    _, aspect = build_plane(args.img, displace_png, args.subdiv, args.depth_scale)
+    _, aspect = build_plane(args.img, depth, args.subdiv, args.depth_scale)
     cam = setup_camera(aspect, args.cam_dist, args.fstop)
     configure_render(args.img, args)
     if args.gpu:

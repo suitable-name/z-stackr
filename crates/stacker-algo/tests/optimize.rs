@@ -1,21 +1,19 @@
 use stacker_algo::optimize::*;
 use stacker_core::image::PlanarImage;
 
-/// Build a flat (near-zero SML) `PlanarImage` of given dimensions.
+/// Build a flat (near-zero focus score) `PlanarImage` of given dimensions.
 fn flat_frame(width: usize, height: usize) -> PlanarImage<f32> {
     let mut img = PlanarImage::new(width, height);
     // Fill with a tiny constant so it is not zero but well below any
     // contrast floor.  Value chosen to be < CONTRAST_FLOOR_ABSOLUTE even
-    // after the SML convolution; the SML of a flat field is 0.
-    for v in &mut img.luma {
-        *v = 0.001;
-    }
+    // after the focus measure; the plane-fit variance of a flat field is 0.
+    img.luma.fill(0.001);
     img
 }
 
 /// Build a frame with a high-contrast blob in a rectangle [bx..ex, by..ey].
-/// Pixels inside the blob alternate between 0 and 1 so the SML kernel
-/// measures a strong response.  Outside pixels are set to 0.001 (flat).
+/// Pixels inside the blob alternate between 0 and 1 so the focus measure
+/// gives a strong response.  Outside pixels are set to 0.001 (flat).
 fn detail_frame(
     width: usize,
     height: usize,
@@ -29,7 +27,7 @@ fn detail_frame(
         for x in 0..width {
             let idx = y * width + x;
             if x >= bx && x < ex && y >= by && y < ey {
-                // Checkerboard pattern — maximum gradient for the SML kernel.
+                // Checkerboard pattern — maximum local variance for the focus measure.
                 img.luma[idx] = if (x + y) % 2 == 0 { 1.0 } else { 0.0 };
             } else {
                 img.luma[idx] = 0.001;
@@ -43,20 +41,21 @@ fn detail_frame(
 ///
 /// - Frame 0: high-contrast blob in the left half.
 /// - Frame 1: high-contrast blob in the right half.
-/// - Frame 2: completely flat (near-zero SML everywhere).
-/// - Frame 3: completely flat (near-zero SML everywhere).
+/// - Frame 2: completely flat (near-zero focus score everywhere).
+/// - Frame 3: completely flat (near-zero focus score everywhere).
 ///
 /// Expected outcome:
 /// - Frames 0 and 1 are KEPT (they win a significant fraction of detail
 ///   pixels each).
 /// - Frames 2 and 3 are DROPPED (they never win any detail pixel).
 ///
-/// Under the old all-pixels metric, frame 0 would accumulate *all* the
-/// background/tie-break wins (initialised `best_idx` = 0, `max_val` = -1.0),
-/// giving it an inflated win count that swamps the threshold even for
-/// genuinely flat frames — this test would FAIL under that metric because
-/// flat frames 2 and 3 would also appear to contribute via the same tie
-/// (their SML = 0 > -1.0 for all background pixels not yet won by frame 0).
+/// Only pixels above the contrast floor count. A metric over all pixels would
+/// let frame 0 accumulate *all* the background/tie-break wins (the running best
+/// starts at `best_idx` = 0, `max_val` = -1.0), inflating its win count past the
+/// threshold even for genuinely flat frames, and flat frames 2 and 3 would also
+/// appear to contribute (their score = 0 > -1.0 for background pixels not yet
+/// won by frame 0). Excluding flat pixels from the census is what lets this
+/// test pass.
 #[test]
 fn test_flat_frames_are_culled() {
     let w = 64_usize;
@@ -115,11 +114,97 @@ fn test_flat_frames_are_culled() {
 fn test_all_flat_no_panic() {
     let images: Vec<PlanarImage<f32>> = (0..4).map(|_| flat_frame(16, 16)).collect();
     let result = optimize_stack(&images, 0.5);
-    // No panic is the primary assertion.  The kept set is secondary —
-    // when there are zero detail pixels every frame's win count is 0,
-    // and 0 >= min_detail_pixels (which is also 0) so all frames are kept.
-    assert!(result.kept_indices.len() <= 4);
-    assert!(result.recommended_order.len() <= 4);
+    // With zero detail pixels every frame's win count is 0 and
+    // 0 >= min_detail_pixels (also 0), so exactly all four frames are kept, and
+    // the recommended order is a permutation of them.
+    assert_eq!(result.kept_indices, vec![0, 1, 2, 3]);
+    let mut order = result.recommended_order;
+    order.sort_unstable();
+    assert_eq!(order, vec![0, 1, 2, 3]);
+}
+
+/// `frame_count` frames of `band * textured.len()` columns and `height` rows.
+/// The frame `textured[k]` carries the checkerboard in the `k`-th band of
+/// `band` columns; every other frame is flat.
+fn banded_stack(
+    frame_count: usize,
+    textured: &[usize],
+    band: usize,
+    height: usize,
+) -> Vec<PlanarImage<f32>> {
+    let width = band * textured.len();
+    (0..frame_count)
+        .map(|f| {
+            textured.iter().position(|&t| t == f).map_or_else(
+                || flat_frame(width, height),
+                |k| detail_frame(width, height, k * band, (k + 1) * band, 0, height),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn test_cull_threshold_formula() {
+    assert!((cull_threshold(0) - 2.0).abs() < 1e-6);
+    assert!((cull_threshold(1) - 2.0).abs() < 1e-6);
+    assert!((cull_threshold(25) - 2.0).abs() < 1e-6);
+    assert!((cull_threshold(50) - 1.0).abs() < 1e-6);
+    assert!((cull_threshold(100) - 0.5).abs() < 1e-6);
+    // Never above the ceiling, never increasing with the frame count.
+    for n in 1..300 {
+        assert!(cull_threshold(n) <= MAX_CULL_THRESHOLD_PCT);
+        assert!(cull_threshold(n + 1) <= cull_threshold(n));
+    }
+}
+
+/// FUS-1: 60 frames, each sharp in its own 1/60 vertical band.  With the
+/// absolute 2 % rule every frame won 1.67 % and all of them were dropped.
+#[test]
+fn test_deep_uniform_stack_keeps_every_frame() {
+    let textured: Vec<usize> = (0..60).collect();
+    let images = banded_stack(60, &textured, 8, 16);
+    let result = optimize_stack(&images, 2.0);
+    assert_eq!(
+        result.kept_indices,
+        textured,
+        "all 60 frames must survive; got {} kept",
+        result.kept_indices.len()
+    );
+    assert_eq!(result.recommended_order.len(), 60);
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+}
+
+/// FUS-1: a small stack still drops exactly the blank frames.
+#[test]
+fn test_ten_frames_two_blank_drops_exactly_those() {
+    let textured = [0, 1, 2, 4, 5, 6, 8, 9];
+    let images = banded_stack(10, &textured, 10, 16);
+    let result = optimize_stack(&images, 2.0);
+    assert_eq!(result.kept_indices, textured.to_vec());
+    assert!(!result.kept_indices.contains(&3));
+    assert!(!result.kept_indices.contains(&7));
+    let mut order = result.recommended_order;
+    order.sort_unstable();
+    assert_eq!(order, textured.to_vec());
+}
+
+/// FUS-1: an absurd caller threshold can no longer empty the list; the
+/// frame-count ceiling applies.
+#[test]
+fn test_huge_threshold_never_empties_the_stack() {
+    let textured: Vec<usize> = (0..12).collect();
+    let images = banded_stack(12, &textured, 8, 16);
+    let result = optimize_stack(&images, 99.0);
+    assert_eq!(result.kept_indices.len(), 12);
+}
+
+/// A stack without any detail keeps everything and says so.
+#[test]
+fn test_no_detail_keeps_all_with_warning() {
+    let images: Vec<PlanarImage<f32>> = (0..4).map(|_| flat_frame(16, 16)).collect();
+    let result = optimize_stack(&images, 2.0);
+    assert_eq!(result.kept_indices, vec![0, 1, 2, 3]);
+    assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
 }
 
 /// Single-frame stack: trivially kept, no nearest-neighbour ordering needed.

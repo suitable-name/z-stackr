@@ -1,0 +1,37 @@
+# Trunk (https://trunkrs.dev) build config for `z-stackr-web`. Run from this directory
+# (`apps/stacker-web`): `trunk serve` for a dev server with live rebuild, `trunk build
+# --release` for a deployable `dist/`. Trunk is a tool you install yourself
+# (`cargo install --locked trunk`); nothing in this workspace's own build assumes it.
+[build]
+target = "index.html"
+dist = "dist"
+# Subresource Integrity off: an edge layer that rewrites scripts (minifiers, script
+# injectors) or a deploy that mixes a fresh `.js` with a cached `index.html` would
+# otherwise make the browser block the module and show a blank page. The page loads no
+# third-party script, so transport security (HTTPS) covers what SRI would add.
+no_sri = true
+# The wasm-opt level, the wasm features it may assume and the Cargo profiles are set per
+# module on the `<link>`s in `index.html`.
+
+[watch]
+# The Web Worker (`index.html`'s `data-type="worker"` link), the protocol crate, the
+# pipeline and the GUI library the page runs live in sibling crates; watch them too so
+# `trunk serve` rebuilds on their edits.
+watch = [
+    "src",
+    "Cargo.toml",
+    "../stacker-gui/src",
+    "../stacker-gui/ui",
+    "../stacker-gui/Cargo.toml",
+    "../stacker-gui/build.rs",
+    "../stacker-web-worker/src",
+    "../stacker-web-worker/Cargo.toml",
+    "../../crates/stacker-web-core/src",
+    "../../crates/stacker-web-core/Cargo.toml",
+    "../../crates/stacker-pipeline/src",
+]
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8768
+open = false

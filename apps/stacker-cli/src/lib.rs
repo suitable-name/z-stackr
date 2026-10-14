@@ -1,9 +1,21 @@
+//! The command-line focus stacker: argument parsing, settings loading, the
+//! `--monitor` loop's event filter and the tiled, out-of-core run.
+//!
+//! The per-frame and per-tile stages, and the out-of-core tile loop itself
+//! (`stacker_pipeline::tiled`), are shared with the desktop app; what lives here
+//! is what only the command line has: the clap arguments, the algorithm and
+//! batch (`--stacks`) handling, the progress bars and the output-path
+//! resolution.
+
+#![warn(missing_docs)]
+
+/// Command-line arguments.
 pub mod args;
+/// Batch stacking: one stack per subfolder of the input folder.
 pub mod batch;
-// The out-of-core tiled pipeline (alignment, fusion, tiling, encode) lives in
-// the shared `z-stackr-pipeline` crate so the CLI and GUI call exactly the
-// same code path instead of maintaining separate copies that can silently
-// drift apart. Re-exporting it under the `pipeline` name keeps every
-// `pipeline::...` call site in this crate working unchanged.
-// `src/pipeline.rs` and `src/pipeline/*.rs` are not part of the module tree.
-pub use stacker_pipeline as pipeline;
+/// Loading the settings file passed with `--config`.
+pub mod config;
+/// The decisions of the `--monitor` loop.
+pub mod monitor;
+/// The tiled, out-of-core run.
+pub mod pipeline;

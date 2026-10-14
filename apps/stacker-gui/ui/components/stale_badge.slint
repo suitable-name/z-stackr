@@ -1,0 +1,61 @@
+import { Theme } from "../theme.slint";
+
+// A shared amber "Stale" chip for any result that was computed from inputs that
+// have since changed (an aligned stack after frames were added or removed, a depth
+// map after a settings change). It badges the EXISTING result rather than clearing
+// it: the old result is still useful, it just needs an honest marker that it may
+// not describe what is on screen any more.
+export component StaleBadge inherits Rectangle {
+    in property <string> text: "Stale: inputs changed";
+    // Hides the "Recompute" action for a result with no single re-run entry point;
+    // the badge text alone still shows.
+    in property <bool> show-recompute: true;
+    // False while the action is not available: it is dimmed and ignores clicks. The
+    // "Stale" text itself stays at full strength, since it is information.
+    in property <bool> enabled: true;
+    callback recompute();
+
+    width: layout.preferred-width;
+    height: layout.preferred-height;
+    border-radius: Theme.radius-sm;
+    background: Theme.warning-glow;
+    border-width: Theme.hairline;
+    border-color: Theme.warning;
+
+    layout := HorizontalLayout {
+        padding-left: Theme.space-xs + 2px;
+        padding-right: Theme.space-xs + 2px;
+        padding-top: 2px;
+        padding-bottom: 2px;
+        spacing: Theme.space-xs + 2px;
+
+        Text {
+            text: root.text;
+            font-size: Theme.font-xs;
+            font-weight: 700;
+            color: Theme.warning;
+            vertical-alignment: center;
+        }
+
+        if root.show-recompute: Rectangle {
+            width: recompute-label.preferred-width;
+            opacity: root.enabled ? 1.0 : 0.4;
+            recompute-touch := TouchArea {
+                enabled: root.enabled;
+                accessible-role: button;
+                accessible-label: "Recompute";
+                accessible-enabled: root.enabled;
+                accessible-action-default => { if root.enabled { root.recompute(); } }
+                mouse-cursor: root.enabled ? pointer : default;
+                clicked => { root.recompute(); }
+            }
+            recompute-label := Text {
+                text: "Recompute";
+                font-size: Theme.font-xs;
+                font-weight: 700;
+                color: recompute-touch.has-hover ? Theme.accent-hover : Theme.accent;
+                vertical-alignment: center;
+            }
+        }
+    }
+}

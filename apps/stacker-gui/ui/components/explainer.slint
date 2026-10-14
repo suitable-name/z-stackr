@@ -1,0 +1,125 @@
+import { Button, CheckBox } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+
+// State of the one-time explainer card. Rust (`gui/explainer.rs`) fills `key`,
+// `heading` and `text` and sets `open`; the card reports the user's answer through
+// `dismissed`. Several features can ask for an explainer, so the card is generic:
+// it knows nothing about auto-cull or retouch.
+export global ExplainerModel {
+    in-out property <bool> open: false;
+    // Identifies WHICH explainer this is ("auto-cull"), passed back to Rust
+    // unchanged so "Don't show again" is remembered under the right key.
+    in-out property <string> key: "";
+    in-out property <string> heading: "";
+    in-out property <string> text: "";
+    // The card was closed. `dont-show-again` is the state of its checkbox.
+    callback dismissed(string, bool);
+
+    public function close() {
+        open = false;
+    }
+}
+
+// A one-time card explaining a feature the first time it is used, with a
+// "Don't show again" checkbox. Mounted once in `app.slint` while
+// `ExplainerModel.open`. Esc, Return, the close button and "Got it" all dismiss
+// it (keeping the checkbox state); a click on the backdrop does too. Other keys
+// are swallowed so the window's shortcuts cannot act underneath.
+export component Explainer inherits Rectangle {
+    in-out property <bool> dont-show-again: false;
+
+    callback dismiss(bool);
+
+    background: Theme.overlay-backdrop;
+
+    FocusScope {
+        width: 100%;
+        height: 100%;
+        init => { self.focus(); }
+        key-pressed(event) => {
+            if event.text == Key.Escape || event.text == Key.Return {
+                root.dismiss(root.dont-show-again);
+            } else if event.text == Key.Tab {
+                return reject;
+            }
+            return accept;
+        }
+
+        TouchArea {
+            clicked => { root.dismiss(root.dont-show-again); }
+        }
+
+        Rectangle {
+            width: min(440px, parent.width - 2 * Theme.space-xl);
+            height: content.preferred-height;
+            background: Theme.surface-dialog;
+            border-radius: Theme.radius-md;
+            border-width: Theme.hairline;
+            border-color: Theme.border-dialog;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: Theme.modal-shadow;
+            clip: true;
+
+            // Isolates clicks inside the card from the backdrop.
+            TouchArea {}
+
+            content := VerticalLayout {
+                padding: Theme.space-lg;
+                spacing: Theme.space-md;
+
+                HorizontalLayout {
+                    alignment: space-between;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: ExplainerModel.heading;
+                        font-size: Theme.font-label;
+                        font-weight: 700;
+                        color: Theme.text-strong;
+                        wrap: word-wrap;
+                    }
+                    Rectangle {
+                        width: 26px;
+                        height: 26px;
+                        border-radius: Theme.radius-sm;
+                        background: close-touch.has-hover ? Theme.bg-hover : transparent;
+                        close-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            accessible-role: button;
+                            accessible-label: "Close dialog";
+                            accessible-action-default => { root.dismiss(root.dont-show-again); }
+                            clicked => { root.dismiss(root.dont-show-again); }
+                        }
+                        Text {
+                            text: "\u{2715}";
+                            font-size: Theme.font-sm;
+                            color: Theme.text-muted;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                Text {
+                    text: ExplainerModel.text;
+                    font-size: Theme.font-sm;
+                    color: Theme.text-secondary;
+                    wrap: word-wrap;
+                }
+
+                CheckBox {
+                    text: "Don't show again";
+                    checked <=> root.dont-show-again;
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    Button {
+                        text: "Got it";
+                        primary: true;
+                        clicked => { root.dismiss(root.dont-show-again); }
+                    }
+                }
+            }
+        }
+    }
+}

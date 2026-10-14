@@ -1,268 +1,393 @@
-use std::cmp;
+//! The `Relief` multigrid engine: a confidence-weighted depth map by diffusion.
+//!
+//! The frame index acts as a depth coordinate (the stack is a focus sweep, so the
+//! frames are ordered by depth). Where the focus measure is confident, the depth of
+//! a pixel is the index of its sharpest frame and the pixel is *pinned* to it; where
+//! it is not (flat, blurred or noisy areas), the depth is filled in by diffusion from
+//! the pinned pixels. [`MultigridSolver`] solves that on a hierarchy of coarser
+//! grids, [`pyramid_smooth`] smooths the result, and [`composite_depth`] turns the
+//! continuous depth back into pixels by interpolating the two nearest frames.
+//!
+//! # Entry points
+//!
+//! * [`multigrid_depth`]: the whole-image depth from the per-pixel winning frame
+//!   index and a confidence weight. The planes it reads are small (6 bytes per
+//!   pixel), so a tiled run computes them per tile ([`update_argmax`],
+//!   [`confidence_weights`]), solves **once** on the whole image and composites per
+//!   tile with [`composite_depth`] on the [`crop_plane`] of the depth: the depth
+//!   has no seams and does not depend on the tile size.
+//! * [`composite_depth`]: the fused pixels for a stack (or a tile of it) and the
+//!   matching depth.
+//!
+//! # Memory
+//!
+//! [`multigrid_depth`] needs about 28 bytes per pixel at its peak, on top of the
+//! frames: the two input planes (2 + 4), the four solver planes of the padded
+//! finest level (16) and the coarser levels (about a third more), the smoothing
+//! pyramid being built only after the coarser solver levels are dropped. The result
+//! is 4 bytes per pixel.
+//!
+//! # The algorithm, step by step (so that a GPU twin can reproduce it)
+//!
+//! All arithmetic is `f32`; every operation below is a pure function of the planes
+//! it reads and every output sample is computed on its own, so the result does not
+//! depend on the thread count. A sum is evaluated left to right in the order named.
+//!
+//! * **Padding.** The field is padded to the odd size `(2 * (w / 2) + 1) × (2 * (h /
+//!   2) + 1)` (one column and/or row is added for an even side) by replicating the
+//!   last column and row. Level 0 is the padded field.
+//! * **Levels.** Level `l + 1` is `ceil(w_l / 2) × ceil(h_l / 2)`; levels are added
+//!   while both sides of the last level are above 2. Every level has four planes:
+//!   `a` the solution, `b` the weight in `0..=1`, `c` the target, `d` a scratch
+//!   plane.
+//! * **Initial state of level 0.** A sample whose weight is positive gets
+//!   `c = target`, `b = 1`, `a = target`; every other sample has `a = b = c = 0`.
+//! * **Cycle.** `cycle(l)` does nothing on the last level. On every other level it
+//!   does three times: `restrict(l -> l + 1)`, `cycle(l + 1)`, `prolong(l + 1 -> l)`
+//!   and then three `relax(l)` sweeps. `solve` is `cycle(0)`.
+//! * **Restrict.** A coarse sample `(cx, cy)` covers the fine block with origin
+//!   `(2 cx, 2 cy)`, clipped to the fine level (so 1, 2 or 4 samples). With `n`
+//!   samples taken in the order (row 0: left, right; row 1: left, right):
+//!   `a = sum(a) / n`, `b = sum(b) / n`, and `c = sum(b * c) / sum(b)` if `sum(b) > 0`
+//!   else `0`.
+//! * **Prolong.** Every fine sample `(x, y)` belongs to the coarse sample `(x / 2,
+//!   y / 2)`. If that coarse sample has `b >= 1`, the fine sample is left alone.
+//!   Otherwise `value = bilinear(coarse a)` and `a = b * c + (1 - b) * value` with
+//!   the fine `b` and `c`. The bilinear value of an even/even fine sample is the
+//!   coarse `a`; of an odd `x` the mean `(a + a_right) * 0.5`; of an odd `y` the
+//!   mean `(a + a_down) * 0.5`; of an odd/odd sample `((a + a_right) + (a_down +
+//!   a_down_right)) * 0.25`, where the neighbour indices are clamped to the coarse
+//!   level.
+//! * **Relax** (one Jacobi sweep: reads `a`, writes `d`, then `d` becomes `a`). For
+//!   every sample, `nv = c` if `b > 0`, else the mean of `a` over the in-bounds 3×3
+//!   neighbourhood (rows top to bottom, columns left to right, the sample itself
+//!   included); `d = b * c + (1 - b) * nv`.
+//! * **Smoothing.** [`pyramid_smooth`] of the padded finest `a` with
+//!   `max_scale = smoothing_radius`, then the crop to `w × h`.
+//!
+//! Two deliberate deviations from the GitHub z-stackr algorithm, both bug fixes: the
+//! restricted target of a 1×1 corner block is the target itself (GitHub halved it),
+//! and the prolongation writes all four samples of a block (GitHub skipped the
+//! lower-left sample, which then kept a stale value until the next relaxation).
 
-/// A single layer in the multigrid depth-solver hierarchy.
+#![allow(
+    clippy::suboptimal_flops,
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the solver spells its weighted means as plain multiply-add in a fixed order that a GPU twin reproduces; frame indices and counts are far below 2^24"
+)]
+
+use rayon::prelude::*;
+use stacker_core::image::PlanarImage;
+
+use super::pyramid::{pyramid_smooth, pyramid_smooth_owned};
+
+/// Planes with fewer samples than this are processed on the calling thread (the
+/// coarse levels are visited millions of times and are tiny).
+const PARALLEL_MIN_SAMPLES: usize = 1 << 14;
+
+/// How often a level restricts to the next one, solves it and prolongs back.
+pub const VISITS_PER_LEVEL: usize = 3;
+
+/// How many relaxation sweeps follow each prolongation.
+pub const SWEEPS_PER_VISIT: usize = 3;
+
+/// Run `row_fn(y, row)` for every `width`-wide row of `data`, in parallel when the
+/// plane is large.
+fn for_each_row<F>(data: &mut [f32], width: usize, row_fn: F)
+where
+    F: Fn(usize, &mut [f32]) + Sync + Send,
+{
+    if data.len() >= PARALLEL_MIN_SAMPLES {
+        data.par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(y, row)| row_fn(y, row));
+    } else {
+        data.chunks_mut(width)
+            .enumerate()
+            .for_each(|(y, row)| row_fn(y, row));
+    }
+}
+
+/// Run `row_fn(y, row_a, row_b, row_c)` for every `width`-wide row of three
+/// equally sized planes, in parallel when the planes are large.
+fn for_each_row3<F>(
+    first: &mut [f32],
+    second: &mut [f32],
+    third: &mut [f32],
+    width: usize,
+    row_fn: F,
+) where
+    F: Fn(usize, &mut [f32], &mut [f32], &mut [f32]) + Sync + Send,
+{
+    if first.len() >= PARALLEL_MIN_SAMPLES {
+        first
+            .par_chunks_mut(width)
+            .zip(second.par_chunks_mut(width))
+            .zip(third.par_chunks_mut(width))
+            .enumerate()
+            .for_each(|(y, ((row_a, row_b), row_c))| row_fn(y, row_a, row_b, row_c));
+    } else {
+        first
+            .chunks_mut(width)
+            .zip(second.chunks_mut(width))
+            .zip(third.chunks_mut(width))
+            .enumerate()
+            .for_each(|(y, ((row_a, row_b), row_c))| row_fn(y, row_a, row_b, row_c));
+    }
+}
+
+/// One row of a relaxation sweep: the new value of every sample of row `y`.
+fn relax_row(a: &[f32], b: &[f32], c: &[f32], (w, h): (usize, usize), y: usize, row: &mut [f32]) {
+    let y_min = y.saturating_sub(1);
+    let y_max = (y + 1).min(h - 1);
+    for (x, out) in row.iter_mut().enumerate() {
+        let i = y * w + x;
+        let neighbourhood = if b[i] > 0.0 {
+            c[i]
+        } else {
+            let x_min = x.saturating_sub(1);
+            let x_max = (x + 1).min(w - 1);
+            let mut sum = 0.0_f32;
+            let mut count = 0.0_f32;
+            for ny in y_min..=y_max {
+                for nx in x_min..=x_max {
+                    sum += a[ny * w + nx];
+                    count += 1.0;
+                }
+            }
+            sum / count
+        };
+        *out = b[i] * c[i] + (1.0 - b[i]) * neighbourhood;
+    }
+}
+
+/// A single level of the multigrid hierarchy: four planes of `width × height`.
+#[derive(Debug, Clone)]
 pub struct MultigridLayer {
+    /// Width in samples.
     pub width: usize,
+    /// Height in samples.
     pub height: usize,
-    pub a: Vec<f32>, // solution
-    pub b: Vec<f32>, // weight (0.0 to 1.0)
-    pub c: Vec<f32>, // target value
-    pub d: Vec<f32>, // temp buffer for relaxation
+    /// The solution.
+    pub a: Vec<f32>,
+    /// The weight (confidence) in `0.0..=1.0`; a positive weight pins the sample to
+    /// its target.
+    pub b: Vec<f32>,
+    /// The target value.
+    pub c: Vec<f32>,
+    /// A scratch plane for [`Self::relax`] (its contents are not meaningful between
+    /// calls).
+    pub d: Vec<f32>,
 }
 
 impl MultigridLayer {
-    pub fn new(
-        width: usize,
-        height: usize,
-        initial_target: Option<&[f32]>,
-        initial_weight: Option<&[f32]>,
-    ) -> Self {
+    /// A level of `width × height` samples, all planes zero.
+    #[must_use]
+    pub fn new(width: usize, height: usize) -> Self {
         let len = width * height;
-        let mut a = vec![0.0; len];
-        let mut b = vec![0.0; len];
-        let mut c = vec![0.0; len];
-        let d = vec![0.0; len];
-
-        if let (Some(target), Some(weight)) = (initial_target, initial_weight) {
-            for i in 0..len {
-                if weight[i] >= 0.0 {
-                    if weight[i] > 0.0 {
-                        c[i] = target[i];
-                        b[i] = 1.0;
-                        a[i] = c[i];
-                    } else {
-                        c[i] = 0.0;
-                        b[i] = 0.0;
-                        a[i] = 0.0;
-                    }
-                }
-            }
-        }
-
         Self {
             width,
             height,
-            a,
-            b,
-            c,
-            d,
+            a: vec![0.0; len],
+            b: vec![0.0; len],
+            c: vec![0.0; len],
+            d: vec![0.0; len],
         }
     }
 
-    /// Restrict from `self` (fine) to `coarse`.
-    pub fn restrict_to(&self, coarse: &mut MultigridLayer) {
-        let cw = coarse.width;
-        let ch = coarse.height;
-        let fw = self.width;
-        let fh = self.height;
-
-        for cy in 0..ch {
-            for cx in 0..cw {
-                let c_idx = cy * cw + cx;
-                let fy0 = cy * 2;
-                let fx0 = cx * 2;
-                let idx00 = fy0 * fw + fx0;
-
-                if fy0 + 1 < fh && fx0 + 1 < fw {
-                    // Full 2x2 block
-                    let idx01 = idx00 + 1;
-                    let idx10 = (fy0 + 1) * fw + fx0;
-                    let idx11 = idx10 + 1;
-
-                    coarse.a[c_idx] =
-                        (self.a[idx00] + self.a[idx01] + self.a[idx10] + self.a[idx11]) / 4.0;
-                    coarse.b[c_idx] =
-                        (self.b[idx00] + self.b[idx01] + self.b[idx10] + self.b[idx11]) / 4.0;
-                    // c is only consumed where b > 0; explicit zero for clarity.
-                    coarse.c[c_idx] = 0.0;
-                    if coarse.b[c_idx] > 0.0 {
-                        coarse.c[c_idx] = (self.b[idx00] * self.c[idx00]
-                            + self.b[idx01] * self.c[idx01]
-                            + self.b[idx10] * self.c[idx10]
-                            + self.b[idx11] * self.c[idx11])
-                            / coarse.b[c_idx]
-                            / 4.0;
-                    }
-                } else if fy0 + 1 < fh {
-                    // Right edge (1x2 block)
-                    let idx10 = (fy0 + 1) * fw + fx0;
-                    coarse.a[c_idx] = f32::midpoint(self.a[idx00], self.a[idx10]);
-                    coarse.b[c_idx] = f32::midpoint(self.b[idx00], self.b[idx10]);
-                    coarse.c[c_idx] = 0.0;
-                    if coarse.b[c_idx] > 0.0 {
-                        coarse.c[c_idx] = (self.b[idx00] * self.c[idx00]
-                            + self.b[idx10] * self.c[idx10])
-                            / coarse.b[c_idx]
-                            / 2.0;
-                    }
-                } else if fx0 + 1 < fw {
-                    // Bottom edge (2x1 block)
-                    let idx01 = idx00 + 1;
-                    coarse.a[c_idx] = f32::midpoint(self.a[idx00], self.a[idx01]);
-                    coarse.b[c_idx] = f32::midpoint(self.b[idx00], self.b[idx01]);
-                    coarse.c[c_idx] = 0.0;
-                    if coarse.b[c_idx] > 0.0 {
-                        coarse.c[c_idx] = (self.b[idx00] * self.c[idx00]
-                            + self.b[idx01] * self.c[idx01])
-                            / coarse.b[c_idx]
-                            / 2.0;
-                    }
-                } else {
-                    // Bottom-right corner (1x1 block)
-                    coarse.a[c_idx] = self.a[idx00];
-                    coarse.b[c_idx] = self.b[idx00];
-                    // c is only consumed where b > 0; explicit zero for clarity.
-                    coarse.c[c_idx] = 0.0;
-                    if coarse.b[c_idx] > 0.0 {
-                        coarse.c[c_idx] = (self.b[idx00] * self.c[idx00]) / coarse.b[c_idx] / 2.0;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Prolong from `self` (coarse) to `fine`.
-    pub fn prolong_from(&self, fine: &mut MultigridLayer) {
-        let cw = self.width;
-        let ch = self.height;
-        let fw = fine.width;
-        let fh = fine.height;
-
-        for cy in 0..ch {
-            for cx in 0..cw {
-                let c_idx = cy * cw + cx;
-                let fy0 = cy * 2;
-                let fx0 = cx * 2;
-
-                if self.b[c_idx] != 1.0 {
-                    let mut val = self.a[c_idx];
-                    let idx00 = fy0 * fw + fx0;
-                    fine.a[idx00] = fine.b[idx00] * fine.c[idx00] + (1.0 - fine.b[idx00]) * val;
-
-                    if fx0 < fw - 1 {
-                        if cx < cw - 1 {
-                            val = f32::midpoint(self.a[c_idx], self.a[c_idx + 1]);
-                        }
-                        let idx01 = fy0 * fw + fx0 + 1;
-                        fine.a[idx01] = fine.b[idx01] * fine.c[idx01] + (1.0 - fine.b[idx01]) * val;
-
-                        if fy0 < fh - 1 {
-                            if cx < cw - 1 && cy < ch - 1 {
-                                val = (self.a[c_idx]
-                                    + self.a[c_idx + 1]
-                                    + self.a[c_idx + cw]
-                                    + self.a[c_idx + cw + 1])
-                                    / 4.0;
-                            }
-                            let idx11 = (fy0 + 1) * fw + fx0 + 1;
-                            fine.a[idx11] =
-                                fine.b[idx11] * fine.c[idx11] + (1.0 - fine.b[idx11]) * val;
-                        }
-                    } else if fy0 < fh - 1 {
-                        if cy < ch - 1 {
-                            val = f32::midpoint(self.a[c_idx], self.a[c_idx + cw]);
-                        }
-                        let idx10 = (fy0 + 1) * fw + fx0;
-                        fine.a[idx10] = fine.b[idx10] * fine.c[idx10] + (1.0 - fine.b[idx10]) * val;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Relax: one Jacobi-style relaxation sweep.
+    /// Restrict `self` (the fine level) onto `coarse`: the mean of `a` and `b` over
+    /// each 2×2 block and the `b`-weighted mean of `c` (see the module
+    /// documentation for the exact order).
     ///
-    /// # GPU dispatch
-    /// When compiled with the `gpu` feature, tries a `wgpu` compute-shader
-    /// port first ([`crate::relief::gpu::relax_gpu`]) and falls back to the
-    /// CPU implementation below on any failure (no adapter, the runtime
-    /// switch off, or any `wgpu` call erroring) — never a panic. See
-    /// `relief::gpu`'s module docs for the tolerance-equal (not bit-equal)
-    /// GPU/CPU parity guarantee.
-    pub fn relax(&mut self) {
-        #[cfg(feature = "gpu")]
-        if let Some(new_a) =
-            crate::relief::gpu::relax_gpu(&self.a, &self.b, &self.c, self.width, self.height)
-        {
-            self.a = new_a;
-            return;
-        }
-
-        let w = self.width;
-        let h = self.height;
-
-        for y in 0..h {
-            for x in 0..w {
-                let idx = y * w + x;
-
-                let neighbourhood_val = if self.b[idx] > 0.0 {
-                    self.c[idx]
-                } else {
-                    let mut sum = 0.0;
-                    let mut count = 0.0;
-                    for dy in -1..=1 {
-                        for dx in -1..=1 {
-                            let ny = y as isize + dy;
-                            let nx = x as isize + dx;
-                            if ny >= 0 && ny < h as isize && nx >= 0 && nx < w as isize {
-                                sum += self.a[ny as usize * w + nx as usize];
-                                count += 1.0;
-                            }
+    /// # Panics
+    /// Panics when `coarse` is not `ceil(width / 2) × ceil(height / 2)`.
+    pub fn restrict_to(&self, coarse: &mut Self) {
+        let (fw, fh) = (self.width, self.height);
+        let cw = coarse.width;
+        assert!(
+            cw == fw.div_ceil(2) && coarse.height == fh.div_ceil(2),
+            "the coarse level must be half the fine level, rounded up"
+        );
+        for_each_row3(
+            &mut coarse.a,
+            &mut coarse.b,
+            &mut coarse.c,
+            cw,
+            |cy, row_a, row_b, row_c| {
+                let fy0 = cy * 2;
+                let rows = if fy0 + 1 < fh { 2 } else { 1 };
+                for cx in 0..cw {
+                    let fx0 = cx * 2;
+                    let cols = if fx0 + 1 < fw { 2 } else { 1 };
+                    let mut sum_a = 0.0_f32;
+                    let mut sum_b = 0.0_f32;
+                    let mut sum_bc = 0.0_f32;
+                    let mut count = 0.0_f32;
+                    for dy in 0..rows {
+                        for dx in 0..cols {
+                            let i = (fy0 + dy) * fw + fx0 + dx;
+                            sum_a += self.a[i];
+                            sum_b += self.b[i];
+                            sum_bc += self.b[i] * self.c[i];
+                            count += 1.0;
                         }
                     }
-                    sum / count
+                    row_a[cx] = sum_a / count;
+                    row_b[cx] = sum_b / count;
+                    row_c[cx] = if sum_b > 0.0 { sum_bc / sum_b } else { 0.0 };
+                }
+            },
+        );
+    }
+
+    /// Prolong `self` (the coarse level) onto `fine`: every fine sample whose coarse
+    /// sample is not fully pinned (`b < 1`) takes the bilinear coarse value, blended
+    /// with its own target by its own weight (see the module documentation).
+    ///
+    /// # Panics
+    /// Panics when `self` is not `ceil(width / 2) × ceil(height / 2)` of `fine`.
+    pub fn prolong_from(&self, fine: &mut Self) {
+        let (cw, ch) = (self.width, self.height);
+        let fw = fine.width;
+        assert!(
+            cw == fw.div_ceil(2) && ch == fine.height.div_ceil(2),
+            "the coarse level must be half the fine level, rounded up"
+        );
+        let (fine_b, fine_c) = (&fine.b, &fine.c);
+        for_each_row(&mut fine.a, fw, |y, row| {
+            let cy = y / 2;
+            let cy_next = (cy + 1).min(ch - 1);
+            for (x, out) in row.iter_mut().enumerate() {
+                let cx = x / 2;
+                if self.b[cy * cw + cx] >= 1.0 {
+                    continue;
+                }
+                let cx_next = (cx + 1).min(cw - 1);
+                let here = self.a[cy * cw + cx];
+                let value = match (x % 2, y % 2) {
+                    (0, 0) => here,
+                    (_, 0) => f32::midpoint(here, self.a[cy * cw + cx_next]),
+                    (0, _) => f32::midpoint(here, self.a[cy_next * cw + cx]),
+                    _ => {
+                        ((here + self.a[cy * cw + cx_next])
+                            + (self.a[cy_next * cw + cx] + self.a[cy_next * cw + cx_next]))
+                            * 0.25
+                    }
                 };
-
-                self.d[idx] = self.b[idx] * self.c[idx] + (1.0 - self.b[idx]) * neighbourhood_val;
+                let i = y * fw + x;
+                *out = fine_b[i] * fine_c[i] + (1.0 - fine_b[i]) * value;
             }
-        }
+        });
+    }
 
-        self.a.copy_from_slice(&self.d);
+    /// One Jacobi relaxation sweep: every pinned sample (`b > 0`) is pulled to its
+    /// target, every other sample becomes the mean of its in-bounds 3×3
+    /// neighbourhood. Reads `a`, writes `d`, then swaps the two planes.
+    pub fn relax(&mut self) {
+        let dims = (self.width, self.height);
+        {
+            let (a, b, c) = (&self.a, &self.b, &self.c);
+            for_each_row(&mut self.d, dims.0, |y, row| {
+                relax_row(a, b, c, dims, y, row);
+            });
+        }
+        std::mem::swap(&mut self.a, &mut self.d);
     }
 }
 
+/// The multigrid depth solver for one image.
+#[derive(Debug, Clone)]
 pub struct MultigridSolver {
+    /// The hierarchy, finest (padded) level first; empty for an empty image.
     pub layers: Vec<MultigridLayer>,
+    /// Width of the image in pixels (the unpadded size).
     pub width: usize,
+    /// Height of the image in pixels (the unpadded size).
     pub height: usize,
 }
 
 impl MultigridSolver {
+    /// A solver for the `width × height` field with the given `target` values and
+    /// confidence `weight`s (a weight `> 0` pins the pixel to its target).
+    ///
+    /// Memory: the four planes of the padded finest level (16 bytes per pixel) plus
+    /// the coarser levels (about a third more).
+    ///
+    /// # Panics
+    /// Panics when a slice holds fewer than `width * height` samples.
+    #[must_use]
     pub fn new(width: usize, height: usize, target: &[f32], weight: &[f32]) -> Self {
+        assert!(
+            target.len() >= width * height,
+            "the target must hold width * height samples"
+        );
+        Self::build(width, height, weight, |i| target[i])
+    }
+
+    /// Like [`Self::new`], but the target of a pixel is the frame index `index[i]`
+    /// (so no `f32` target plane is needed).
+    ///
+    /// # Panics
+    /// Panics when a slice holds fewer than `width * height` samples.
+    #[must_use]
+    pub fn from_index(width: usize, height: usize, index: &[u16], weight: &[f32]) -> Self {
+        assert!(
+            index.len() >= width * height,
+            "the index must hold width * height samples"
+        );
+        Self::build(width, height, weight, |i| f32::from(index[i]))
+    }
+
+    /// Pad, initialise the finest level and add the coarser ones.
+    fn build<F>(width: usize, height: usize, weight: &[f32], target_at: F) -> Self
+    where
+        F: Fn(usize) -> f32 + Sync + Send,
+    {
+        assert!(
+            weight.len() >= width * height,
+            "the weight must hold width * height samples"
+        );
+        if width == 0 || height == 0 {
+            return Self {
+                layers: Vec::new(),
+                width,
+                height,
+            };
+        }
         let pad_w = (width / 2) * 2 + 1;
         let pad_h = (height / 2) * 2 + 1;
 
-        let mut padded_target = vec![0.0; pad_w * pad_h];
-        let mut padded_weight = vec![0.0; pad_w * pad_h];
-
-        for y in 0..pad_h {
-            for x in 0..pad_w {
-                let src_y = cmp::min(y, height - 1);
-                let src_x = cmp::min(x, width - 1);
-                let src_idx = src_y * width + src_x;
-                let dst_idx = y * pad_w + x;
-                padded_target[dst_idx] = target[src_idx];
-                padded_weight[dst_idx] = weight[src_idx];
-            }
-        }
-
-        let mut layers = Vec::new();
-        layers.push(MultigridLayer::new(
+        let mut finest = MultigridLayer::new(pad_w, pad_h);
+        for_each_row3(
+            &mut finest.a,
+            &mut finest.b,
+            &mut finest.c,
             pad_w,
-            pad_h,
-            Some(&padded_target),
-            Some(&padded_weight),
-        ));
+            |y, row_a, row_b, row_c| {
+                let source_row = y.min(height - 1) * width;
+                for x in 0..pad_w {
+                    let source = source_row + x.min(width - 1);
+                    if weight[source] > 0.0 {
+                        let target = target_at(source);
+                        row_a[x] = target;
+                        row_b[x] = 1.0;
+                        row_c[x] = target;
+                    }
+                }
+            },
+        );
 
-        let mut curr_w = pad_w;
-        let mut curr_h = pad_h;
-
-        while curr_w > 2 && curr_h > 2 {
-            curr_w = (curr_w + 1) / 2;
-            curr_h = (curr_h + 1) / 2;
-            layers.push(MultigridLayer::new(curr_w, curr_h, None, None));
+        let mut layers = vec![finest];
+        let (mut level_w, mut level_h) = (pad_w, pad_h);
+        while level_w > 2 && level_h > 2 {
+            level_w = level_w.div_ceil(2);
+            level_h = level_h.div_ceil(2);
+            layers.push(MultigridLayer::new(level_w, level_h));
         }
-
         Self {
             layers,
             width,
@@ -270,176 +395,241 @@ impl MultigridSolver {
         }
     }
 
+    /// Run the cycle once (`cycle(0)` of the module documentation). An image whose
+    /// padded finest level already has a side of 2 or less (a single row or column)
+    /// has no coarser level and is left as initialised.
     pub fn solve(&mut self) {
-        self.cycle(0);
+        if self.layers.len() > 1 {
+            self.cycle(0);
+        }
     }
 
+    /// The recursive cycle on `level`; the coarsest level does nothing (its `a` is
+    /// fully determined by the restriction).
     fn cycle(&mut self, level: usize) {
-        // Base case: the coarsest level intentionally does nothing here (no
-        // relaxation is performed at `self.layers.len() - 1`). This is a
-        // deliberate, behaviour-preserving no-op — the coarsest layer is
-        // constructed small enough (`new` stops subdividing once both
-        // dimensions are `<= 2`) that its `a` values are already fully
-        // determined by the preceding `restrict_to` averaging, and every
-        // finer level still receives its full quota of `relax()` passes
-        // after `prolong_from` on the way back up. Do not add relaxation
-        // here without re-validating the full engine's output against the
-        // synthetic-source-selection test in
-        // `docs/relief-multigrid-design-notes.md`.
-        if level < self.layers.len() - 1 {
-            for _ in 0..3 {
-                let (left, right) = self.layers.split_at_mut(level + 1);
-                left[level].restrict_to(&mut right[0]);
-
-                self.cycle(level + 1);
-
-                let (left, right) = self.layers.split_at_mut(level + 1);
-                right[0].prolong_from(&mut left[level]);
-
-                for _ in 0..3 {
-                    self.layers[level].relax();
-                }
+        if level + 1 >= self.layers.len() {
+            return;
+        }
+        for _ in 0..VISITS_PER_LEVEL {
+            {
+                let (fine, coarse) = self.layers.split_at_mut(level + 1);
+                fine[level].restrict_to(&mut coarse[0]);
+            }
+            self.cycle(level + 1);
+            {
+                let (fine, coarse) = self.layers.split_at_mut(level + 1);
+                coarse[0].prolong_from(&mut fine[level]);
+            }
+            for _ in 0..SWEEPS_PER_VISIT {
+                self.layers[level].relax();
             }
         }
     }
 
+    /// The solved field cropped to `width × height` (no smoothing); empty for an
+    /// empty image.
+    #[must_use]
     pub fn get_solution(&self) -> Vec<f32> {
-        let finest = &self.layers[0];
-        let mut out = vec![0.0; self.width * self.height];
-        for y in 0..self.height {
-            for x in 0..self.width {
-                out[y * self.width + x] = finest.a[y * finest.width + x];
-            }
-        }
-        out
+        self.layers.first().map_or_else(Vec::new, |finest| {
+            crop(&finest.a, finest.width, self.width, self.height)
+        })
     }
 
-    /// Post-solve smoothing: applies `crate::relief::pyramid::pyramid_smooth`
-    /// (see its docs for the algorithm) to the padded finest-level
-    /// solution, then crops to `width x height`.
-    ///
-    /// `max_scale` is `relief_smoothing_radius`.
+    /// The solved field after [`pyramid_smooth`] (with `max_scale`, the
+    /// `relief_smoothing_radius`), cropped to `width × height`; empty for an empty
+    /// image.
+    #[must_use]
     pub fn get_smoothed_solution(&self, max_scale: usize) -> Vec<f32> {
-        let finest = &self.layers[0];
-        let smoothed_padded = crate::relief::pyramid::pyramid_smooth(
-            &finest.a,
-            finest.width,
-            finest.height,
-            max_scale,
-        );
+        self.layers.first().map_or_else(Vec::new, |finest| {
+            let smoothed = pyramid_smooth(&finest.a, finest.width, finest.height, max_scale);
+            crop(&smoothed, finest.width, self.width, self.height)
+        })
+    }
 
-        let mut out = vec![0.0; self.width * self.height];
-        for y in 0..self.height {
-            for x in 0..self.width {
-                out[y * self.width + x] = smoothed_padded[y * finest.width + x];
-            }
-        }
-        out
+    /// Like [`Self::get_smoothed_solution`], but consumes the solver and frees the
+    /// coarse levels and the weight and target planes before smoothing, which lowers
+    /// the peak memory.
+    #[must_use]
+    pub fn into_smoothed_solution(self, max_scale: usize) -> Vec<f32> {
+        let (width, height) = (self.width, self.height);
+        let mut layers = self.layers;
+        layers.truncate(1);
+        let Some(finest) = layers.pop() else {
+            return Vec::new();
+        };
+        let MultigridLayer {
+            width: padded_width,
+            height: padded_height,
+            a,
+            ..
+        } = finest;
+        let smoothed = pyramid_smooth_owned(a, padded_width, padded_height, max_scale);
+        crop_owned(smoothed, padded_width, width, height)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::MultigridSolver;
+/// The top-left `width × height` part of a `padded_width`-wide field.
+fn crop(padded: &[f32], padded_width: usize, width: usize, height: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(width * height);
+    for row in padded.chunks(padded_width).take(height) {
+        out.extend_from_slice(&row[..width]);
+    }
+    out
+}
 
-    /// A constant target field with full weight (confidence 1.0) everywhere
-    /// must solve back to that same constant, since every pixel is already
-    /// pinned by `b == 1.0` and `relax()`/`prolong_from()` both preserve
-    /// pinned values (`fine.b[idx] * fine.c[idx] + (1 - fine.b[idx]) * val`
-    /// reduces to `fine.c[idx]` when `b == 1.0`).
-    #[test]
-    fn constant_target_with_full_weight_solves_to_constant() {
-        const CONST: f32 = 0.42;
-        let (w, h) = (10, 8);
-        let target = vec![CONST; w * h];
-        let weight = vec![1.0; w * h];
-
-        let mut solver = MultigridSolver::new(w, h, &target, &weight);
-        solver.solve();
-        let solution = solver.get_solution();
-
-        for (i, &v) in solution.iter().enumerate() {
-            assert!(v.is_finite(), "solution[{i}] is not finite: {v}");
-            assert!(
-                (v - CONST).abs() < 1e-4,
-                "solution[{i}] = {v}, expected {CONST}"
-            );
+/// [`crop`] in place.
+fn crop_owned(mut padded: Vec<f32>, padded_width: usize, width: usize, height: usize) -> Vec<f32> {
+    if padded_width != width {
+        for y in 1..height {
+            padded.copy_within(y * padded_width..y * padded_width + width, y * width);
         }
     }
+    padded.truncate(width * height);
+    padded
+}
 
-    /// Constrained pixels (weight == 1.0) must keep their target value after
-    /// `solve()`, within a small tolerance — they are pinned boundary
-    /// conditions for the diffusion, not free variables.
-    #[test]
-    fn constrained_pixels_keep_their_target_values() {
-        let (w, h) = (12, 12);
-        let mut target = vec![0.0_f32; w * h];
-        let mut weight = vec![0.0_f32; w * h];
+/// The whole-image depth map from the per-pixel winning frame `index` and a
+/// confidence `weight`, tile-invariant by construction.
+///
+/// A pixel with a positive `weight` is pinned to the frame index `index[i]`; the
+/// others are filled in by the multigrid diffusion ([`MultigridSolver`], three
+/// cycles of three sweeps as described in the module documentation) and the result
+/// is smoothed by [`pyramid_smooth`] with `max_scale = smoothing_radius`
+/// (`relief_smoothing_radius`; a value of 1 or less skips the smoothing). The
+/// values are fractional frame indices, in the range of the pinned indices (the
+/// whole procedure averages) up to rounding; pass them to [`composite_depth`].
+///
+/// With no pinned pixel at all the depth is 0 everywhere. An empty image gives an
+/// empty result. Memory: see the module documentation (about 28 bytes per pixel at
+/// the peak). The result does not depend on the thread count.
+///
+/// # Panics
+/// Panics when `index` or `weight` holds fewer than `width * height` samples.
+#[must_use]
+pub fn multigrid_depth(
+    width: usize,
+    height: usize,
+    index: &[u16],
+    weight: &[f32],
+    smoothing_radius: usize,
+) -> Vec<f32> {
+    let mut solver = MultigridSolver::from_index(width, height, index, weight);
+    solver.solve();
+    solver.into_smoothed_solution(smoothing_radius)
+}
 
-        // Pin the left column to 0.0 and the right column to 1.0; leave the
-        // interior unconstrained.
-        for y in 0..h {
-            target[y * w] = 0.0;
-            weight[y * w] = 1.0;
-            target[y * w + (w - 1)] = 1.0;
-            weight[y * w + (w - 1)] = 1.0;
-        }
+/// Fold one frame's focus map into the running per-pixel maximum: where
+/// `focus[i] > best[i]` (strictly, so the earlier frame wins a tie), `best[i]`
+/// becomes `focus[i]` and `index[i]` becomes `frame`.
+///
+/// Start with `best` filled with `f32::NEG_INFINITY` and `index` zero, call this
+/// for the frames in stack order, then pass `index` to [`multigrid_depth`] and
+/// `best` to [`confidence_weights`]. A pixel whose focus values are all NaN keeps
+/// index 0. The update works on any sub-range of pixels (a tile row, a tile).
+///
+/// # Panics
+/// Panics when the three slices differ in length.
+pub fn update_argmax(best: &mut [f32], index: &mut [u16], frame: u16, focus: &[f32]) {
+    assert!(
+        best.len() == index.len() && best.len() == focus.len(),
+        "the planes must have one sample per pixel"
+    );
+    best.par_iter_mut()
+        .zip(index.par_iter_mut())
+        .zip(focus.par_iter())
+        .for_each(|((best, index), &focus)| {
+            if focus > *best {
+                *best = focus;
+                *index = frame;
+            }
+        });
+}
 
-        let mut solver = MultigridSolver::new(w, h, &target, &weight);
-        solver.solve();
-        let solution = solver.get_solution();
+/// The confidence weights for [`multigrid_depth`]: 1 where the best focus value
+/// reaches the contrast `threshold` (`max_focus >= threshold`, the same test as
+/// `mask_above`), else 0.
+#[must_use]
+pub fn confidence_weights(max_focus: &[f32], threshold: f32) -> Vec<f32> {
+    max_focus
+        .par_iter()
+        .map(|&value| if value >= threshold { 1.0 } else { 0.0 })
+        .collect()
+}
 
-        for y in 0..h {
-            let left = solution[y * w];
-            let right = solution[y * w + (w - 1)];
-            assert!(
-                (left - 0.0).abs() < 1e-3,
-                "left-column pixel at row {y} drifted: {left}"
-            );
-            assert!(
-                (right - 1.0).abs() < 1e-3,
-                "right-column pixel at row {y} drifted: {right}"
-            );
-        }
+/// Copy the `width × height` window at `(x0, y0)` out of a `src_width`-wide plane
+/// (to take the depth of a tile out of the whole-image depth).
+///
+/// # Panics
+/// Panics when the window reaches outside the plane.
+#[must_use]
+pub fn crop_plane(
+    plane: &[f32],
+    src_width: usize,
+    (x0, y0): (usize, usize),
+    (width, height): (usize, usize),
+) -> Vec<f32> {
+    let mut out = Vec::with_capacity(width * height);
+    for y in y0..y0 + height {
+        let start = y * src_width + x0;
+        out.extend_from_slice(&plane[start..start + width]);
     }
+    out
+}
 
-    /// An unconstrained hole between two constrained regions (0.0 on the
-    /// left, 1.0 on the right) must be filled with intermediate values by
-    /// the diffusion — no NaN, and every solved value stays within the
-    /// `[min, max]` bracket of the constraints.
-    #[test]
-    fn unconstrained_hole_is_filled_with_intermediate_values() {
-        let (w, h) = (16, 16);
-        let mut target = vec![0.0_f32; w * h];
-        let mut weight = vec![0.0_f32; w * h];
+/// The fused image for a continuous `depth`.
+///
+/// Every pixel interpolates, on all three planes, between the frames
+/// `floor(depth)` and `ceil(depth)` of `frames` with the weight
+/// `depth - floor(depth)` (so an integral depth takes that frame as it is).
+///
+/// `depth` is clamped to `0..=frames.len() - 1` first (NaN becomes 0), and holds one
+/// value per pixel of the frames. Frames of a tile and the [`crop_plane`] of the
+/// whole-image depth give the tile of the whole-image result: the operation is
+/// per pixel. No guided filter follows; the smoothing is in [`multigrid_depth`].
+/// Returns an empty image for no frames.
+///
+/// # Panics
+/// Panics when the frames differ in size or `depth` does not hold one sample per
+/// pixel.
+#[must_use]
+pub fn composite_depth(frames: &[PlanarImage<f32>], depth: &[f32]) -> PlanarImage<f32> {
+    let Some(first) = frames.first() else {
+        return PlanarImage::new(0, 0);
+    };
+    let (width, height) = (first.width, first.height);
+    let len = width * height;
+    assert!(
+        frames
+            .iter()
+            .all(|f| f.width == width && f.height == height),
+        "all frames must have the same size"
+    );
+    assert_eq!(depth.len(), len, "one depth value per pixel");
+    let last = (frames.len() - 1) as f32;
 
-        for y in 0..h {
-            target[y * w] = 0.0;
-            weight[y * w] = 1.0;
-            target[y * w + (w - 1)] = 1.0;
-            weight[y * w + (w - 1)] = 1.0;
-        }
+    let mut luma = vec![0.0_f32; len];
+    let mut chroma_a = vec![0.0_f32; len];
+    let mut chroma_b = vec![0.0_f32; len];
+    luma.par_iter_mut()
+        .zip(chroma_a.par_iter_mut())
+        .zip(chroma_b.par_iter_mut())
+        .zip(depth.par_iter())
+        .enumerate()
+        .for_each(|(i, (((out_l, out_a), out_b), &depth))| {
+            let position = if depth.is_nan() {
+                0.0
+            } else {
+                depth.clamp(0.0, last)
+            };
+            let lower = position.floor();
+            let frac = position - lower;
+            let low = &frames[lower as usize];
+            let high = &frames[position.ceil() as usize];
+            *out_l = low.luma[i] * (1.0 - frac) + high.luma[i] * frac;
+            *out_a = low.chroma_a[i] * (1.0 - frac) + high.chroma_a[i] * frac;
+            *out_b = low.chroma_b[i] * (1.0 - frac) + high.chroma_b[i] * frac;
+        });
 
-        let mut solver = MultigridSolver::new(w, h, &target, &weight);
-        solver.solve();
-        let solution = solver.get_solution();
-
-        for (i, &v) in solution.iter().enumerate() {
-            assert!(v.is_finite(), "solution[{i}] is not finite: {v}");
-            assert!(
-                (0.0..=1.0).contains(&v),
-                "solution[{i}] = {v} outside constraint bracket [0, 1]"
-            );
-        }
-
-        // The hole's centre column should be a genuine blend, not exactly
-        // equal to either constrained endpoint.
-        let mid_x = w / 2;
-        let mid_y = h / 2;
-        let mid_val = solution[mid_y * w + mid_x];
-        assert!(
-            mid_val > 0.05 && mid_val < 0.95,
-            "centre pixel {mid_val} is not a genuine interior blend"
-        );
-    }
+    PlanarImage::from_planes(width, height, luma, chroma_a, chroma_b)
+        .expect("every plane has one sample per pixel")
 }

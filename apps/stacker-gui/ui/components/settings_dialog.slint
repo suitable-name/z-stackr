@@ -1,0 +1,702 @@
+import { Button, ComboBox, LineEdit, ScrollView, Slider, Switch } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { SettingsModel } from "../models/settings.slint";
+import { AppModel } from "../models/app_model.slint";
+import { SettingsTabs, SettingsTabIndex } from "settings_tabs.slint";
+
+// One settings row: a label on the left, the control (`@children`) on the right.
+// The native `Tooltip` covers the whole row, so hovering the label or the control
+// shows the explanation. `dim` greys the label while the control does not apply.
+component SettingRow inherits Rectangle {
+    in property <string> label;
+    in property <string> tip;
+    in property <bool> dim: false;
+
+    HorizontalLayout {
+        spacing: Theme.space-sm;
+        Text {
+            text: root.label;
+            color: root.dim ? Theme.text-disabled : Theme.text-primary;
+            font-size: Theme.font-md;
+            vertical-alignment: center;
+        }
+        Rectangle { horizontal-stretch: 1; }
+        @children
+    }
+
+    Tooltip { text: @markdown("\{root.tip}"); }
+}
+
+// A slider with its rounded value next to it. `display-scale` converts the stored
+// value to the shown one (0.0 ..= 1.0 stored, percent shown).
+component SliderField inherits HorizontalLayout {
+    // The slider's accessible name: the setting row's label.
+    in property <string> name;
+    in-out property <float> value;
+    in property <float> minimum: 0.0;
+    in property <float> maximum: 1.0;
+    in property <float> display-scale: 1.0;
+    in property <string> suffix: "";
+    // Shown instead of the number while the value rounds to zero ("Auto").
+    in property <string> zero-text: "";
+    // 1.0 shows whole numbers, 10.0 one decimal place.
+    in property <float> decimal-scale: 1.0;
+    // One fixed value column for every slider of the dialog, so all the tracks have
+    // the same length whatever the value text ("7", "50.0%", "64 px", "Auto").
+    in property <length> value-width: 52px;
+    in property <bool> enabled: true;
+    callback edited();
+
+    spacing: Theme.space-sm;
+    width: 180px;
+
+    Slider {
+        accessible-label: root.name;
+        minimum: root.minimum;
+        maximum: root.maximum;
+        enabled: root.enabled;
+        value <=> root.value;
+        // `changed` fires for every user change (drag steps and the arrow keys),
+        // never for a value Rust pushes; `released` would miss the keyboard.
+        // The persister is debounced, so a drag still collapses into one write.
+        changed(v) => { root.edited(); }
+    }
+    Text {
+        text: (root.zero-text != "" && Math.round(root.value * root.display-scale * root.decimal-scale) == 0)
+            ? root.zero-text
+            : (Math.round(root.value * root.display-scale * root.decimal-scale) / root.decimal-scale) + root.suffix;
+        color: Theme.text-secondary;
+        font-size: Theme.font-sm;
+        vertical-alignment: center;
+        width: root.value-width;
+    }
+}
+
+// The stacking-settings dialog (a popup overlay). Bound directly to
+// `SettingsModel`; every user edit fires `SettingsModel.settings-edited()` once.
+// The dialog holds no setting default and no combo list of its own: Rust pushes
+// both (see `models/settings.slint`).
+export component SettingsDialog inherits Rectangle {
+    callback apply();
+    callback cancel();
+    callback reset-defaults();
+    callback browse-output-dir();
+    callback load-config();
+    callback save-config();
+
+    // Overlay background: fills the entire parent window.
+    background: Theme.overlay-backdrop;
+    x: 0;
+    y: 0;
+    width: 100%;
+    height: 100%;
+
+    // Swallows clicks so they never reach the window underneath.
+    TouchArea { }
+
+    // Centre card
+    Rectangle {
+        width: 540px;
+        // One fixed height for every tab; the tallest (General) scrolls.
+        height: min(600px, parent.height - 2 * Theme.space-xl);
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: Theme.surface-dialog;
+        border-radius: Theme.radius-lg;
+        border-width: Theme.hairline;
+        border-color: Theme.border-dialog;
+
+        VerticalLayout {
+            padding: Theme.space-xl;
+            spacing: 0px;
+
+            // ── Header ─────────────────────────────────────────────────────
+            HorizontalLayout {
+                alignment: space-between;
+                height: 40px;
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: "Stacking Settings";
+                        color: Theme.text-strong;
+                        font-size: Theme.font-title;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: "Hover a setting for an explanation.";
+                        color: Theme.text-dim;
+                        font-size: Theme.font-xs;
+                    }
+                }
+                TouchArea {
+                    width: 28px;
+                    height: 28px;
+                    mouse-cursor: pointer;
+                    accessible-role: button;
+                    accessible-label: "Close dialog";
+                    accessible-action-default => { root.cancel(); }
+                    clicked => { root.cancel(); }
+                    Rectangle {
+                        background: Theme.bg-control;
+                        border-radius: 14px;
+                        Text {
+                            text: "×";
+                            color: Theme.text-primary;
+                            font-size: Theme.font-lg;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            // ── Tab pills ──────────────────────────────────────────────────
+            Rectangle { height: Theme.space-md; }
+            SettingsTabs {
+                active <=> AppModel.settings-tab;
+            }
+
+            // ── Scrollable settings content (one tab at a time) ────────────
+            ScrollView {
+                vertical-stretch: 1;
+                content-width: self.width;
+
+                VerticalLayout {
+                    alignment: start;
+                    padding-top: Theme.space-md;
+                    padding-bottom: Theme.space-md;
+                    padding-left: 0px;
+                    padding-right: Theme.space-lg;
+                    spacing: Theme.space-lg;
+
+                    // ── General ────────────────────────────────────────────
+                    if AppModel.settings-tab == SettingsTabIndex.general : VerticalLayout {
+                        alignment: start;
+                        spacing: Theme.space-md;
+
+                        SettingRow {
+                            label: "Alignment Mode";
+                            tip: "Method used to align the frames before stacking. Registration solves shift, scale and rotation and suits most series. Translation solves shift and one uniform scale (no rotation), for a tripod or a macro rail. Affine adds a stretch and a shear on top, for a lens or rail that changes the aspect between frames. None skips alignment. Neural predicts the transforms with a trained model (AI builds only). All classical modes minimise the RMS luma difference to the reference.";
+                            ComboBox {
+                                accessible-label: "Alignment Mode";
+                                model: SettingsModel.alignment-options;
+                                current-value <=> SettingsModel.alignment;
+                                selected(v) => { SettingsModel.settings-edited(); }
+                                width: 150px;
+                            }
+                        }
+
+                        // Neural alignment only: the model and what to do with its answer.
+                        if SettingsModel.alignment == "Neural" : SettingRow {
+                            label: "Alignment Model";
+                            tip: "The trained alignment model that predicts each frame's transform. Greyed out when no alignment model is installed. The choice applies to this session; it is not stored in the settings file.";
+                            ComboBox {
+                                accessible-label: "Alignment Model";
+                                model: AppModel.align-models-available ? AppModel.align-model-names : ["(no models found)"];
+                                enabled: AppModel.align-models-available;
+                                current-index <=> AppModel.align-model-index;
+                                width: 200px;
+                            }
+                        }
+
+                        if SettingsModel.alignment == "Neural" : SettingRow {
+                            label: "Refine Neural Alignment Classically";
+                            tip: "Use the model's transforms only as a starting point and let the classical optimiser polish them (recommended). Off applies the model's transforms as they are, without refinement.";
+                            Switch {
+                                accessible-label: "Refine Neural Alignment Classically";
+                                checked <=> SettingsModel.neural-refine-classically;
+                                toggled => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        if !AppModel.web-build: SettingRow {
+                            label: "Optimizer";
+                            dim: SettingsModel.alignment == "None";
+                            tip: "The search the classical alignment modes use to polish a frame. Auto tries Lucas-Kanade first (fast, needs a good start) and falls back to Nelder-Mead from the same start when it fails or ends worse. Lucas-Kanade and Nelder-Mead force one of the two. The browser version always uses Nelder-Mead, so this choice is not offered there.";
+                            ComboBox {
+                                accessible-label: "Optimizer";
+                                model: SettingsModel.optimizer-options;
+                                current-value <=> SettingsModel.optimizer;
+                                selected(v) => { SettingsModel.settings-edited(); }
+                                width: 150px;
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Bounded Search";
+                            dim: SettingsModel.alignment == "None";
+                            tip: "Constrain the optimiser to a small band around the initial estimate (5 % of the image size for each shift, 5 % for the scale, 5 degrees for the rotation). Guarantees a non-degenerate transform.";
+                            Switch {
+                                accessible-label: "Bounded Search";
+                                checked <=> SettingsModel.bounded-search;
+                                toggled => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "AKAZE Seeding";
+                            dim: SettingsModel.alignment == "None";
+                            tip: "Seed the optimiser with an AKAZE feature match before intensity refinement. Helps on textured subjects with large shifts. Off means pure intensity alignment, more robust on glossy or featureless subjects.";
+                            Switch {
+                                accessible-label: "AKAZE Seeding";
+                                checked <=> SettingsModel.akaze-seeding;
+                                toggled => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Correct Brightness";
+                            dim: SettingsModel.alignment == "None";
+                            tip: "Match each aligned frame's brightness to the reference, measured in linear light, so exposure drift between frames (a flicker, an auto-exposure step) does not show up in the stack. Switch it off for a series shot at deliberately different exposures.";
+                            Switch {
+                                accessible-label: "Correct Brightness";
+                                checked <=> SettingsModel.correct-brightness;
+                                toggled => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Chain Alignment";
+                            dim: SettingsModel.alignment == "None";
+                            tip: "Align every frame to the frame before it instead of to the single reference frame, and chain the results. Helps long stacks whose end frames share little with the reference; the cost is a little accumulated drift.";
+                            Switch {
+                                accessible-label: "Chain Alignment";
+                                checked <=> SettingsModel.chain-alignment;
+                                toggled => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Auto-Cull Frames";
+                            tip: "Drops frames that win less than half the average share of the in-focus detail (at most 2 %), so deep stacks keep their frames. If every frame would go, all are kept and a warning is shown.";
+                            Switch {
+                                accessible-label: "Auto-Cull Frames";
+                                checked <=> SettingsModel.auto-cull;
+                                toggled => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Cull Threshold %";
+                            dim: !SettingsModel.auto-cull;
+                            tip: "The share of the in-focus detail a frame must win to be kept, 0 to 50 %. Automatic (0) scales the threshold with the number of frames. A fixed value applies to the Auto-Cull Frames switch and to the Cull button alike.";
+                            SliderField {
+                                name: "Cull Threshold %";
+                                minimum: 0.0;
+                                maximum: 50.0;
+                                suffix: "%";
+                                zero-text: "Auto";
+                                decimal-scale: 10.0;
+                                value <=> SettingsModel.auto-cull-threshold-pct;
+                                edited => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Sort by Sharpness";
+                            tip: "Order the frames sharpest-first (the order of the focus census) before alignment, so the sharpest frame becomes the reference. Off keeps the file order. The Sort button in the Source Files list does this once, on demand.";
+                            Switch {
+                                accessible-label: "Sort by Sharpness";
+                                checked <=> SettingsModel.sort-by-sharpness;
+                                toggled => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Stack Every Nth Frame";
+                            tip: "Skips frames to speed up processing. Set to 1 to process all frames, 2 to process every second frame.";
+                            SliderField {
+                                name: "Stack Every Nth Frame";
+                                minimum: 1.0;
+                                maximum: 10.0;
+                                value <=> SettingsModel.stack-every-nth;
+                                edited => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        if !AppModel.web-build: SettingRow {
+                            label: "Compute Device";
+                            tip: "Where the alignment and the Apex, Relief and Strata fusions run. CPU is the reference. GPU uses the graphics card in a build with GPU support, and falls back to the CPU, with a warning, if there is no usable card, the frames are too large for it or it fails. The result agrees with the CPU within a small tolerance, not bit for bit. The AI mode has its own device choice.";
+                            ComboBox {
+                                accessible-label: "Compute Device";
+                                model: SettingsModel.compute-device-options;
+                                current-value <=> SettingsModel.compute-device;
+                                selected(v) => { SettingsModel.settings-edited(); }
+                                width: 150px;
+                            }
+                        }
+
+                        if !AppModel.web-build: SettingRow {
+                            label: "Tile Size";
+                            tip: "In Memory keeps the whole stack in RAM, the fastest choice. A tile size (in pixels) processes the stack in square tiles that are kept on disk, so a stack larger than the memory can still be fused. Smaller tiles need less memory and more time. Not offered in the browser version.";
+                            ComboBox {
+                                accessible-label: "Tile Size";
+                                model: SettingsModel.tile-size-options;
+                                current-value <=> SettingsModel.tile-size;
+                                selected(v) => { SettingsModel.settings-edited(); }
+                                width: 150px;
+                            }
+                        }
+                    }
+
+                    // ── Apex ───────────────────────────────────────────────
+                    if AppModel.settings-tab == SettingsTabIndex.apex : VerticalLayout {
+                        alignment: start;
+                        spacing: Theme.space-md;
+
+                        SettingRow {
+                            label: "Pyramid levels";
+                            tip: "Controls how many frequency bands are blended. More levels blend larger features but increase processing time and may add halos.";
+                            SliderField {
+                                name: "Pyramid levels";
+                                minimum: 2.0;
+                                maximum: 12.0;
+                                value <=> SettingsModel.pyramid-levels;
+                                edited => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Use all color channels";
+                            tip: "Adds the chroma bands to the energy Apex uses to pick the sharpest frame (luma only by default). Luma and chroma are still copied together from one frame. Costs a few extra multiplies per pixel.";
+                            Switch {
+                                accessible-label: "Use all color channels";
+                                checked <=> SettingsModel.use-all-color-channels;
+                                toggled => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Grit suppression";
+                            tip: "At Apex's finest band, picks each pixel's sharpest frame by the energy of its 3x3 neighbourhood instead of the pixel alone. Nothing is smoothed or filtered.";
+                            Switch {
+                                accessible-label: "Grit suppression";
+                                checked <=> SettingsModel.grit-suppression;
+                                toggled => { SettingsModel.settings-edited(); }
+                            }
+                        }
+                    }
+
+                    // ── Relief ───────────────────────────────────────────────
+                    if AppModel.settings-tab == SettingsTabIndex.relief : VerticalLayout {
+                        alignment: start;
+                        spacing: Theme.space-md;
+
+                        SettingRow {
+                            label: "Estimation radius";
+                            tip: "Radius of the window for the plane-fit variance focus measure. Larger is smoother but gives less precise depth.";
+                            SliderField {
+                                name: "Estimation radius";
+                                minimum: 0.0;
+                                maximum: 100.0;
+                                value <=> SettingsModel.relief-estimation-radius;
+                                edited => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Smoothing radius";
+                            tip: "Radius for the guided filter. Larger values smooth the transition boundaries between differently-focused areas.";
+                            SliderField {
+                                name: "Smoothing radius";
+                                minimum: 0.0;
+                                maximum: 50.0;
+                                value <=> SettingsModel.relief-smoothing-radius;
+                                edited => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Contrast threshold %";
+                            tip: "Pixels below this contrast threshold take the mean of all frames instead of the sharpest source, which keeps flat areas free of selection noise.";
+                            SliderField {
+                                name: "Contrast threshold %";
+                                minimum: 0.0;
+                                maximum: 1.0;
+                                display-scale: 100.0;
+                                suffix: "%";
+                                value <=> SettingsModel.relief-contrast-pct;
+                                edited => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Show preview during stacking";
+                            tip: "Pauses the Relief process and shows a popup where you can adjust the contrast threshold and see the resulting mask overlaid on the image.";
+                            Switch {
+                                accessible-label: "Show preview during stacking";
+                                checked <=> SettingsModel.relief-show-preview;
+                                toggled => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Auto-detect optimum contrast";
+                            dim: !SettingsModel.relief-show-preview;
+                            tip: "When showing the preview, automatically calculates and suggests an optimal threshold value from the spread of the sharpness values (median plus 1.5 times the median absolute deviation).";
+                            Switch {
+                                accessible-label: "Auto-detect optimum contrast";
+                                checked <=> SettingsModel.relief-auto-detect;
+                                toggled => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Multigrid Depth Solver";
+                            tip: "Solves the depth map of the whole image with a multigrid solver instead of taking the sharpest frame per pixel. The depth map comes out smoother and tile-independent, and in-between depths blend two neighbouring frames. It needs a little more memory and time, and handles at most 65,536 frames.";
+                            Switch {
+                                accessible-label: "Multigrid Depth Solver";
+                                checked <=> SettingsModel.relief-use-multigrid;
+                                toggled => { SettingsModel.settings-edited(); }
+                            }
+                        }
+                    }
+
+                    // ── Strata ─────────────────────────────────────────────
+                    if AppModel.settings-tab == SettingsTabIndex.strata : VerticalLayout {
+                        alignment: start;
+                        spacing: Theme.space-md;
+
+                        SettingRow {
+                            label: "Base Radius";
+                            tip: "Radius, in pixels, of the box blur that splits every frame into a smooth base layer and a detail layer. A larger radius moves wider structures into the detail layer, which is then taken from the sharpest frame; a smaller one treats only fine texture as detail. Range 8 to 64.";
+                            SliderField {
+                                name: "Base Radius";
+                                minimum: 8.0;
+                                maximum: 64.0;
+                                suffix: " px";
+                                value <=> SettingsModel.strata-base-radius;
+                                edited => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Detail Focus";
+                            tip: "How strongly the detail layer follows the sharpest frame. 1 blends the frames softly; 5 comes close to taking each detail from one frame only. Range 1 to 5.";
+                            SliderField {
+                                name: "Detail Focus";
+                                minimum: 1.0;
+                                maximum: 5.0;
+                                value <=> SettingsModel.strata-detail-focus;
+                                edited => { SettingsModel.settings-edited(); }
+                            }
+                        }
+                    }
+
+                    // ── Input (preprocessing) ──────────────────────────────
+                    if AppModel.settings-tab == SettingsTabIndex.input : VerticalLayout {
+                        alignment: start;
+                        spacing: Theme.space-md;
+
+                        SettingRow {
+                            label: "Pre-rotation";
+                            tip: "Rotates all incoming images by 90-degree increments before any alignment or processing begins.";
+                            ComboBox {
+                                accessible-label: "Pre-rotation";
+                                // index 0=0°, 1=90°, 2=180°, 3=270°, stored in degrees
+                                model: ["0°", "90°", "180°", "270°"];
+                                current-index: SettingsModel.pre-rotation / 90;
+                                selected(val) => {
+                                    if (val == "0°")   { SettingsModel.pre-rotation = 0;   }
+                                    if (val == "90°")  { SettingsModel.pre-rotation = 90;  }
+                                    if (val == "180°") { SettingsModel.pre-rotation = 180; }
+                                    if (val == "270°") { SettingsModel.pre-rotation = 270; }
+                                    SettingsModel.settings-edited();
+                                }
+                                width: 100px;
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Pre-crop";
+                            tip: "Crops all images to a specified region before processing to save time and memory.";
+                            Switch {
+                                accessible-label: "Pre-crop";
+                                checked <=> SettingsModel.pre-crop-enabled;
+                                toggled => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Crop spec (w,h or x,y,w,h)";
+                            dim: !SettingsModel.pre-crop-enabled;
+                            tip: "Define the crop as 'width,height' (center crop) or 'x,y,width,height' (absolute crop).";
+                            LineEdit {
+                                accessible-label: "Crop spec (w,h or x,y,w,h)";
+                                text <=> SettingsModel.pre-crop-spec;
+                                enabled: SettingsModel.pre-crop-enabled;
+                                placeholder-text: "e.g. 1920,1080";
+                                width: 160px;
+                                edited(t) => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Pre-resize %";
+                            tip: "Downscales images by this percentage before processing. Helpful for quick previews.";
+                            SliderField {
+                                name: "Pre-resize %";
+                                minimum: 10.0;
+                                maximum: 100.0;
+                                suffix: "%";
+                                value <=> SettingsModel.pre-resize-percent;
+                                edited => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Reverse sort order";
+                            tip: "Reverses the alphabetical sorting of input frames. Important if your macro rail goes front-to-back instead of back-to-front.";
+                            Switch {
+                                accessible-label: "Reverse sort order";
+                                checked <=> SettingsModel.sort-reverse;
+                                toggled => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Ignore EXIF orientation";
+                            tip: "Disregards the camera rotation flags inside the image files. Required for some raw converters.";
+                            Switch {
+                                accessible-label: "Ignore EXIF orientation";
+                                checked <=> SettingsModel.ignore-exif;
+                                toggled => { SettingsModel.settings-edited(); }
+                            }
+                        }
+                    }
+
+                    // ── Output (image saving) ──────────────────────────────
+                    if AppModel.settings-tab == SettingsTabIndex.output : VerticalLayout {
+                        alignment: start;
+                        spacing: Theme.space-md;
+
+                        SettingRow {
+                            label: "Crop to Common Area";
+                            tip: "Crop the result to the largest rectangle that every aligned frame covers, so no edge shows filled-in data. A crop that would keep less than half of the canvas is refused as a rogue frame. Off keeps the full canvas and the border shows the nearest edge pixels.";
+                            Switch {
+                                accessible-label: "Crop to Common Area";
+                                checked <=> SettingsModel.crop-to-common-area;
+                                toggled => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Resize Cropped to Original";
+                            dim: !SettingsModel.crop-to-common-area;
+                            tip: "After the common-area crop, stretch the result back to the original image size. This changes the proportions very slightly. It has no effect when nothing was cropped.";
+                            Switch {
+                                accessible-label: "Resize Cropped to Original";
+                                checked <=> SettingsModel.resize-cropped-to-original;
+                                toggled => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Output format";
+                            tip: "Saves the final stacked result as a TIFF, PNG or JPEG.";
+                            ComboBox {
+                                accessible-label: "Output format";
+                                model: SettingsModel.output-format-options;
+                                current-value <=> SettingsModel.output-format;
+                                selected(v) => { SettingsModel.settings-edited(); }
+                                width: 100px;
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Bit depth";
+                            tip: "Saves the file as 16-bit (preserves a vast tonal range) or 8-bit (standard web format). JPEG only supports 8-bit.";
+                            ComboBox {
+                                accessible-label: "Bit depth";
+                                // index 0 = 16-bit, index 1 = 8-bit
+                                model: ["16-bit", "8-bit"];
+                                current-index: SettingsModel.bit-depth == 16 ? 0 : 1;
+                                selected(val) => {
+                                    if (val == "16-bit") { SettingsModel.bit-depth = 16; }
+                                    if (val == "8-bit")  { SettingsModel.bit-depth = 8;  }
+                                    SettingsModel.settings-edited();
+                                }
+                                width: 100px;
+                            }
+                        }
+
+                        SettingRow {
+                            label: "JPEG quality";
+                            dim: SettingsModel.output-format != "JPEG";
+                            tip: "Compression quality (1-100) used when saving JPEG files. 100 is best quality and the largest file.";
+                            SliderField {
+                                name: "JPEG quality";
+                                minimum: 1.0;
+                                maximum: 100.0;
+                                enabled: SettingsModel.output-format == "JPEG";
+                                value <=> SettingsModel.jpeg-quality;
+                                edited => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Filename template";
+                            tip: "Pattern used to name the output file. '{name}' stands for the project name, or the first source file's name while the project is unsaved.";
+                            LineEdit {
+                                accessible-label: "Filename template";
+                                text <=> SettingsModel.filename-template;
+                                placeholder-text: "{name}_stacked";
+                                width: 160px;
+                                edited(t) => { SettingsModel.settings-edited(); }
+                            }
+                        }
+
+                        if !AppModel.web-build: SettingRow {
+                            label: "Default output dir";
+                            tip: "If set, the export dialog's Save writes the file here directly, without asking. Save As… always asks.";
+                            HorizontalLayout {
+                                spacing: Theme.space-xs + 2px;
+                                width: 280px;
+                                LineEdit {
+                                    accessible-label: "Default output dir";
+                                    text <=> SettingsModel.default-output-dir;
+                                    placeholder-text: "Ask each time";
+                                    horizontal-stretch: 1;
+                                    edited(t) => { SettingsModel.settings-edited(); }
+                                }
+                                Button {
+                                    text: "Browse…";
+                                    height: Theme.control-height-sm;
+                                    clicked => { root.browse-output-dir(); }
+                                }
+                            }
+                        }
+
+                        SettingRow {
+                            label: "Copy metadata to output";
+                            tip: "Transfers EXIF metadata (lens, aperture, shutter speed) from the first input frame to the output file.";
+                            Switch {
+                                accessible-label: "Copy metadata to output";
+                                checked <=> SettingsModel.copy-metadata;
+                                toggled => { SettingsModel.settings-edited(); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Buttons ────────────────────────────────────────────────────
+            HorizontalLayout {
+                padding-top: Theme.space-md;
+                spacing: Theme.space-md;
+                alignment: space-between;
+                HorizontalLayout {
+                    spacing: Theme.space-md;
+                    Button { text: "Load Config"; height: Theme.control-height; clicked => { root.load-config(); } }
+                    Button { text: "Save Config"; height: Theme.control-height; clicked => { root.save-config(); } }
+                }
+                HorizontalLayout {
+                    spacing: Theme.space-md;
+                    Button { text: "Reset to Defaults"; height: Theme.control-height; clicked => { root.reset-defaults(); } }
+                    Button { text: "Cancel"; height: Theme.control-height; clicked => { root.cancel(); } }
+                    Button { text: "Apply"; primary: true; height: Theme.control-height; clicked => { root.apply(); } }
+                }
+            }
+        }
+    }
+}

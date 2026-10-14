@@ -1,54 +1,45 @@
 use stacker_core::telemetry::*;
 
+/// A valid filter always succeeds: either it installs the subscriber or one is
+/// already installed (the initialiser is idempotent).
 #[test]
-fn test_init_tracing_mocked() {
-    let result = init_tracing("debug");
-    match result {
-        Ok(()) => {}
-        Err(e) => {
-            let msg = format!("{e}");
-            assert!(
-                msg.contains("Failed to initialize tracing")
-                    || msg.contains("Invalid tracing filter")
-            );
-        }
-    }
+fn test_init_tracing_valid_filter_is_ok() {
+    init_tracing("debug").expect("a valid filter must be accepted");
 }
 
-/// Verify that `init_tracing_to_file` either creates the file and writes to
-/// it, or returns the expected error type when a global subscriber is
-/// already registered (which happens when tests run in the same process).
+/// CORE-7: `init_tracing` is idempotent, so calling it again after the global
+/// subscriber is set (by itself, another test, or anyone) returns `Ok`.
 #[test]
-fn test_init_tracing_to_file_creates_file_or_errors() {
-    let tmp =
-        std::env::temp_dir().join(format!("stacker_telemetry_test_{}.log", std::process::id()));
-    // Clean up any left-over from a previous run.
-    let _ = std::fs::remove_file(&tmp);
+fn test_init_tracing_twice_is_ok() {
+    assert!(init_tracing("info").is_ok());
+    assert!(init_tracing("info").is_ok());
+    assert!(init_tracing("debug").is_ok());
+}
 
-    let result = init_tracing_to_file(&tmp, "info");
-    match result {
-        Ok(()) => {
-            // Subscriber registered — the file must exist and be non-empty
-            // after we emit at least one event.
-            tracing::info!("telemetry file test event");
-            // Give the synchronous writer a moment (it's sync, so no wait
-            // needed, but flush by dropping any guard is implicit here).
-            assert!(
-                tmp.exists(),
-                "log file must exist after init_tracing_to_file"
-            );
-        }
-        Err(e) => {
-            // A global subscriber was already registered by another test or
-            // init_tracing().  The error message must match the expected
-            // pattern — this is the important invariant.
-            let msg = format!("{e}");
-            assert!(
-                msg.contains("Failed to initialize tracing") || msg.contains("IO error"),
-                "unexpected error from init_tracing_to_file: {msg}"
-            );
-        }
-    }
+/// CORE-7: an invalid filter argument is reported, not replaced by `info`,
+/// and it is reported on every call, including after a subscriber exists.
+#[test]
+fn test_init_tracing_invalid_filter_is_error() {
+    let err = init_tracing("app=notalevel").expect_err("invalid level must be an error");
+    assert!(
+        format!("{err}").contains("Invalid tracing filter"),
+        "unexpected message: {err}"
+    );
+    // Same answer once a subscriber is registered.
+    assert!(init_tracing("info").is_ok());
+    assert!(init_tracing("app=notalevel").is_err());
+}
 
-    let _ = std::fs::remove_file(&tmp);
+/// CORE-7: a rejected filter must not leave a log file or directory behind.
+#[test]
+fn test_init_tracing_to_file_invalid_filter_creates_nothing() {
+    let dir = std::env::temp_dir().join(format!("stacker_telemetry_bad_{}", std::process::id()));
+    let log = dir.join("never.log");
+    let _ = std::fs::remove_dir_all(&dir);
+    let result = init_tracing_to_file(&log, "app=notalevel");
+    assert!(result.is_err());
+    assert!(
+        !dir.exists(),
+        "no directory may be created for a bad filter"
+    );
 }

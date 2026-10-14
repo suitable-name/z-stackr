@@ -1,97 +1,135 @@
 # z-stackr-align
 
-The precision alignment engine for **z-stackr** (crate identifier `stacker_align`).
+The alignment engine of **z-stackr** (crate identifier `stacker_align`).
 
-`stacker-align` is responsible for registering misaligned macro images before they are fused. Because depth-of-field bracketed sequences involve changing the lens focal distance, subjects naturally experience magnification scaling (focus breathing) and minor lateral shifts, especially if shot handheld. This crate calculates and applies the exact homographic transformations necessary to bring all images into perfect subpixel alignment.
+Focus-bracketed sequences change in magnification (focus breathing) and shift sideways from frame to frame, especially when shot hand-held. This crate estimates, for each frame, a transform that registers it to the reference frame, and applies it. The transform is chosen from a **motion model** ([`Motion`]): shift only, shift and uniform scale, the four-parameter **similarity** (shift in x and y, uniform scale, rotation) or the six-parameter **affine** map (adds aspect ratio and shear). No model is a full homography.
 
-## Alignment Pipeline
+## Alignment pipeline
 
-Both `z-stackr-cli` and `z-stackr-gui` call through a **single shared dispatch function, `pipeline::align_frame`** — this is deliberate: alignment logic must never be duplicated or re-derived per app. `align_frame` takes a frame, a reference, a seed matrix, the selected `AlignmentModeSetting`, the selected `OptimizerSetting`, and an optional brightness target, and returns the solved matrix plus the warped, brightness-corrected frame.
+The alignment is intensity-based at its core, with an optional feature-matching seed.
 
-The process is **intensity-based at its core** with an *optional* feature-matching seed:
+### 1. Optional seed (feature `akaze`, off by default at run time)
+With the `akaze` feature compiled in, the consuming app decides per run whether to use the seed. The crate then extracts AKAZE keypoints and binary descriptors with the [`akaze`](https://crates.io/crates/akaze) crate, matches them between the reference and the frame, and fits a model with RANSAC (`ransac::AlignmentEstimator::compute_matrix`: translation-only or a 6-parameter affine model, 500 iterations). The sampling uses a fixed-seed `SplitMix64` generator, so the same matches always give the same matrix. A fit is accepted only when at least `min(clamp(ceil(n / 5), min_sample + 2, 50), n)` of the `n` matches agree with it (the same floor guards the focus-breathing estimate).
 
-### 1. Optional Coarse Seed (Feature Gated, off by default)
-AKAZE feature matching is an **optional accelerator, never a requirement** — even when the `akaze` feature is compiled in, the consuming application decides per-run whether to use it. When enabled, the crate uses the [`akaze`](https://crates.io/crates/akaze) crate to extract keypoints and binary (M-LDB) descriptors, matches them between target and reference, and uses a robust **RANSAC** estimator to compute a coarse `Matrix3` seed. The RANSAC acceptance is deliberately strict: a winning model must be supported by **at least 20% of all candidate matches** (floored at `minimal sample + 2`, capped at 50) — a model corroborated only by its own minimal sample is rejected, because on defocused/low-texture macro frames most feature matches are wrong and a barely-supported model is typically an arbitrary large, wrong transform. Index sampling uses the LCG's high bits (low bits of a power-of-two-modulus LCG have degenerate periods). The mapping from `AlignmentModeSetting` to the AKAZE matcher's degrees of freedom is itself a shared function, `pipeline::akaze_mode_for_alignment` (`Affine`/`Registration` → affine seed; `Translation` → shift + uniform-scale seed, matching the refinement DOFs) — both apps call it so the seed's DOF selection can never drift from the actual alignment mode. For `Affine`, the seed's anisotropic-scale/shear estimate now feeds real refinement DOFs instead of being discarded, since `Affine` is the only mode that solves them; for `Registration` the same affine seed is still used, but the refinement stage only solves the similarity subset, so the seed's extra DOFs are simply ignored there.
+Feature detectors fail on glossy or low-texture subjects, so seeding is off by default. Without a seed, the optimiser starts from the identity matrix. A seed that is not plausible is discarded by the caller (`stacker_pipeline::align::is_sane_seed`).
 
-Two safety nets guard the seed and the refined result:
-- `pipeline::is_sane_seed` filters the seed **before** refinement: it must be all-finite, with similarity scales in `[0.5, 2.0]` and translations within **25% of the frame dimension** (the bounded optimiser searches ±20% around the seed, so a seed further off than that would make the true alignment unreachable). An insane seed is replaced by identity. When RANSAC itself errors, the *caller* falls back to the previous frame's solved matrix (chain warm start). A shear-heavy garbage seed failing the similarity-scale band check is expected to fall back to identity too — the seed sanity check is deliberately similarity-shaped even for `Affine` mode.
-- A **post-refinement gate** compares the refined matrix against identity on a ≤256 px downsampled RMS objective and falls back to identity (with a warning log) if refinement made things worse — a bounded-but-wrong seed can otherwise converge on a confidently wrong transform.
+### 2. Subpixel refinement (always runs)
+Starting from the seed (or the identity), an optimiser minimises the RMS difference between the source luma plane and the warped reference luma plane, counting only pixels the warp can sample (a transform that samples less than half of the frame is penalised). The search is coarse-to-fine over a luma pyramid (`LumaPyramid`; the coarsest level is 32 to 63 px on its short side). `refine_motion` is the one entry point the pipeline maps its settings onto:
 
-Because feature detectors fail on glossy / low-texture subjects (e.g. crystals, polished metal), seeding is **off by default**. With seeding disabled the optimiser simply starts from the identity matrix (or, in sequential/chain alignment, the previous frame's solved matrix).
+| `Motion` | Degrees of freedom | Pipeline mode |
+|---|---|---|
+| `Shift` | shift X, shift Y | (tests and seeding) |
+| `Translation` | shift X, shift Y, uniform scale | `translation` |
+| `Similarity` | shift, uniform scale, rotation | `registration` (the default) |
+| `Affine` | similarity + aspect ratio + shear | `affine` |
 
-### 2. Subpixel Refinement — two optimisers, one objective
+The `Optimizer` selects how the objective is minimised:
 
-Every alignment mode (`Translation`, `Registration`, `Affine`) shares the same 6-DOF parameter model (`tx, ty, scale, rotate, aspect, shear`) and the same RMS-difference objective. Which **optimiser** solves it is selected independently, via `StackingSettings::optimizer` (`OptimizerSetting`):
+* **`NelderMead`**: the simplex, in the unbounded form (`refine_alignment`) or the logit-bounded form (`refine_alignment_bounded`). `Affine` is always bounded, because an unbounded six-parameter simplex wanders into degenerate matrices. It is the only optimiser the GPU objective and the ask/tell `search::AlignSearch` (the browser build) serve.
+* **`LucasKanade`**: Gauss-Newton on the same pyramid and objective (`refine_alignment_lk`), clamped to the same windows. CPU only; a failure is returned as an error.
+* **`Auto`** (default): Lucas-Kanade first; if it errors, or its final objective is not finite or is worse than its start, the simplex runs from the same seed (`Refined::fell_back` says so).
 
-- **`Auto`** (default) — try the pyramid Lucas-Kanade / Gauss-Newton optimiser (`refine::refine_alignment_lk`) first; if it errors or its final RMS does not improve on its own starting RMS, fall back to Nelder-Mead (`refine_alignment_registration`) from the same seed.
-- **`LucasKanade`** — force Lucas-Kanade only. On error there is no Nelder-Mead fallback (only the fallback to the sanity-filtered seed every optimiser has).
-- **`NelderMead`** — force the original bounded-simplex optimiser (described below), unconditionally.
+#### The simplex schedule
+The Nelder-Mead refiners walk the pyramid with one coarse-biased schedule (`level_plan`, shared by the synchronous refiners and `AlignSearch`): 150 iterations on every level up to the large ones, 3 on a level whose short side exceeds 512 px, none on the finest level, restarting the coarsest level from ten deterministic starts (the seed plus nine fixed offsets of `0.001 * j` on tx and ty), then a short full-resolution **polish** (`DEFAULT_POLISH_ITERATIONS`, 40) from a simplex scaled to the expected residual. Each level is capped by `max_iterations`.
 
-Lucas-Kanade uses analytic image-gradient Jacobians and converges in far fewer iterations per pyramid level than Nelder-Mead's blind function sampling. See `refine::lucas_kanade`'s module doc for the implementation-level detail.
+#### Direction convention
+The refiners return a matrix `M` that maps **reference coordinates to source coordinates**: at the optimum `source(M * p) ~ reference(p)`. `transform::warp_image(src, A)` produces `dst(p) = src(A^-1 * p)`. To bring a frame onto the reference, warp it with the **inverse**, `A = M^-1`; passing `M` itself displaces the frame by twice its offset. The RANSAC seed uses the same direction.
 
-#### Nelder-Mead — `refine_alignment_registration`
+#### Bounded mode (`refine_alignment_bounded`)
+The same objective, but each active degree of freedom (rotation, scale, shift x, shift y, and for `Affine` aspect and shear) is mapped into a logit-transformed search space with an explicit interval around the starting estimate (`BoundedRefineOptions`). Because the inverse map is a sigmoid, the parameters cannot leave their intervals, so the simplex cannot drift into a degenerate transform. The default half-widths are 5 percent of the image size for each shift, 5 percent for the scale and 5 degrees for the rotation (10 percent for aspect and shear). `allow_shift_x`, `allow_shift_y`, `allow_scale`, `allow_rotation`, `allow_aspect` and `allow_shear` switch degrees of freedom off (a switched-off one is pinned to the value in the seed); a shift-only mode must pass `allow_scale: false` and `allow_rotation: false`, because the defaults enable them. With a single active degree of freedom a plain golden-section search (a bracketing search without parabolic steps, so not Brent's method) replaces the simplex. The unbounded and the bounded paths share one Nelder-Mead implementation.
 
-It performs a coarse-to-fine multi-scale search over a Gaussian luma pyramid, minimising the Root-Mean-Square (RMS) intensity difference against the reference, with:
-- a per-level iteration schedule (short-side thresholding, a fixed iteration count on the large early levels, a larger count near the target, and — critically — the **finest level is deliberately under-refined** rather than iterated to convergence);
-- random restarts at the coarsest level to escape local minima;
-- always-bounded, logit-space parameter mapping so the simplex can never drift into a degenerate transform;
-- per-mode degree-of-freedom gating — a strict ladder, each mode a superset of the last: `Translation` solves shift X/Y **plus centre-anchored uniform scale** with rotation (and aspect/shear) held fixed — the scale DOF stays enabled because focus breathing (per-frame magnification as the focus distance changes) is present in essentially every macro focus stack, and a pure X/Y shift cannot represent it (the residual radial misalignment grows with distance from the centre until the fused result is unusable). `Registration` (**the default**) adds rotation: shift X/Y + uniform scale + rotation, a similarity transform (aspect/shear held fixed). `Affine` adds anisotropic scale and shear on top of `Registration`: a true 6-DOF affine solve — the only mode that can recover independent X/Y scale or shear, at the cost of being more expensive to converge and more prone to overfitting sensor noise on otherwise-similarity-only misalignment. `None` skips refinement entirely and uses the seed as the final matrix.
+#### Registration objective (`refine_alignment_registration`)
+The bounded pyramid search with a different sampler: the objective samples the reference with a four-tap, edge-clamped **C0 cubic kernel**. This kernel is not Catmull-Rom: its weights sum to 1 and it interpolates at the knots, but it is only continuous across integer coordinates, so the objective has a kink at integer shifts. The kernel is kept as it is because recorded registration results depend on it. The matching warp is `transform::warp_image_clamped`. It used to be a single-resolution search; it now uses the same level schedule as the other refiners (`refine_alignment_registration_with_pyramid` takes a reference pyramid built once).
 
-This schedule exists because refining the full-resolution level to convergence chases sensor noise and produces a visible comb/ghosting artifact in the fused output — under-refining the finest level on purpose is intentional.
+#### Determinism
+The RANSAC sampling is deterministic, and the RMS objective adds its per-row partial sums serially in row order, so the objective does not depend on the thread count or on rayon's scheduling.
 
-Every mode warps with `transform::warp_image_clamped` — an **edge-clamped** Spline4x4 interpolation that samples the nearest in-bounds pixel rather than zero-filling past the border, avoiding black edges in the full-canvas output.
+### 3. Identity gate (`apply_identity_gate`)
+A bounded search is centred on its seed, so a plausible but wrong seed can still end on a transform that fits *worse* than doing nothing. After the refinement the gate halves both luma planes until the short side is at most 256 px and compares the objective of the refined matrix with that of the identity; if the identity is strictly better, it replaces the matrix (equal scores keep the refined one). `refined_beats_identity` is the predicate. The gate has no GPU form and no state.
 
-### 3. Neural alignment (`AlignmentModeSetting::Neural`, requires the `nn` feature) — experimental
+### 4. Brightness correction (`brightness`)
+Exposure drift between shots shows up as brightness steps in a fused result. `BrightnessTarget::from_reference` records the reference's luma statistics; `correct_brightness` and `correct_brightness_masked` (with the warp's coverage mask) fit `y' = (scale * y)^gamma` on **linear** luma so that the frame's mean and standard deviation match the reference's, with `gamma` limited to `[0.5, 2.0]`, and apply the same per-pixel ratio to the chroma planes. A frame that already agrees, or a fit that does not improve on the identity, leaves the frame bit for bit unchanged.
 
-`Neural` replaces AKAZE seeding + classical-only refinement with a trained `stacker-nn` alignment model, via `stacker_nn::runtime::LoadedAlignModel::align`. Two architectures are supported, selected automatically from the chosen model's manifest tag: `batchalign-v2` (`BatchAlignNet` — all frames' matrices in one batched whole-stack inference call, wrapping `stacker_nn::bridge::align_planar`) and `fusionalign-v1` (`FusionAlignNet` — one reference/frame pair per call, streamed, O(1) memory in stack size, wrapping `stacker_nn::bridge::align_planar_pairwise`). The model internally downscales every frame to a 512px-longest-side copy before inference — callers pass full-resolution frames and get back full-resolution PIXEL-space matrices; no manual downscaling or matrix decomposition is needed on the caller side, since the returned `Matrix3<f32>` is fed straight into the same `warp_image_clamped`/`warp_planar` warp step every other mode uses.
+### 5. Chain alignment (`chain`)
+Instead of aligning every frame to frame 0, a chain aligns frame `k` to frame `k - 1`. `compose_chain(&C_prev, &step)` composes the steps (`C_k = R_k * C_(k-1)`, in `f64`), and `chain_coverage(&C_k, w, h)` gives the coverage of a frame in frame-0 coordinates from the cumulative matrix, not the step's, so a border of undefined pixels never enters the common area. The module documentation compares the two ways to run the loop.
 
-By default (`neural_refine_classically = true`) the neural matrix is used as a **seed** into the same classical intensity refinement every other mode runs (`pipeline::align_frame`, `Registration` DOFs) — the seed is sanity-filtered by `pipeline::is_sane_seed` and the post-refinement identity gate applies, so a poor neural estimate degrades gracefully to classical behaviour. Set `neural_refine_classically = false` to apply the network's matrix directly with no classical refinement (useful for benchmarking the network in isolation).
+## Core features
 
-Status: **experimental**, coarse registration only. No pretrained alignment model ships with this repository — train one with `z-stackr-train --strategy align` (whole-stack `BatchAlignNet`) or `--strategy fusion-align` (streaming pairwise `FusionAlignNet`), using training data generated by `scripts/03_simulate_misalignment.py` (see that binary's module docs and the `stacker-nn` crate README for the full training data format). Both the GUI and CLI grey out / refuse the Neural option when no alignment-capable model (either architecture) is discovered in the `models/` directory.
-
-### 4. Per-frame brightness correction (`brightness` module)
-`stacker_align::brightness` implements per-frame brightness/gamma correction (on by default, wired via the `correct_brightness` setting): after a frame is warped, its luma is corrected toward a **target** built from the very first frame — a 10,000-bin histogram over gamma-space luma `[0, 2]` yields a target mean and (Bessel-corrected) standard deviation. Every other frame then solves a 2-parameter `(scale, gamma)` fit (`corrected = pow(luma * scale, gamma)`) via a small Nelder-Mead run, minimising squared error between its own corrected mean/std and the target's. The fit is applied to luma, and the resulting per-pixel `luma_out / luma_in` ratio is used to scale both chroma channels too, so brightness is corrected without shifting hue. `BrightnessTarget::new(&first_frame)` builds the target once; `align_frame` applies the correction automatically when a target is passed in.
-
-## Optional GPU acceleration (`gpu` feature)
-
-`transform::warp_image_clamped` — the production edge-clamped warp every active alignment mode uses — internally tries a `wgpu` compute-shader port of its own kernel (`transform::gpu::warp_image_clamped_gpu`) before falling back to the CPU/SIMD implementation (`transform::warp_image_clamped_cpu`). GPU is used only when all three hold: the `gpu` feature is compiled in, the runtime toggle is on, and a `wgpu` adapter is actually available. The runtime toggle is `StackingSettings::use_gpu` (default `true`; CLI `--no-gpu`, GUI switch, Python `use_gpu`), applied via `stacker_core::gpu::set_enabled` — when off, `transform::gpu::warp_image_clamped_gpu` returns `Ok(None)` immediately and the CPU path runs, the same as when no adapter is available. The public `warp_image_clamped` signature and every call site are unaffected either way. GPU output is tolerance-equal (not bit-equal) to the CPU path — see `transform::gpu`'s module docs for the tested epsilon (max-abs diff `< 1e-3`) and `tests/gpu_warp_parity.rs`. Off by default (`--features gpu`). See `docs/gpu_acceleration_summary.md` for the full scope and implementation status.
-
-## Core Features
-
-- **Shared dispatch, not per-app logic**: `pipeline::align_frame` and `pipeline::akaze_mode_for_alignment` are the only alignment entry points either app should call — see "Alignment Pipeline" above.
-- **Two optimisers, one objective**: `OptimizerSetting::Auto` (default) tries the cheaper Lucas-Kanade / Gauss-Newton optimiser first, falling back to the Nelder-Mead bounded simplex on failure/regression; both can be forced unconditionally. See "Subpixel Refinement" above.
-- **Multi-Scale Pyramids with Random Restarts** (Nelder-Mead): Solves large displacements quickly at coarse resolutions, escapes local minima via coarsest-level restarts, then refines — deliberately not to full convergence at the finest level (see above). Lucas-Kanade also runs coarse-to-fine over the same pyramid, but with an analytic-gradient Gauss-Newton solve instead of random restarts, needing far fewer iterations per level.
-- **Robust Transformation**: Handles scaling (focus breathing), translation (handheld camera shake), rotation, and (in `Affine` mode) anisotropic scale + shear, via the alignment mode's DOF gating (`Translation` keeps scale enabled precisely because of focus breathing — see above).
-- **Gamma-Space Contract**: The whole pipeline stores and compares **gamma-encoded (sRGB) BT.601 YCbCr** planes — no transfer function is applied on load (a deliberate reference-fidelity choice). The RMS similarity metric, the AKAZE detector buffer, and the warp all operate on those gamma-encoded values; the RMS objective is additionally mean-bias-corrected, so global brightness offsets do not bias the fit.
-- **Warping**: `transform::warp_image_clamped` (edge-clamped Spline4x4, the production path), with an optional GPU-accelerated path (see "Optional GPU acceleration" above).
-- **Common-Area Crop**: `coverage_mask` and `largest_true_rectangle` compute the rectangle valid in every aligned frame; `resolve_common_crop` wraps that with the guard rails an automatic crop needs — it returns `None` (meaning "don't crop") when there's nothing to crop (the rectangle already covers the whole canvas) or when a rogue/misaligned frame has collapsed the rectangle below 25% of the canvas area. Both `z-stackr-pipeline`'s tiled/whole-image fusion and the GUI's in-RAM Stack path call `resolve_common_crop` to crop the saved output (and exclude the smeared edge-replication band from fusion processing) whenever `StackingSettings::crop_to_common_area` is enabled (the default) — see each app's README for how the crop is applied. Setting `crop_to_common_area = false` always saves the full, uncropped canvas.
-- **Per-Frame Brightness Correction**: see the `brightness` module above — on by default.
+- **Multi-level pyramids** (`LumaPyramid`): large displacements are solved at coarse resolution before the full-resolution polish. A stack aligns N-1 frames to one reference, so the `*_with_pyramid` forms of every refiner take a reference pyramid built once.
+- **Linear-light metrics**: the objective runs on the linear-light luma plane, so it has no sRGB gamma weighting.
+- **Warping**: `warp_image` resamples with bicubic (Catmull-Rom) interpolation and a zero border, with a `std::simd` inner loop; `warp_image_clamped` is the edge-clamped C0-cubic variant. The SIMD width is fixed when the crate is compiled from the target features (16 lanes with `avx512f`, 8 with `avx2`, otherwise 4, one SSE2 operation on the default `x86-64` baseline) and does not change the result; fused multiply-adds go through `stacker_core::fma`, which is an instruction on native targets that have `fma` and an unfused multiply and add on wasm32. `-C target-cpu=x86-64-v3` or a newer level selects the wider vectors (see the root README, "CPU features"). `transform::simd_build_report()` says what the build was compiled for.
+- **Common-area crop**: `coverage_mask` marks the pixels a warp fills with real data, `intersect_coverage` combines masks, and `largest_true_rectangle` finds the rectangle valid in every frame.
+- **GPU objective**: `device::DeviceHandle` is the hook through which the simplex objective can run on a GPU (`stacker-gpu` implements it); the crate itself has no GPU dependency.
 
 ## Usage
 
 ```toml
 [dependencies]
-z-stackr-align = { version = "1.0", features = ["akaze"] }
+z-stackr-align = { path = "../stacker-align", features = ["akaze"] }
 ```
+
+Refine one frame and warp it onto the reference:
 
 ```rust
-use stacker_align::{pipeline::align_frame, brightness::BrightnessTarget, Matrix3};
-use stacker_core::settings::{AlignmentModeSetting, OptimizerSetting};
+use stacker_align::{
+    Matrix3, RefineOptions, refine_alignment,
+    transform::{coverage_mask, warp_image},
+};
+use stacker_core::{error::StackerError, image::PlanarImage};
 
-// Build the brightness target once, from the first frame (or pass `None` to disable correction).
-let brightness_target = Some(BrightnessTarget::new(&reference_frame));
-
-// Align + warp one subsequent frame against the reference (or, in a chain, the
-// previously-warped frame), warm-started from `seed` (e.g. the previous frame's
-// solved matrix, or `Matrix3::identity()` for the first frame).
-let (matrix, warped_frame) = align_frame(
-    target_frame,
-    &reference_frame,
-    seed,
-    AlignmentModeSetting::Registration,
-    OptimizerSetting::Auto,
-    /* bounded (currently always-bounded regardless) */ true,
-    frame_index,
-    brightness_target.as_ref(),
-);
+fn align_one(
+    reference: &PlanarImage<f32>,
+    frame: &PlanarImage<f32>,
+) -> Result<(PlanarImage<f32>, Vec<bool>), StackerError> {
+    // `m` maps reference coordinates to frame coordinates.
+    let m = refine_alignment(
+        reference,
+        frame,
+        &Matrix3::identity(),
+        &RefineOptions::default(),
+    )?;
+    // Bring the frame onto the reference: warp with the inverse.
+    let apply = m
+        .try_inverse()
+        .ok_or_else(|| StackerError::MathError("the refined matrix is not invertible".into()))?;
+    let aligned = warp_image(frame, &apply)?;
+    let covered = coverage_mask(&apply, frame.width, frame.height);
+    Ok((aligned, covered))
+}
 ```
+
+Align a whole stack with a chosen motion model and optimiser, the reference pyramid built once and the identity gate applied:
+
+```rust
+use stacker_align::{
+    Matrix3, Motion, MotionRefine, Optimizer, apply_identity_gate, refine::LumaPyramid,
+    refine_motion, transform::warp_image,
+};
+use stacker_core::{error::StackerError, image::PlanarImage};
+
+fn align_stack(
+    reference: &PlanarImage<f32>,
+    frames: &[PlanarImage<f32>],
+) -> Result<Vec<PlanarImage<f32>>, StackerError> {
+    let pyramid = LumaPyramid::new(reference);
+    // Shift, scale and rotation, Lucas-Kanade with the simplex as the fallback.
+    let cfg = MotionRefine {
+        optimizer: Optimizer::Auto,
+        bounded: true,
+        ..MotionRefine::new(Motion::Similarity)
+    };
+    frames
+        .iter()
+        .map(|frame| -> Result<PlanarImage<f32>, StackerError> {
+            let refined = refine_motion(reference, &pyramid, frame, &Matrix3::identity(), &cfg)?;
+            let matrix = apply_identity_gate(reference, frame, &refined.matrix);
+            let apply = matrix.try_inverse().ok_or_else(|| {
+                StackerError::MathError("the refined matrix is not invertible".into())
+            })?;
+            warp_image(frame, &apply)
+        })
+        .collect()
+}
+```
+
+The apps do not call these pieces one by one. `stacker_pipeline::align::align_frame(reference, frame, &AlignmentSettings::from(&settings), seed)` performs the whole step (mode dispatch, refinement, the identity gate, the inversion, the warp, the coverage mask, brightness correction, and the fallbacks when a refinement or a warp fails) and `align_sequence` drives it over a stack, including the chain mode and the neural seeds; use those unless you need a single piece.

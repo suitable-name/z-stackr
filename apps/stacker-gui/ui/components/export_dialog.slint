@@ -1,0 +1,268 @@
+import { Button, ComboBox, LineEdit, Slider } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { ExportModel } from "../models/export.slint";
+import { SettingsModel } from "../models/settings.slint";
+import { AppModel } from "../models/app_model.slint";
+
+// A small caption above a field.
+component FieldLabel inherits Text {
+    color: Theme.text-secondary;
+    font-size: Theme.font-xs;
+    font-weight: 600;
+}
+
+// The export dialog (File > Export…): where the file goes, what it is called,
+// and in which format. The folder, the template and the format fields are bound
+// straight to `SettingsModel`; every user edit fires `settings-edited()` once, as
+// in the settings dialog, so what is chosen here is also what the settings file
+// keeps. `ExportModel.preview-name` answers from Rust with the sanitised file
+// name the template gives right now.
+//
+// Keys: Esc closes, Return saves (also from inside the template field). Every
+// other key is swallowed so the window's shortcuts cannot act on the content
+// underneath; Tab still moves between the controls.
+export component ExportDialog inherits Rectangle {
+    callback close();
+    callback save();
+    // Ask for the name in a save dialog instead of using the template.
+    callback save-as();
+    callback change-directory();
+
+    background: Theme.overlay-backdrop;
+
+    property <string> unknown: ExportModel.unknown-placeholders(SettingsModel.filename-template);
+    property <string> extension: SettingsModel.output-format == "JPEG" ? "jpg"
+        : (SettingsModel.output-format == "PNG" ? "png" : "tiff");
+    property <bool> has-directory: SettingsModel.default-output-dir != "";
+
+    FocusScope {
+        width: 100%;
+        height: 100%;
+        init => { template-edit.focus(); }
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.close();
+            } else if event.text == Key.Return {
+                root.save();
+            } else if event.text == Key.Tab {
+                return reject;
+            }
+            return accept;
+        }
+
+        // A click on the backdrop closes, like Cancel.
+        TouchArea {
+            clicked => { root.close(); }
+        }
+
+        Rectangle {
+            width: min(540px, parent.width - 2 * Theme.space-xl);
+            height: content.preferred-height;
+            background: Theme.surface-dialog;
+            border-radius: Theme.radius-md;
+            border-width: Theme.hairline;
+            border-color: Theme.border-dialog;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: Theme.modal-shadow;
+            clip: true;
+
+            // Swallows clicks so they never fall through to the backdrop.
+            TouchArea {}
+
+            content := VerticalLayout {
+                padding: Theme.space-lg;
+                spacing: Theme.space-md;
+
+                // ── Header ─────────────────────────────────────────────────
+                HorizontalLayout {
+                    alignment: space-between;
+                    Text {
+                        text: "Export image";
+                        font-size: Theme.font-label;
+                        font-weight: 700;
+                        color: Theme.text-strong;
+                    }
+                    Rectangle {
+                        width: 26px;
+                        height: 26px;
+                        border-radius: Theme.radius-sm;
+                        background: close-touch.has-hover ? Theme.bg-hover : transparent;
+                        close-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            accessible-role: button;
+                            accessible-label: "Close dialog";
+                            accessible-action-default => { root.close(); }
+                            clicked => { root.close(); }
+                        }
+                        Text {
+                            text: "\u{2715}";
+                            font-size: Theme.font-sm;
+                            color: Theme.text-muted;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                Text {
+                    text: ExportModel.target-note;
+                    font-size: Theme.font-sm;
+                    color: Theme.text-secondary;
+                    wrap: word-wrap;
+                }
+
+                // ── Output folder ──────────────────────────────────────────
+                if !AppModel.web-build: VerticalLayout {
+                    spacing: Theme.space-xs;
+                    FieldLabel { text: "Output folder"; }
+                    HorizontalLayout {
+                        spacing: Theme.space-sm;
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            height: Theme.control-height-sm;
+                            background: Theme.bg-input;
+                            border-radius: Theme.radius-sm;
+                            border-width: Theme.hairline;
+                            border-color: Theme.border-control;
+                            clip: true;
+                            Text {
+                                x: Theme.space-sm;
+                                width: parent.width - 2 * Theme.space-sm;
+                                text: root.has-directory
+                                    ? SettingsModel.default-output-dir
+                                    : "Asked in a save dialog each time";
+                                color: root.has-directory ? Theme.text-primary : Theme.text-muted;
+                                font-size: Theme.font-sm;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                        Button {
+                            text: "Change…";
+                            height: Theme.control-height-sm;
+                            clicked => { root.change-directory(); }
+                        }
+                        if root.has-directory: Button {
+                            text: "Ask each time";
+                            height: Theme.control-height-sm;
+                            clicked => {
+                                SettingsModel.default-output-dir = "";
+                                SettingsModel.settings-edited();
+                            }
+                        }
+                    }
+                }
+
+                // ── File name ──────────────────────────────────────────────
+                VerticalLayout {
+                    spacing: Theme.space-xs;
+                    FieldLabel { text: "File name template"; }
+                    template-edit := LineEdit {
+                        text <=> SettingsModel.filename-template;
+                        placeholder-text: "{name}_stacked";
+                        edited(t) => { SettingsModel.settings-edited(); }
+                        accepted(t) => { root.save(); }
+                    }
+                    Text {
+                        text: ExportModel.placeholders;
+                        font-size: Theme.font-xs;
+                        color: Theme.text-dim;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: "File name: "
+                            + ExportModel.preview-name(SettingsModel.filename-template)
+                            + "." + root.extension;
+                        font-size: Theme.font-sm;
+                        font-weight: 600;
+                        color: Theme.accent-result;
+                        wrap: word-wrap;
+                    }
+                    if root.unknown != "": Text {
+                        text: "Not a known placeholder, kept as typed: " + root.unknown;
+                        font-size: Theme.font-xs;
+                        color: Theme.warning;
+                        wrap: word-wrap;
+                    }
+                    if root.has-directory && !AppModel.web-build: Text {
+                        text: "An existing file is never overwritten: the name gets a number instead.";
+                        font-size: Theme.font-xs;
+                        color: Theme.text-dim;
+                        wrap: word-wrap;
+                    }
+                }
+
+                // ── Format ─────────────────────────────────────────────────
+                HorizontalLayout {
+                    spacing: Theme.space-md;
+                    VerticalLayout {
+                        spacing: Theme.space-xs;
+                        FieldLabel { text: "Format"; }
+                        ComboBox {
+                            accessible-label: "Format";
+                            model: SettingsModel.output-format-options;
+                            current-value <=> SettingsModel.output-format;
+                            selected(v) => { SettingsModel.settings-edited(); }
+                            width: 110px;
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: Theme.space-xs;
+                        FieldLabel { text: "Bit depth"; }
+                        ComboBox {
+                            accessible-label: "Bit depth";
+                            // index 0 = 16-bit, index 1 = 8-bit; JPEG is always 8-bit.
+                            model: ["16-bit", "8-bit"];
+                            current-index: SettingsModel.bit-depth == 16 ? 0 : 1;
+                            enabled: SettingsModel.output-format != "JPEG";
+                            selected(val) => {
+                                if (val == "16-bit") { SettingsModel.bit-depth = 16; }
+                                if (val == "8-bit")  { SettingsModel.bit-depth = 8;  }
+                                SettingsModel.settings-edited();
+                            }
+                            width: 110px;
+                        }
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: Theme.space-xs;
+                        FieldLabel {
+                            text: "JPEG quality " + Math.round(SettingsModel.jpeg-quality);
+                            color: SettingsModel.output-format == "JPEG" ? Theme.text-secondary : Theme.text-disabled;
+                        }
+                        Slider {
+                            accessible-label: "JPEG quality";
+                            minimum: 1.0;
+                            maximum: 100.0;
+                            enabled: SettingsModel.output-format == "JPEG";
+                            value <=> SettingsModel.jpeg-quality;
+                            changed(v) => { SettingsModel.settings-edited(); }
+                        }
+                    }
+                }
+
+                // ── Buttons ────────────────────────────────────────────────
+                HorizontalLayout {
+                    spacing: Theme.space-sm;
+                    alignment: end;
+                    Button {
+                        text: AppModel.web-build ? "Download As…" : "Save As…";
+                        height: Theme.control-height;
+                        clicked => { root.save-as(); }
+                    }
+                    Button {
+                        text: "Cancel";
+                        height: Theme.control-height;
+                        clicked => { root.close(); }
+                    }
+                    Button {
+                        text: AppModel.web-build ? "Download" : (root.has-directory ? "Save" : "Choose name…");
+                        primary: true;
+                        height: Theme.control-height;
+                        clicked => { root.save(); }
+                    }
+                }
+            }
+        }
+    }
+}

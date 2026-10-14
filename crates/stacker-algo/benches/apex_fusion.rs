@@ -4,15 +4,23 @@
 //! - `apex_fusion/parallel` — `build_and_fuse_pyramids` (rayon `par_iter` across images)
 //! - `apex_fusion/serial`   — equivalent serial loop (baseline for speedup calculation)
 //!
-//! Run: `cargo bench -p stacker-algo --bench apex_fusion`
-#![allow(
-    clippy::cast_precision_loss, // synthetic benchmark: usize→f32 for pixel coords is fine
-    clippy::suboptimal_flops,    // readability preferred in benchmark setup code
+//! Run: `cargo bench -p z-stackr-algo --bench apex_fusion`
+#![expect(
+    clippy::cast_precision_loss,
+    reason = "synthetic benchmark: usize to f32 for pixel coordinates is exact at these sizes"
 )]
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "readability is preferred in the benchmark setup code"
+)]
+
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use stacker_algo::apex::{
-    fuse::{build_and_fuse_pyramids, fuse_pyramids},
-    pyramid::LaplacianPyramid,
+use stacker_algo::{
+    apex::{
+        fuse::{build_and_fuse_pyramids, fuse_pyramids},
+        pyramid::{LaplacianPyramid, downsample, expand},
+    },
+    relief::focus::compute_focus_map,
 };
 use stacker_core::image::PlanarImage;
 
@@ -79,5 +87,28 @@ fn bench_apex_fusion(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_apex_fusion);
+/// The two pyramid stages that dominate `LaplacianPyramid::build`, in isolation
+/// (the decimating `downsample` and the polyphase `expand`), plus the
+/// plane-fit focus measure.  Run to compare against a pre-PERF-4/5 checkout.
+fn bench_pyramid_stages(c: &mut Criterion) {
+    const W: usize = 1024;
+    const H: usize = 768;
+    let frame = make_frame(W, H, 0.3);
+    let small = downsample(&frame);
+
+    let mut group = c.benchmark_group("pyramid_stages");
+    group.sample_size(20);
+    group.bench_function(format!("downsample/{W}x{H}"), |b| {
+        b.iter(|| downsample(std::hint::black_box(&frame)));
+    });
+    group.bench_function(format!("expand/{W}x{H}"), |b| {
+        b.iter(|| expand(std::hint::black_box(&small), W, H));
+    });
+    group.bench_function(format!("focus_map_r2/{W}x{H}"), |b| {
+        b.iter(|| compute_focus_map(std::hint::black_box(&frame), 2));
+    });
+    group.finish();
+}
+
+criterion_group!(benches, bench_apex_fusion, bench_pyramid_stages);
 criterion_main!(benches);

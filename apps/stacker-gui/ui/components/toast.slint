@@ -1,0 +1,88 @@
+import { Theme } from "../theme.slint";
+
+// A transient message card. Mount it with an `if` on the model's visibility flag
+// and position it from the parent (`x`/`y`); it sizes its own height to the wrapped
+// text. Glyphs stand in for icons, so no image assets are needed.
+export component Toast inherits Rectangle {
+    in property <string> text: "";
+    in property <bool> is-visible: true;
+    // "info", "success", "warning" or "error".
+    in property <string> toast-type: "info";
+
+    callback dismiss();
+
+    visible: root.is-visible;
+    width: 380px;
+    // A Rectangle outside a layout has no intrinsic size: with no `height` it fills
+    // its parent. Size it to the wrapped content instead.
+    height: content.preferred-height;
+    background: root.toast-type == "success" ? Theme.toast-success-surface
+        : (root.toast-type == "error" ? Theme.toast-error-surface
+        : (root.toast-type == "warning" ? Theme.toast-warning-surface : Theme.toast-info-surface));
+    border-color: root.toast-type == "success" ? Theme.success
+        : (root.toast-type == "error" ? Theme.danger
+        : (root.toast-type == "warning" ? Theme.warning : Theme.accent));
+    border-width: Theme.hairline;
+    border-radius: Theme.radius-md;
+    drop-shadow-blur: 20px;
+    drop-shadow-color: Theme.toast-shadow;
+    drop-shadow-offset-y: 6px;
+    clip: true;
+
+    content := HorizontalLayout {
+        padding-left: Theme.space-md + 2px;
+        padding-right: Theme.space-sm + 2px;
+        padding-top: Theme.space-sm + 2px;
+        padding-bottom: Theme.space-sm + 2px;
+        spacing: Theme.space-sm + 2px;
+
+        Text {
+            width: 16px;
+            text: root.toast-type == "success" ? "\u{2713}"
+                : ((root.toast-type == "error" || root.toast-type == "warning") ? "!" : "i");
+            font-size: Theme.font-label;
+            font-weight: 800;
+            horizontal-alignment: center;
+            vertical-alignment: top;
+            color: root.toast-type == "success" ? Theme.success
+                : (root.toast-type == "error" ? Theme.danger
+                : (root.toast-type == "warning" ? Theme.warning : Theme.accent));
+        }
+
+        // Wraps rather than eliding, so a long message stays fully readable; the
+        // toast's height (bound to `content.preferred-height` above) grows to fit.
+        Text {
+            horizontal-stretch: 1;
+            text: root.text;
+            font-size: Theme.font-sm;
+            font-weight: 600;
+            color: Theme.text-strong;
+            wrap: word-wrap;
+            vertical-alignment: center;
+        }
+
+        // Close button
+        Rectangle {
+            width: 24px;
+            height: 24px;
+            border-radius: Theme.radius-sm;
+            background: close-touch.has-hover ? Theme.overlay-hover : transparent;
+
+            close-touch := TouchArea {
+                mouse-cursor: pointer;
+                accessible-role: button;
+                accessible-label: "Dismiss message";
+                accessible-action-default => { root.dismiss(); }
+                clicked => { root.dismiss(); }
+            }
+
+            Text {
+                text: "\u{2715}";
+                font-size: Theme.font-sm;
+                color: Theme.text-secondary;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}

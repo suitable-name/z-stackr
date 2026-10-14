@@ -1,0 +1,140 @@
+import { Button, CheckBox } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+
+// A generic modal confirmation (Save / Discard / Cancel shaped), reused by every
+// destructive-action guard that needs a blocking choice. Deliberately bound to
+// NOTHING but its own properties and callbacks, so each call site drives it from
+// whichever model owns that decision.
+//
+// A full-viewport backdrop plus a content-sized card. Clicking the backdrop counts
+// as Cancel: a stray click outside must never silently escalate into the
+// destructive option. An empty `primary-label`, `secondary-label` or
+// `tertiary-label` hides that button.
+export component ConfirmDialog inherits Rectangle {
+    in property <string> heading: "Please confirm";
+    in property <string> message: "";
+    in property <string> primary-label: "OK";
+    in property <string> secondary-label: "";
+    in property <string> tertiary-label: "";
+    // An optional "Don't ask again" checkbox for a confirmation the user may want to
+    // silence. `dont-ask` is `in-out` so a caller can read it back through a
+    // two-way binding after the dialog closes.
+    in property <bool> show-dont-ask: false;
+    in-out property <bool> dont-ask: false;
+
+    callback primary();
+    callback secondary();
+    callback cancel();
+    callback tertiary();
+
+    background: Theme.overlay-backdrop;
+
+    // Takes focus when mounted so Escape and Return work without a prior click, and
+    // swallows every other key so the window's global shortcuts cannot fire on the
+    // content underneath while this modal is up. Tab is let through so the window's
+    // focus cycling between the buttons still works.
+    FocusScope {
+        width: 100%;
+        height: 100%;
+        init => { self.focus(); }
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.cancel();
+            } else if event.text == Key.Return && root.primary-label != "" {
+                root.primary();
+            } else if event.text == Key.Tab {
+                return reject;
+            }
+            return accept;
+        }
+
+        TouchArea {
+            clicked => { root.cancel(); }
+        }
+
+        Rectangle {
+            width: 420px;
+            height: content.preferred-height;
+            background: Theme.surface-dialog;
+            border-radius: Theme.radius-md;
+            border-width: Theme.hairline;
+            border-color: Theme.border-dialog;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: Theme.modal-shadow;
+            clip: true;
+
+            // Swallows clicks so they never fall through to the backdrop's TouchArea.
+            TouchArea {}
+
+            content := VerticalLayout {
+                padding: Theme.space-lg;
+                spacing: Theme.space-md;
+
+                HorizontalLayout {
+                    alignment: space-between;
+                    Text {
+                        text: root.heading;
+                        font-size: Theme.font-label;
+                        font-weight: 700;
+                        color: Theme.text-strong;
+                    }
+                    Rectangle {
+                        width: 26px;
+                        height: 26px;
+                        border-radius: Theme.radius-sm;
+                        background: close-touch.has-hover ? Theme.bg-hover : transparent;
+                        close-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            accessible-role: button;
+                            accessible-label: "Close dialog";
+                            accessible-action-default => { root.cancel(); }
+                            clicked => { root.cancel(); }
+                        }
+                        Text {
+                            text: "\u{2715}";
+                            font-size: Theme.font-sm;
+                            color: Theme.text-muted;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                Text {
+                    text: root.message;
+                    font-size: Theme.font-sm;
+                    color: Theme.text-secondary;
+                    wrap: word-wrap;
+                }
+
+                if root.show-dont-ask: CheckBox {
+                    text: "Don't ask again";
+                    checked <=> root.dont-ask;
+                }
+
+                HorizontalLayout {
+                    spacing: Theme.space-sm;
+                    alignment: end;
+
+                    if root.tertiary-label != "": Button {
+                        text: root.tertiary-label;
+                        clicked => { root.tertiary(); }
+                    }
+                    Button {
+                        text: "Cancel";
+                        clicked => { root.cancel(); }
+                    }
+                    if root.secondary-label != "": Button {
+                        text: root.secondary-label;
+                        clicked => { root.secondary(); }
+                    }
+                    if root.primary-label != "": Button {
+                        text: root.primary-label;
+                        primary: true;
+                        clicked => { root.primary(); }
+                    }
+                }
+            }
+        }
+    }
+}

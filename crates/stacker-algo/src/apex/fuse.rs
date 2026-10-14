@@ -1,10 +1,96 @@
-use crate::apex::pyramid::LaplacianPyramid;
+//! `Apex` fusion: combine one Laplacian pyramid per frame into a single pyramid.
+//!
+//! [`build_and_fuse_pyramids`] builds the pyramids in parallel and fuses them;
+//! [`fuse_pyramids`] is the selection rule itself (strongest coefficient per
+//! pixel and band, averaged base). [`ApexFold`] is the same fusion streamed one
+//! frame at a time, bit-identical and with memory independent of the frame
+//! count ([`apex_fold_bytes_per_pixel`]). [`apron_for_levels`] and
+//! [`pyramid_grid`] give the tile apron and alignment a tiled run needs.
+
+use crate::{
+    apex::pyramid::{LaplacianPyramid, reconstruct_from_bands},
+    strata::FrameSource,
+};
 use rayon::prelude::*;
 use stacker_core::image::PlanarImage;
+
+/// Fewest pyramid levels `Apex` fusion accepts: one detail band plus the
+/// averaged base.  [`build_and_fuse_pyramids`] clamps smaller requests to it.
+pub const MIN_PYRAMID_LEVELS: usize = 2;
+
+/// Deepest pyramid the apron functions distinguish (the config allows 12).
+const MAX_APRON_LEVELS: usize = 32;
+
+/// The number of source pixels around a pixel that its `Apex` output depends
+/// on, for a pyramid of `levels` levels.
+///
+/// One reduce step reads radius 2 at its own level, so level `k` of the
+/// Gaussian pyramid depends on the source within `2·(2^k − 1)` pixels; the
+/// reconstruction adds one expand per level (radius 2 at level `k`, i.e.
+/// `2·2^k` source pixels). Both chains over `L` levels give
+/// `4·(2^(L−1) − 1)`. The 3×3 neighbourhood energy of the grit suppression adds
+/// one more pixel at level 0. Levels below [`MIN_PYRAMID_LEVELS`] are raised to
+/// it, as [`build_and_fuse_pyramids`] does.
+///
+/// | levels | radius |
+/// |---|---|
+/// | 6 | 125 |
+/// | 7 | 253 |
+/// | 8 | 509 |
+#[must_use]
+pub const fn pyramid_dependence_radius(levels: usize) -> usize {
+    let levels = if levels < MIN_PYRAMID_LEVELS {
+        MIN_PYRAMID_LEVELS
+    } else if levels > MAX_APRON_LEVELS {
+        MAX_APRON_LEVELS
+    } else {
+        levels
+    };
+    4 * ((1_usize << (levels - 1)) - 1) + 1
+}
+
+/// The apron (pixels on every side of a tile) a tiled `Apex` run needs.
+///
+/// With this apron the tile interior equals the whole-image result: it is the
+/// dependence radius of [`pyramid_dependence_radius`] rounded **up to a multiple
+/// of `2^(L−1)`**. The multiple keeps the padded tile's origin on the global decimation grid
+/// when the tile size is itself a multiple of `2^(L−1)` (the pyramid halves
+/// from the tile's own top-left corner, so an origin off the grid would shift
+/// every coarse level against the whole-image pyramid).
+///
+/// | levels | apron |
+/// |---|---|
+/// | 6 | 128 |
+/// | 7 | 256 |
+/// | 8 | 512 |
+#[must_use]
+pub const fn apron_for_levels(levels: usize) -> usize {
+    let grid = pyramid_grid(levels);
+    pyramid_dependence_radius(levels).div_ceil(grid) * grid
+}
+
+/// `2^(L−1)`: the spacing of the coarsest pyramid level in source pixels, and
+/// the multiple that tile sizes and aprons must have for tiles to share the
+/// whole image's decimation grid.
+#[must_use]
+pub const fn pyramid_grid(levels: usize) -> usize {
+    let levels = if levels < MIN_PYRAMID_LEVELS {
+        MIN_PYRAMID_LEVELS
+    } else if levels > MAX_APRON_LEVELS {
+        MAX_APRON_LEVELS
+    } else {
+        levels
+    };
+    1_usize << (levels - 1)
+}
 
 // ── Private blend helpers ────────────────────────────────────────────────────
 
 /// Average all source pixels at `level_idx` into the output buffers.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the number of source frames is far below 2^24"
+)]
 fn blend_average(
     pyramids: &[LaplacianPyramid],
     level_idx: usize,
@@ -40,6 +126,10 @@ fn blend_average(
 /// - `use_color = false`: energy = luma² only.
 /// - `use_color = true`:  energy = luma² + `chroma_a²` + `chroma_b²`.
 #[inline]
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "plain multiply-add keeps the selection energy identical on targets with and without FMA, so ties break the same way"
+)]
 fn pixel_energy(lvl: &stacker_core::image::PlanarImage<f32>, i: usize, use_color: bool) -> f32 {
     let luma = lvl.luma[i];
     let energy = luma * luma;
@@ -74,15 +164,13 @@ fn blend_max_contrast(
         .enumerate()
         .for_each(|(i, ((ol, oa), ob))| {
             // Single pass: evaluate each source's energy exactly once and keep
-            // the argmax. `max_by` re-evaluated the energy of *both* operands on
-            // every comparison (~2× the work); this evaluates each source once.
-            // `>=` reproduces `Iterator::max_by`'s "last maximum wins" tie-break,
-            // so the selection is identical to the previous implementation.
+            // the argmax. Strict `>`: on a tie the FIRST source in input order
+            // wins, the same rule as Relief and the auto-cull (see `fuse_pyramids`).
             let mut winner = 0usize;
             let mut best_e = f32::NEG_INFINITY;
             for (k, p) in pyramids.iter().enumerate() {
                 let e = pixel_energy(&p.levels[level_idx], i, use_color);
-                if e >= best_e {
+                if e > best_e {
                     best_e = e;
                     winner = k;
                 }
@@ -103,7 +191,10 @@ fn blend_max_contrast(
 /// luma² + `chroma_a²` + `chroma_b²`.
 ///
 /// All three channels are always copied coherently from the winning source.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "pyramid set, level, size, metric flag and the three output planes; bundling them would only add a struct used once"
+)]
 fn blend_max_contrast_neighborhood(
     pyramids: &[LaplacianPyramid],
     level_idx: usize,
@@ -114,44 +205,83 @@ fn blend_max_contrast_neighborhood(
     out_chroma_a: &mut [f32],
     out_chroma_b: &mut [f32],
 ) {
+    let len = width * height;
+    if len == 0 {
+        return;
+    }
+    // Frame-outer, pixel-inner: each source's 3×3 energy plane is computed once
+    // (with the same nine-term order as ever), folded into a running best and
+    // winner, and dropped. Strict `>`: on a tie the FIRST source in input order
+    // wins (see `fuse_pyramids`).
+    let mut best = vec![f32::NEG_INFINITY; len];
+    let mut winner = vec![0_u32; len];
+    let mut pixel = vec![0.0_f32; len];
+    let mut energy = vec![0.0_f32; len];
+    for (k, p) in pyramids.iter().enumerate() {
+        let k = u32::try_from(k).expect("fewer than 2^32 frames");
+        grit_energy_plane(&p.levels[level_idx], use_color, &mut pixel, &mut energy);
+        best.par_iter_mut()
+            .zip(winner.par_iter_mut())
+            .zip(energy.par_iter())
+            .for_each(|((b, w), &e)| {
+                if e > *b {
+                    *b = e;
+                    *w = k;
+                }
+            });
+    }
+
     out_luma
         .par_chunks_mut(width)
         .zip(out_chroma_a.par_chunks_mut(width))
         .zip(out_chroma_b.par_chunks_mut(width))
         .enumerate()
         .for_each(|(row, ((rl, ra), rb))| {
+            let base = row * width;
             for col in 0..width {
-                // Evaluate each source's 3×3 neighbourhood energy exactly once,
-                // then take the argmax. The previous `max_by` recomputed the
-                // (9-pixel) neighbourhood energy for *both* operands on every
-                // comparison — ~2× the work on the largest pyramid level. `>=`
-                // reproduces `max_by`'s "last maximum wins" tie-break.
-                let mut winner = 0usize;
-                let mut best_e = f32::NEG_INFINITY;
-                for (k, p) in pyramids.iter().enumerate() {
-                    let lvl = &p.levels[level_idx];
-                    let mut e = 0.0_f32;
-                    for dr in -1_isize..=1 {
-                        for dc in -1_isize..=1 {
-                            let nr = row as isize + dr;
-                            let nc = col as isize + dc;
-                            if nr >= 0 && nr < height as isize && nc >= 0 && nc < width as isize {
-                                let ni = nr as usize * width + nc as usize;
-                                e += pixel_energy(lvl, ni, use_color);
-                            }
-                        }
-                    }
-                    if e >= best_e {
-                        best_e = e;
-                        winner = k;
-                    }
-                }
-
-                let lvl = &pyramids[winner].levels[level_idx];
-                let pi = row * width + col;
+                let pi = base + col;
+                let lvl = &pyramids[winner[pi] as usize].levels[level_idx];
                 rl[col] = lvl.luma[pi];
                 ra[col] = lvl.chroma_a[pi];
                 rb[col] = lvl.chroma_b[pi];
+            }
+        });
+}
+
+/// The grit-suppression selection energy of one level: for every pixel the sum of
+/// [`pixel_energy`] over its 3×3 neighbourhood (out-of-image neighbours skipped),
+/// added row by row from the top-left neighbour to the bottom-right one starting
+/// from `0.0`. This is the exact summation order of the per-pixel formulation, so
+/// the sums (and therefore the exact ties) are bit-identical to it.
+///
+/// `pixel` is scratch for the per-pixel energies; both slices hold
+/// `width * height` samples.
+fn grit_energy_plane(lvl: &PlanarImage<f32>, use_color: bool, pixel: &mut [f32], out: &mut [f32]) {
+    let (width, height) = (lvl.width, lvl.height);
+    if width == 0 || height == 0 {
+        return;
+    }
+    pixel
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(i, p)| *p = pixel_energy(lvl, i, use_color));
+    let pixel: &[f32] = pixel;
+    out.par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(row, out_row)| {
+            let first_row = row.saturating_sub(1);
+            let last_row = (row + 1).min(height - 1);
+            for (col, cell) in out_row.iter_mut().enumerate() {
+                let first_col = col.saturating_sub(1);
+                let last_col = (col + 1).min(width - 1);
+                let mut e = 0.0_f32;
+                for nr in first_row..=last_row {
+                    let base = nr * width;
+                    for nc in first_col..=last_col {
+                        e += pixel[base + nc];
+                    }
+                }
+                *cell = e;
             }
         });
 }
@@ -164,32 +294,40 @@ fn blend_max_contrast_neighborhood(
 /// - **Base / low-frequency level** (last level): averaged across all sources.
 ///   Unaffected by `use_color` or `grit_suppression`.
 /// - **Finest / level 0**: winner selection is controlled by `grit_suppression`:
-///   - `grit_suppression = true` (default): winner chosen by summing Laplacian
-///     energy over a 3×3 neighborhood with clamped boundary.  Neighborhood
-///     energy reduces single-pixel noise artefacts on the highest-frequency band.
-///   - `grit_suppression = false`: winner chosen by per-pixel energy only.
-/// - **All other Laplacian levels**: winner chosen by per-pixel energy.
+///   - `grit_suppression = true` (default): the winner is the source with the
+///     largest selection energy summed over the 3×3 neighbourhood of the pixel
+///     (out-of-image neighbours are skipped).  This only changes *which source
+///     wins*; the winner's own coefficients are copied unchanged, so nothing is
+///     smoothed or filtered.  Its effect is that an isolated noisy coefficient
+///     is less likely to win a pixel by itself.
+///   - `grit_suppression = false`: the winner is chosen by the pixel's own
+///     energy.
+/// - **All other Laplacian levels**: the winner is chosen by the pixel's own
+///   energy (the 3×3 sum is never used there).
 ///
-/// The energy metric for winner selection is controlled by `use_color`:
+/// The selection energy is controlled by `use_color`:
 /// - `use_color = false` (default): energy = luma² only.  Chroma noise cannot
 ///   steer the winner.
-/// - `use_color = true`: energy = luma² + `chroma_a²` + `chroma_b²`.
+/// - `use_color = true`: energy = luma² + `chroma_a²` + `chroma_b²`, i.e. the
+///   chroma bands of the linear YCbCr pyramid add to the selection energy.
+///   The channels are not blended independently, and the cost is a few extra
+///   multiplies per pixel.
 ///
 /// In every winning case all three channels (luma, `chroma_a`, `chroma_b`) are
 /// taken from the *same* source so they remain coherent and false colours
 /// are avoided.
 ///
-/// # GPU dispatch
-/// When compiled with the `gpu` feature, this tries a `wgpu` compute-shader
-/// port of the exact per-level semantics above first
-/// ([`crate::apex::gpu::fuse_pyramids_gpu`]) and falls back to the CPU/rayon
-/// implementation below on any failure (no adapter available, or any `wgpu`
-/// call erroring) — never a panic. See `apex::gpu`'s module docs for the
-/// tolerance-equal (not bit-equal) GPU/CPU parity guarantee and its tested
-/// epsilon. [`ApexAccumulator`]'s incremental whole-image path (used by the
-/// GUI's in-RAM mode) has its own, separate GPU-resident accelerator — see
-/// [`fuse_pyramids_incremental_with_progress`] and
-/// `crate::apex::gpu::accumulator`'s module docs.
+/// **Tie rule:** when two or more sources have exactly the same selection energy
+/// at a pixel, the *first* of them in `pyramids` order wins.  This is the same
+/// rule as the `Relief` per-pixel selection and the auto-cull census (strict `>`
+/// comparisons), so reordering the frames changes ties the same way in all
+/// three.  Flat regions (every detail coefficient zero) therefore take their
+/// detail coefficients and chroma from the first frame.
+///
+/// # Panics
+/// Panics if `pyramids` is empty or the pyramids differ in level count or in
+/// the size of any level.
+#[must_use]
 pub fn fuse_pyramids(
     pyramids: &[LaplacianPyramid],
     use_color: bool,
@@ -199,18 +337,6 @@ pub fn fuse_pyramids(
         !pyramids.is_empty(),
         "cannot fuse an empty array of pyramids"
     );
-
-    // GPU dispatch: try the GPU compute-shader path first (adapter acquired,
-    // per-level semantics matching the CPU code below — see
-    // `apex::gpu`'s module docs), and fall back to the CPU/rayon
-    // implementation on ANY failure (no adapter, a `wgpu` call erroring,
-    // etc.) — never a panic, and the CPU body below always stays reachable.
-    // The chosen backend is logged once by `stacker_core::gpu::context`.
-    #[cfg(feature = "gpu")]
-    if let Some(fused) = crate::apex::gpu::fuse_pyramids_gpu(pyramids, use_color, grit_suppression)
-    {
-        return fused;
-    }
 
     let levels_count = pyramids[0].levels.len();
     for p in pyramids {
@@ -273,17 +399,29 @@ pub fn fuse_pyramids(
             );
         }
 
-        fused_levels.push(PlanarImage {
-            width,
-            height,
-            luma: fused_luma,
-            chroma_a: fused_chroma_a,
-            chroma_b: fused_chroma_b,
-        });
+        fused_levels.push(
+            PlanarImage::from_planes(width, height, fused_luma, fused_chroma_a, fused_chroma_b)
+                .expect("each fused plane holds width * height samples"),
+        );
     }
 
     LaplacianPyramid {
         levels: fused_levels,
+    }
+}
+
+/// A requested depth raised to [`MIN_PYRAMID_LEVELS`], with a warning when it was
+/// raised.
+fn clamp_requested_levels(max_levels: usize) -> usize {
+    if max_levels < MIN_PYRAMID_LEVELS {
+        tracing::warn!(
+            requested = max_levels,
+            used = MIN_PYRAMID_LEVELS,
+            "pyramid_levels below {MIN_PYRAMID_LEVELS} would turn Apex into a plain mean; clamping"
+        );
+        MIN_PYRAMID_LEVELS
+    } else {
+        max_levels
     }
 }
 
@@ -298,6 +436,14 @@ pub fn fuse_pyramids(
 ///
 /// `use_color` and `grit_suppression` are forwarded directly to
 /// [`fuse_pyramids`]; see that function's documentation for their semantics.
+///
+/// A `max_levels` below [`MIN_PYRAMID_LEVELS`] is raised to it with a warning:
+/// a one-level pyramid has only the base band, which is *averaged* across the
+/// frames, so `Apex` would silently degrade to a plain mean of the stack.
+///
+/// # Panics
+/// Panics if `images` is empty or the images differ in size.
+#[must_use]
 pub fn build_and_fuse_pyramids(
     images: &[PlanarImage<f32>],
     max_levels: usize,
@@ -305,6 +451,7 @@ pub fn build_and_fuse_pyramids(
     grit_suppression: bool,
 ) -> LaplacianPyramid {
     assert!(!images.is_empty(), "cannot fuse an empty image stack");
+    let max_levels = clamp_requested_levels(max_levels);
     let pyramids: Vec<LaplacianPyramid> = images
         .par_iter()
         .map(|img| LaplacianPyramid::build(img, max_levels))
@@ -312,518 +459,402 @@ pub fn build_and_fuse_pyramids(
     fuse_pyramids(&pyramids, use_color, grit_suppression)
 }
 
-// ── Incremental whole-image accumulator ─────────────────────────────────────
+// ── Streaming fold ───────────────────────────────────────────────────────────
 
-/// Full-depth pyramid level count passed to [`LaplacianPyramid::build`].
-///
-/// A value of 32 always exceeds the maximum number of halvings possible for
-/// any practical image (a 4 `GPixel` image only produces ~16 levels before the
-/// early-break condition fires), so the pyramid depth is determined entirely
-/// by the image dimensions rather than this constant.
-const FULL_DEPTH: usize = 32;
+/// Samples per parallel work item of the fold's per-pixel selection.
+const FOLD_CHUNK: usize = 4096;
 
-/// `FULL_DEPTH`, re-exported at `pub(crate)` visibility for
-/// `apex::gpu::accumulator::GpuApexAccumulator::new`, which needs the exact
-/// same level budget the CPU accumulator uses so a mid-stack GPU-to-CPU
-/// hand-off (see that module's docs) builds subsequent frames' pyramids to
-/// a depth that matches the levels already accumulated on the GPU.
-#[cfg(feature = "gpu")]
-pub(crate) const FULL_DEPTH_PUB: usize = FULL_DEPTH;
-
-/// Memory-bounded incremental `Apex` focus-stacking accumulator.
-///
-/// Rather than holding one pyramid per input frame (O(N) memory for N frames),
-/// this type maintains a single *accumulator pyramid* that is updated in-place
-/// as each new frame arrives.  Peak memory is therefore ~2 whole-image
-/// pyramids at any one time: the long-lived accumulator plus the single
-/// per-frame pyramid built inside [`blend`](Self::blend) — which is dropped
-/// immediately after blending.
-///
-/// # Selection semantics
-///
-/// - **Residual (last) level**: running arithmetic mean across all blended
-///   frames.  Each call to [`blend`](Self::blend) updates the accumulator
-///   with the online formula `acc = (acc * count + src) / (count + 1)`.
-/// - **Finest level (index 0) with `grit_suppression = true`**: the centre
-///   pixel of the accumulator is replaced by the corresponding source pixel
-///   when the source's 3×3-neighbourhood energy strictly exceeds the
-///   accumulator's 3×3-neighbourhood energy (ties keep the accumulator, i.e.
-///   the earliest frame wins).
-/// - **All other Laplacian levels**: per-pixel energy selection.  The source
-///   replaces the accumulator pixel when the source energy strictly exceeds
-///   the accumulator energy (ties keep the accumulator).
-///
-/// Energy is luma² when `use_color = false`, or luma² + `chroma_a²` +
-/// `chroma_b²` when `use_color = true`.  All three channels are always copied
-/// coherently from the winning source to avoid false colours.
-pub struct ApexAccumulator {
-    levels: Vec<PlanarImage<f32>>,
-    count: usize,
-    build_levels: usize,
-    use_color: bool,
-    grit_suppression: bool,
+/// `Σ ⌈per_pixel / 4^k⌉` over the first `levels` pyramid levels: the bytes per
+/// source pixel of a pyramid whose finest level costs `per_pixel` (a safe upper
+/// bound, each level rounded up).
+const fn pyramid_bytes(per_pixel: usize, levels: usize) -> usize {
+    let mut total = 0;
+    let mut k = 0;
+    while k < levels {
+        total += if 2 * k >= 16 {
+            1
+        } else {
+            per_pixel.div_ceil(1 << (2 * k))
+        };
+        k += 1;
+    }
+    total
 }
 
-impl ApexAccumulator {
-    /// Create a new accumulator seeded with `first`.
-    ///
-    /// A full-depth Laplacian pyramid is built from `first` (using
-    /// [`FULL_DEPTH`] as the level budget, so the actual depth is limited only
-    /// by the image dimensions).  The resulting levels become the initial
-    /// accumulator state; `count` is set to 1.
-    ///
-    /// Peak memory during construction: the source image plus two full-size
-    /// pyramid allocations (one temporary inside [`LaplacianPyramid::build`],
-    /// one stored as the accumulator).
-    pub fn new(first: &PlanarImage<f32>, use_color: bool, grit_suppression: bool) -> Self {
-        let p = LaplacianPyramid::build(first, FULL_DEPTH);
-        Self {
-            levels: p.levels,
-            count: 1,
-            build_levels: FULL_DEPTH,
-            use_color,
-            grit_suppression,
-        }
-    }
+/// Bytes per source pixel that an [`ApexFold`] with `levels` pyramid levels holds
+/// at its peak, independent of the number of frames.
+///
+/// The sum of: the accumulator pyramid (12 B per level-0 pixel, a quarter of that
+/// per further level), the `best_energy` planes of every level but the residual
+/// (4 B per pixel, likewise), the grit scratch of the finest level (two `f32`
+/// planes, 8 B), the incoming frame's pyramid (as the accumulator), and 24 B for
+/// the transients of building that pyramid (the working copy of the frame and the
+/// expanded plane set). For 8 levels this is about 84 B per pixel.
+///
+/// The batch path ([`build_and_fuse_pyramids`]) holds every frame's pyramid at
+/// once: the pipeline's estimate for it is `28 N + 66` B per pixel, so the fold is
+/// lower for any stack of two or more frames and stays flat as `N` grows.
+/// `levels` is clamped like the fold clamps it (at least [`MIN_PYRAMID_LEVELS`]).
+#[must_use]
+pub const fn apex_fold_bytes_per_pixel(levels: usize) -> usize {
+    let levels = if levels < MIN_PYRAMID_LEVELS {
+        MIN_PYRAMID_LEVELS
+    } else if levels > MAX_APRON_LEVELS {
+        MAX_APRON_LEVELS
+    } else {
+        levels
+    };
+    let accumulator = pyramid_bytes(12, levels);
+    let best = pyramid_bytes(4, levels - 1);
+    let grit_scratch = 8;
+    let frame_pyramid = pyramid_bytes(12, levels);
+    let build_transients = 24;
+    accumulator + best + grit_scratch + frame_pyramid + build_transients
+}
 
-    /// Construct a CPU accumulator resuming from an already-in-progress
-    /// state — the mid-stack hand-off from [`crate::apex::gpu::accumulator::GpuApexAccumulator`]
-    /// when a GPU dispatch fails part-way through a stack (see that
-    /// module's docs for the full rationale). `levels` is the exact
-    /// GPU-accumulated state read back via `GpuApexAccumulator::read_back`,
-    /// `count` is the number of frames already folded into it, and
-    /// `build_levels`/`use_color`/`grit_suppression` must match the values
-    /// the `GpuApexAccumulator` was constructed with so subsequent
-    /// [`blend`](Self::blend) calls stay numerically consistent with the
-    /// frames already accumulated on the GPU.
-    #[cfg(feature = "gpu")]
+/// The streaming form of [`build_and_fuse_pyramids`]: frames are folded in one at
+/// a time and only one accumulator pyramid is ever held.
+///
+/// Per pyramid level the fold keeps the winner's coefficients and a
+/// `best_energy` plane (at the finest level with grit suppression, the winner's
+/// own 3×3 energy sum); a later frame replaces a pixel only when its energy is
+/// **strictly** larger, so the first frame wins ties, exactly as in the batch
+/// rule. The residual (last) level is a running **sum** divided by the frame
+/// count in [`Self::finish`], added in frame order, so the result equals the batch
+/// fusion bit for bit (not a running mean, which would round differently).
+///
+/// ```
+/// use stacker_algo::apex::fuse::{build_and_fuse_pyramids, ApexFold};
+/// use stacker_core::image::PlanarImage;
+///
+/// let frames: Vec<PlanarImage<f32>> = (0..3)
+///     .map(|k| PlanarImage::with_luma(8, 8, vec![k as f32; 64]).unwrap())
+///     .collect();
+/// let mut fold = ApexFold::new(3, false, true);
+/// for frame in &frames {
+///     fold.fold(frame);
+/// }
+/// let streamed = fold.finish();
+/// let batch = build_and_fuse_pyramids(&frames, 3, false, true).reconstruct();
+/// assert_eq!(streamed.luma, batch.luma);
+/// ```
+pub struct ApexFold {
+    max_levels: usize,
+    use_color: bool,
+    grit_suppression: bool,
+    state: Option<FoldState>,
+}
+
+/// The accumulator: allocated when the first frame arrives (its pyramid fixes
+/// the level sizes).
+struct FoldState {
+    /// Per level the winner's coefficients; the last level is the running sum.
+    values: Vec<PlanarImage<f32>>,
+    /// Per level but the last: the winner's selection energy.
+    best: Vec<Vec<f32>>,
+    /// Frames folded so far.
+    count: usize,
+    /// Scratch of the finest level's grit energy (per-pixel energies, 3×3 sums);
+    /// empty unless grit suppression is on.
+    pixel: Vec<f32>,
+    energy: Vec<f32>,
+}
+
+impl ApexFold {
+    /// A fold for pyramids of at most `max_levels` levels, with the selection
+    /// rules of [`fuse_pyramids`] (`use_color`, `grit_suppression`). A
+    /// `max_levels` below [`MIN_PYRAMID_LEVELS`] is raised to it with a warning,
+    /// as [`build_and_fuse_pyramids`] does.
     #[must_use]
-    pub(crate) const fn from_gpu_state(
-        levels: Vec<PlanarImage<f32>>,
-        count: usize,
-        build_levels: usize,
-        use_color: bool,
-        grit_suppression: bool,
-    ) -> Self {
+    pub fn new(max_levels: usize, use_color: bool, grit_suppression: bool) -> Self {
         Self {
-            levels,
-            count,
-            build_levels,
+            max_levels: clamp_requested_levels(max_levels),
             use_color,
             grit_suppression,
+            state: None,
         }
     }
 
-    /// Blend one more frame into the accumulator.
-    ///
-    /// A full-depth pyramid is built from `img`, blended into the accumulator
-    /// level-by-level, and then immediately dropped.  Peak memory during this
-    /// call is ~2 whole-image pyramids (the accumulator plus the freshly built
-    /// source pyramid).
+    /// The number of frames folded so far.
+    #[must_use]
+    pub fn frames_folded(&self) -> usize {
+        self.state.as_ref().map_or(0, |s| s.count)
+    }
+
+    /// Fold one frame into the accumulator. Frames must arrive in stack order
+    /// (ties go to the earlier one) and all have the size of the first.
     ///
     /// # Panics
-    ///
-    /// Panics if the new frame produces a pyramid whose level count or any
-    /// level's dimensions differ from those stored in the accumulator.  In
-    /// practice this cannot happen when all input frames share the same
-    /// dimensions, which is a precondition of focus stacking.
-    fn blend_finest_with_grit_suppression(
-        use_color: bool,
-        src: &PlanarImage<f32>,
-        acc: &mut PlanarImage<f32>,
-    ) {
-        let width = acc.width;
-        let height = acc.height;
-        let acc_energy: Vec<f32> = (0..width * height)
-            .map(|i| pixel_energy(acc, i, use_color))
-            .collect();
-        let src_energy: Vec<f32> = (0..width * height)
-            .map(|i| pixel_energy(src, i, use_color))
-            .collect();
-        acc.luma
-            .par_chunks_mut(width)
-            .zip(acc.chroma_a.par_chunks_mut(width))
-            .zip(acc.chroma_b.par_chunks_mut(width))
-            .enumerate()
-            .for_each(|(row, ((rl, ra), rb))| {
-                for col in 0..width {
-                    // Sum 3×3 neighbourhood energies for acc and src
-                    // using the pre-computed snapshots.
-                    let mut tgt_e = 0.0_f32;
-                    let mut src_e = 0.0_f32;
-                    for dr in -1_isize..=1 {
-                        for dc in -1_isize..=1 {
-                            let nr = row as isize + dr;
-                            let nc = col as isize + dc;
-                            if nr >= 0 && nr < height as isize && nc >= 0 && nc < width as isize {
-                                let ni = nr as usize * width + nc as usize;
-                                tgt_e += acc_energy[ni];
-                                src_e += src_energy[ni];
-                            }
-                        }
-                    }
-                    // Strict >: ties keep the accumulator (earliest frame wins).
-                    if src_e > tgt_e {
-                        let pi = row * width + col;
-                        rl[col] = src.luma[pi];
-                        ra[col] = src.chroma_a[pi];
-                        rb[col] = src.chroma_b[pi];
-                    }
-                }
-            });
-    }
-
-    pub fn blend(&mut self, img: &PlanarImage<f32>) {
-        let p = LaplacianPyramid::build(img, self.build_levels);
-
-        let n = self.levels.len();
-        assert_eq!(
-            p.levels.len(),
-            n,
-            "source pyramid has {} levels but accumulator has {} levels — \
-             all frames must have the same dimensions",
-            p.levels.len(),
-            n,
-        );
-        for idx in 0..n {
-            assert_eq!(
-                p.levels[idx].width, self.levels[idx].width,
-                "source pyramid level {idx} width {} differs from accumulator width {} — \
-                 all frames must have the same dimensions",
-                p.levels[idx].width, self.levels[idx].width,
-            );
-            assert_eq!(
-                p.levels[idx].height, self.levels[idx].height,
-                "source pyramid level {idx} height {} differs from accumulator height {} — \
-                 all frames must have the same dimensions",
-                p.levels[idx].height, self.levels[idx].height,
-            );
-        }
-
-        let count = self.count;
-        let use_color = self.use_color;
-        let grit_suppression = self.grit_suppression;
-
-        for idx in 0..n {
-            let src = &p.levels[idx];
-            let acc = &mut self.levels[idx];
-
-            if idx == n - 1 {
-                // Residual (low-frequency) level: running arithmetic mean.
-                // acc_new = (acc_old * count + src) / (count + 1)
-                let count_f = count as f32;
-                acc.luma
-                    .par_iter_mut()
-                    .zip(acc.chroma_a.par_iter_mut())
-                    .zip(acc.chroma_b.par_iter_mut())
-                    .zip(src.luma.par_iter())
-                    .zip(src.chroma_a.par_iter())
-                    .zip(src.chroma_b.par_iter())
-                    .for_each(|(((((al, aa), ab), sl), sa), sb)| {
-                        *al = (*al * count_f + sl) / (count_f + 1.0);
-                        *aa = (*aa * count_f + sa) / (count_f + 1.0);
-                        *ab = (*ab * count_f + sb) / (count_f + 1.0);
-                    });
-            } else if idx == 0 && grit_suppression {
-                Self::blend_finest_with_grit_suppression(use_color, src, acc);
-            } else {
-                // All other Laplacian levels: per-pixel energy selection.
-                // Pre-compute the accumulator's energy snapshot to avoid
-                // borrowing acc both mutably (via par_iter_mut) and immutably
-                // (via pixel_energy) inside the same closure.
-                let len = acc.width * acc.height;
-                let acc_energy: Vec<f32> =
-                    (0..len).map(|i| pixel_energy(acc, i, use_color)).collect();
-                // Strict >: ties keep the accumulator (earliest frame wins).
-                acc.luma
-                    .par_iter_mut()
-                    .zip(acc.chroma_a.par_iter_mut())
-                    .zip(acc.chroma_b.par_iter_mut())
-                    .enumerate()
-                    .for_each(|(i, ((al, aa), ab))| {
-                        if pixel_energy(src, i, use_color) > acc_energy[i] {
-                            *al = src.luma[i];
-                            *aa = src.chroma_a[i];
-                            *ab = src.chroma_b[i];
-                        }
-                    });
+    /// Panics when `frame` differs in size from the first frame folded.
+    pub fn fold(&mut self, frame: &PlanarImage<f32>) {
+        let pyramid = LaplacianPyramid::build(frame, self.max_levels);
+        match self.state {
+            Some(ref mut state) => state.fold_in(&pyramid, self.use_color, self.grit_suppression),
+            None => {
+                self.state = Some(FoldState::start(
+                    pyramid,
+                    self.use_color,
+                    self.grit_suppression,
+                ));
             }
         }
+    }
 
+    /// Fold every frame of `frames` in index order, calling `on_frame(done, self)`
+    /// after each (`done` frames folded so far), so a caller can report progress
+    /// or take a [`Self::preview`].
+    ///
+    /// # Panics
+    /// Panics when the frames differ in size.
+    pub fn fold_source(
+        &mut self,
+        frames: &(impl FrameSource + ?Sized),
+        mut on_frame: impl FnMut(usize, &Self),
+    ) {
+        for index in 0..frames.len() {
+            let frame = frames.frame(index);
+            self.fold(&frame);
+            drop(frame);
+            on_frame(index + 1, self);
+        }
+    }
+
+    /// The image the accumulator would give now, as if the frames folded so far
+    /// were the whole stack. It reads the accumulator in place (only the small
+    /// residual level is copied), so it costs one reconstruction, not a clone of
+    /// the pyramid. An empty fold gives a 0 × 0 image.
+    #[must_use]
+    pub fn preview(&self) -> PlanarImage<f32> {
+        let Some(state) = self.state.as_ref() else {
+            return PlanarImage::new(0, 0);
+        };
+        let Some((residual, bands)) = state.values.split_last() else {
+            return PlanarImage::new(0, 0);
+        };
+        reconstruct_from_bands(bands, mean_of(residual, state.count))
+    }
+
+    /// The fused pyramid: the batch result of [`build_and_fuse_pyramids`] on the
+    /// frames folded.
+    ///
+    /// # Panics
+    /// Panics when no frame was folded.
+    #[must_use]
+    pub fn finish_pyramid(self) -> LaplacianPyramid {
+        let state = self
+            .state
+            .expect("cannot fuse an empty image stack: fold at least one frame");
+        let count = state.count;
+        let mut levels = state.values;
+        if let Some(residual) = levels.last_mut() {
+            *residual = mean_of(residual, count);
+        }
+        LaplacianPyramid { levels }
+    }
+
+    /// The fused image: [`Self::finish_pyramid`] reconstructed.
+    ///
+    /// # Panics
+    /// Panics when no frame was folded.
+    #[must_use]
+    pub fn finish(self) -> PlanarImage<f32> {
+        self.finish_pyramid().reconstruct()
+    }
+}
+
+/// `sum / count` per sample, the residual level's final form.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the number of source frames is far below 2^24"
+)]
+fn mean_of(sum: &PlanarImage<f32>, count: usize) -> PlanarImage<f32> {
+    let n = count as f32;
+    let divide = |plane: &[f32]| -> Vec<f32> { plane.par_iter().map(|&s| s / n).collect() };
+    PlanarImage::from_planes(
+        sum.width,
+        sum.height,
+        divide(&sum.luma),
+        divide(&sum.chroma_a),
+        divide(&sum.chroma_b),
+    )
+    .expect("each mean plane holds width * height samples")
+}
+
+impl FoldState {
+    /// The accumulator after the first frame: that frame's pyramid is the
+    /// starting winner everywhere (the batch rule's default winner is source 0).
+    fn start(pyramid: LaplacianPyramid, use_color: bool, grit_suppression: bool) -> Self {
+        let mut values = pyramid.levels;
+        let last = values.len() - 1;
+        let mut best: Vec<Vec<f32>> = Vec::with_capacity(last);
+        let mut pixel: Vec<f32> = Vec::new();
+        let mut energy: Vec<f32> = Vec::new();
+        for (k, level) in values.iter_mut().enumerate() {
+            if k == last {
+                // Residual: the running sum starts from 0.0 + the first value.
+                for plane in [&mut level.luma, &mut level.chroma_a, &mut level.chroma_b] {
+                    plane.par_iter_mut().for_each(|v| *v += 0.0);
+                }
+            } else if k == 0 && grit_suppression {
+                pixel = vec![0.0_f32; level.width * level.height];
+                energy = vec![0.0_f32; level.width * level.height];
+                grit_energy_plane(level, use_color, &mut pixel, &mut energy);
+                best.push(energy.iter().map(|&e| initial_best(e)).collect());
+            } else {
+                best.push(
+                    (0..level.width * level.height)
+                        .into_par_iter()
+                        .map(|i| initial_best(pixel_energy(level, i, use_color)))
+                        .collect(),
+                );
+            }
+        }
+        Self {
+            values,
+            best,
+            count: 1,
+            pixel,
+            energy,
+        }
+    }
+
+    /// Fold one more frame's pyramid in.
+    fn fold_in(&mut self, pyramid: &LaplacianPyramid, use_color: bool, grit_suppression: bool) {
+        assert_eq!(
+            pyramid.levels.len(),
+            self.values.len(),
+            "all frames must give pyramids with the same number of levels (same size)"
+        );
+        let last = self.values.len() - 1;
+        for (k, (acc, src)) in self.values.iter_mut().zip(&pyramid.levels).enumerate() {
+            assert!(
+                acc.width == src.width && acc.height == src.height,
+                "all frames must have the same size"
+            );
+            if k == last {
+                for (sum, add) in [
+                    (&mut acc.luma, &src.luma),
+                    (&mut acc.chroma_a, &src.chroma_a),
+                    (&mut acc.chroma_b, &src.chroma_b),
+                ] {
+                    sum.par_iter_mut()
+                        .zip(add.par_iter())
+                        .for_each(|(s, &v)| *s += v);
+                }
+            } else if k == 0 && grit_suppression {
+                grit_energy_plane(src, use_color, &mut self.pixel, &mut self.energy);
+                let energy = &self.energy;
+                select_strongest(acc, &mut self.best[k], src, |i| energy[i]);
+            } else {
+                select_strongest(acc, &mut self.best[k], src, |i| {
+                    pixel_energy(src, i, use_color)
+                });
+            }
+        }
         self.count += 1;
     }
+}
 
-    /// Consume the accumulator and reconstruct the fused image.
-    ///
-    /// Wraps the stored levels in a [`LaplacianPyramid`] and calls
-    /// [`reconstruct`](LaplacianPyramid::reconstruct).  The accumulator is
-    /// consumed so no extra copy is needed.
-    pub fn reconstruct(self) -> PlanarImage<f32> {
-        LaplacianPyramid {
-            levels: self.levels,
-        }
-        .reconstruct()
-    }
-
-    /// Non-consuming reconstruction of the current accumulator state.
-    ///
-    /// Clones the accumulator's levels (an O(image size) allocation and copy)
-    /// before reconstructing, so the accumulator itself remains usable for
-    /// further [`blend`](Self::blend) calls afterwards. Intended for periodic
-    /// progress previews during [`fuse_pyramids_incremental_with_progress`],
-    /// not for per-frame use on large stacks — prefer
-    /// [`reconstruct`](Self::reconstruct) when the accumulator is no longer
-    /// needed.
-    #[must_use]
-    pub fn reconstruct_preview(&self) -> PlanarImage<f32> {
-        LaplacianPyramid {
-            levels: self.levels.clone(),
-        }
-        .reconstruct()
+/// A first-frame energy as the starting `best_energy`: the batch rule starts from
+/// `-inf` and a NaN energy never beats it, so NaN maps to `-inf` (a later frame
+/// with any comparable energy then wins, as in batch).
+const fn initial_best(energy: f32) -> f32 {
+    if energy > f32::NEG_INFINITY {
+        energy
+    } else {
+        f32::NEG_INFINITY
     }
 }
 
-/// Build a fused image from a stack using the incremental whole-image
-/// accumulator.
-///
-/// Peak memory is ~2 whole-image pyramids regardless of `images.len()`,
-/// compared with O(N) for the batch [`build_and_fuse_pyramids`] approach.
-///
-/// `use_color` and `grit_suppression` have the same semantics as in
-/// [`fuse_pyramids`].
-///
-/// # GPU dispatch
-/// When compiled with the `gpu` feature, this tries the GPU-resident
-/// [`crate::apex::gpu::accumulator::GpuApexAccumulator`] first — see that
-/// module's docs for the fallback contract, including the mid-stack
-/// GPU-to-CPU hand-off on a dispatch failure after some frames were already
-/// accumulated on the GPU.
-pub fn fuse_pyramids_incremental(
-    images: &[PlanarImage<f32>],
-    use_color: bool,
-    grit_suppression: bool,
-) -> PlanarImage<f32> {
-    assert!(!images.is_empty(), "cannot fuse an empty image stack");
-
-    #[cfg(feature = "gpu")]
-    if let Some(result) =
-        try_fuse_pyramids_incremental_gpu(images, use_color, grit_suppression, |_, _, _| {})
-    {
-        return result;
-    }
-
-    let mut acc = ApexAccumulator::new(&images[0], use_color, grit_suppression);
-    for img in &images[1..] {
-        acc.blend(img);
-    }
-    acc.reconstruct()
-}
-
-/// GPU-resident incremental accumulation, shared by [`fuse_pyramids_incremental`]
-/// and [`fuse_pyramids_incremental_with_progress`].
-///
-/// Returns `None` — never panics — when no `wgpu` context is available at
-/// all (the caller falls back to the plain CPU accumulator for the whole
-/// stack in that case). Once a [`crate::apex::gpu::accumulator::GpuApexAccumulator`]
-/// exists, a mid-stack `accumulate` failure is handled internally (read back
-/// the exact GPU state so far, finish the remaining frames on a CPU
-/// accumulator resumed from that state via [`ApexAccumulator::from_gpu_state`])
-/// rather than surfaced as `None` — see `crate::apex::gpu::accumulator`'s
-/// module docs for why that hand-off, not a full CPU restart, is the right
-/// failure mode here.
-#[cfg(feature = "gpu")]
-fn try_fuse_pyramids_incremental_gpu<F>(
-    images: &[PlanarImage<f32>],
-    use_color: bool,
-    grit_suppression: bool,
-    mut on_progress: F,
-) -> Option<PlanarImage<f32>>
-where
-    F: FnMut(usize, usize, Option<PlanarImage<f32>>),
-{
-    use crate::apex::gpu::accumulator::GpuApexAccumulator;
-
-    let total = images.len();
-    let mut gpu_acc = GpuApexAccumulator::new(&images[0], use_color, grit_suppression)?;
-    // The CPU path (`fuse_pyramids_incremental_with_progress`) always sends a
-    // preview with the very first progress call — it already holds the
-    // seeded accumulator in RAM, so `reconstruct_preview` is effectively
-    // free there. The GPU path must match that observable contract exactly
-    // (per `ApexAccumulator`'s progress-callback semantics), so it pays for
-    // one readback here rather than reporting `None` on frame 1: skipping it
-    // is an observable behavioural difference from the CPU path, not merely
-    // a perf trade-off, and callers (and this crate's own tests) rely on
-    // every completed-call sequence carrying a preview on both frame 1 and
-    // the final frame. A `read_back` failure here is handled exactly like
-    // any other mid-stack GPU failure: hand off to the CPU from the state
-    // already seeded (no frame has been lost, `resume_at = 1` re-blends
-    // every remaining frame from the CPU accumulator built off that same
-    // seed).
-    let first_preview = match gpu_acc.read_back() {
-        Some(levels) => Some(LaplacianPyramid { levels }.reconstruct()),
-        None => {
-            return finish_on_cpu_after_gpu_failure(&gpu_acc, images, 1, &mut on_progress);
-        }
-    };
-    on_progress(1, total, first_preview);
-
-    for (offset, img) in images[1..].iter().enumerate() {
-        if gpu_acc.accumulate(img) {
-            let completed = offset + 2;
-            let want_preview = completed == total || completed % PREVIEW_STRIDE == 0;
-            let preview = if want_preview {
-                // A preview mid-run costs a full readback of every resident
-                // level; `read_back` failing here is treated the same as any
-                // other GPU failure — hand off to the CPU for the rest of
-                // the stack rather than silently skipping this preview.
-                match gpu_acc.read_back() {
-                    Some(levels) => Some(LaplacianPyramid { levels }.reconstruct()),
-                    None => {
-                        return finish_on_cpu_after_gpu_failure(
-                            &gpu_acc,
-                            images,
-                            offset + 2,
-                            &mut on_progress,
-                        );
-                    }
+/// Per pixel, replace the accumulated coefficients of `acc` by those of `src`
+/// where `energy(i)` is strictly larger than `best[i]` (and update `best`).
+fn select_strongest(
+    acc: &mut PlanarImage<f32>,
+    best: &mut [f32],
+    src: &PlanarImage<f32>,
+    energy: impl Fn(usize) -> f32 + Sync,
+) {
+    best.par_chunks_mut(FOLD_CHUNK)
+        .zip(acc.luma.par_chunks_mut(FOLD_CHUNK))
+        .zip(acc.chroma_a.par_chunks_mut(FOLD_CHUNK))
+        .zip(acc.chroma_b.par_chunks_mut(FOLD_CHUNK))
+        .zip(src.luma.par_chunks(FOLD_CHUNK))
+        .zip(src.chroma_a.par_chunks(FOLD_CHUNK))
+        .zip(src.chroma_b.par_chunks(FOLD_CHUNK))
+        .enumerate()
+        .for_each(|(chunk, ((((((b, ol), oa), ob), sl), sa), sb))| {
+            let base = chunk * FOLD_CHUNK;
+            for (j, best_j) in b.iter_mut().enumerate() {
+                let e = energy(base + j);
+                if e > *best_j {
+                    *best_j = e;
+                    ol[j] = sl[j];
+                    oa[j] = sa[j];
+                    ob[j] = sb[j];
                 }
-            } else {
-                None
-            };
-            on_progress(completed, total, preview);
-            continue;
-        }
-
-        // `accumulate` itself failed for this frame: hand off to the CPU
-        // from the last successfully accumulated state (this frame,
-        // `images[offset + 1]`, has NOT been folded in yet, so the CPU
-        // accumulator must still blend it).
-        return finish_on_cpu_after_gpu_failure(&gpu_acc, images, offset + 1, &mut on_progress);
-    }
-
-    // `total` here doubles as "every frame has already been folded in" — if
-    // the final readback fails, `finish_on_cpu_after_gpu_failure`
-    // (`resume_at == total`) skips its blend loop entirely (the `skip`
-    // iterator is empty) and simply re-reads-back + reconstructs on the CPU
-    // side, rather than needlessly restarting the whole stack from frame 0.
-    // `read_back` (not the consuming `finish`) is used here so `gpu_acc` is
-    // still available to pass to the hand-off helper if it fails.
-    if let Some(levels) = gpu_acc.read_back() {
-        return Some(LaplacianPyramid { levels }.reconstruct());
-    }
-    finish_on_cpu_after_gpu_failure(&gpu_acc, images, total, &mut on_progress)
+            }
+        });
 }
 
-/// Shared mid-stack GPU-failure hand-off: read back `gpu_acc`'s current
-/// state, resume a CPU [`ApexAccumulator`] from it, blend every remaining
-/// frame from `resume_at` (the index of the next frame that still needs
-/// blending) onward, and report progress for each.
+/// Fuse the frames of `frames` with the streaming [`ApexFold`].
 ///
-/// Returns `None` if even the readback fails (nothing left to resume from —
-/// the caller's own CPU-from-scratch fallback then applies).
-#[cfg(feature = "gpu")]
-fn finish_on_cpu_after_gpu_failure<F>(
-    gpu_acc: &crate::apex::gpu::accumulator::GpuApexAccumulator,
-    images: &[PlanarImage<f32>],
-    resume_at: usize,
-    on_progress: &mut F,
-) -> Option<PlanarImage<f32>>
-where
-    F: FnMut(usize, usize, Option<PlanarImage<f32>>),
-{
-    tracing::debug!(
-        resume_at,
-        total = images.len(),
-        "gpu: incremental apex accumulator failed mid-stack, resuming on CPU from the last good state"
-    );
-    let levels = gpu_acc.read_back()?;
-    let mut cpu_acc = ApexAccumulator::from_gpu_state(
-        levels,
-        gpu_acc.count(),
-        gpu_acc.build_levels(),
-        gpu_acc.use_color(),
-        gpu_acc.grit_suppression(),
-    );
-
-    let total = images.len();
-    for (i, img) in images.iter().enumerate().skip(resume_at) {
-        cpu_acc.blend(img);
-        let completed = i + 1;
-        let want_preview = completed == total || completed % PREVIEW_STRIDE == 0;
-        on_progress(
-            completed,
-            total,
-            want_preview.then(|| cpu_acc.reconstruct_preview()),
-        );
-    }
-    Some(cpu_acc.reconstruct())
-}
-
-/// Number of frames between reconstructed preview snapshots in
-/// [`fuse_pyramids_incremental_with_progress`].
+/// The result of [`build_and_fuse_pyramids`] followed by a reconstruction, bit
+/// for bit, but only one frame and one accumulator pyramid are alive at a time.
 ///
-/// A full reconstruction costs roughly as much as a single
-/// [`ApexAccumulator::blend`] call, so previewing every frame would ~double
-/// runtime on large stacks. Progress (without a preview image) is still
-/// reported on every frame.
-const PREVIEW_STRIDE: usize = 4;
-
-/// Progress-reporting variant of [`fuse_pyramids_incremental`].
+/// `on_frame(done, &fold)` is called after each frame (see
+/// [`ApexFold::fold_source`]).
 ///
-/// `on_progress(completed, total, preview)` is called once per frame, with
-/// `completed` counting `1..=total`. `preview` carries a freshly
-/// reconstructed snapshot of the accumulator on the first frame, the last
-/// frame, and every [`PREVIEW_STRIDE`]th frame in between; it is `None` on
-/// the other calls so callers can cheaply report progress without paying for
-/// a reconstruction on every frame.
-///
-/// # GPU dispatch
-/// When compiled with the `gpu` feature, this tries the GPU-resident
-/// [`crate::apex::gpu::accumulator::GpuApexAccumulator`] first — see that
-/// module's docs for the fallback contract, including the mid-stack
-/// GPU-to-CPU hand-off on a dispatch failure after some frames were already
-/// accumulated on the GPU. `preview` snapshots on the GPU path cost a full
-/// readback of every resident level (same relative cost as the CPU path's
-/// own [`ApexAccumulator::reconstruct_preview`]), so they are taken on the
-/// same [`PREVIEW_STRIDE`] schedule; the very first progress call (frame 1)
-/// also carries a preview on the GPU path, matching the CPU path's own
-/// frame-1 preview exactly (both read back/clone the freshly seeded
-/// accumulator, so the observable progress-callback contract is identical
-/// regardless of which backend is engaged).
-pub fn fuse_pyramids_incremental_with_progress<F>(
-    images: &[PlanarImage<f32>],
+/// # Panics
+/// Panics if `frames` is empty or the frames differ in size.
+#[must_use]
+pub fn fuse_streaming(
+    frames: &(impl FrameSource + ?Sized),
+    max_levels: usize,
     use_color: bool,
     grit_suppression: bool,
-    mut on_progress: F,
-) -> PlanarImage<f32>
-where
-    F: FnMut(usize, usize, Option<PlanarImage<f32>>),
-{
-    assert!(!images.is_empty(), "cannot fuse an empty image stack");
-
-    #[cfg(feature = "gpu")]
-    if let Some(result) =
-        try_fuse_pyramids_incremental_gpu(images, use_color, grit_suppression, &mut on_progress)
-    {
-        return result;
-    }
-
-    let total = images.len();
-    let mut acc = ApexAccumulator::new(&images[0], use_color, grit_suppression);
-    on_progress(1, total, Some(acc.reconstruct_preview()));
-
-    for (offset, img) in images[1..].iter().enumerate() {
-        acc.blend(img);
-        let completed = offset + 2;
-        let want_preview = completed == total || completed % PREVIEW_STRIDE == 0;
-        on_progress(
-            completed,
-            total,
-            want_preview.then(|| acc.reconstruct_preview()),
-        );
-    }
-
-    acc.reconstruct()
+    on_frame: impl FnMut(usize, &ApexFold),
+) -> PlanarImage<f32> {
+    assert!(!frames.is_empty(), "cannot fuse an empty image stack");
+    let mut fold = ApexFold::new(max_levels, use_color, grit_suppression);
+    fold.fold_source(frames, on_frame);
+    fold.finish()
 }
 
-// Tests moved to tests/apex_fuse.rs
+#[cfg(test)]
+mod apron_tests {
+    use super::{apron_for_levels, pyramid_dependence_radius, pyramid_grid};
+
+    #[test]
+    fn apron_follows_the_pyramid_depth() {
+        assert_eq!(pyramid_dependence_radius(6), 125);
+        assert_eq!(pyramid_dependence_radius(7), 253);
+        assert_eq!(pyramid_dependence_radius(8), 509);
+        assert_eq!(apron_for_levels(6), 128);
+        assert_eq!(apron_for_levels(7), 256);
+        assert_eq!(apron_for_levels(8), 512);
+        assert_eq!(apron_for_levels(4), 32);
+        assert_eq!(apron_for_levels(2), 6);
+    }
+
+    #[test]
+    fn apron_covers_the_radius_and_stays_on_the_grid() {
+        for levels in 0..=14 {
+            let apron = apron_for_levels(levels);
+            assert!(
+                apron >= pyramid_dependence_radius(levels),
+                "levels {levels}"
+            );
+            assert_eq!(apron % pyramid_grid(levels), 0, "levels {levels}");
+            assert!(
+                apron < pyramid_dependence_radius(levels) + pyramid_grid(levels),
+                "levels {levels}: rounded up by less than one grid step"
+            );
+        }
+    }
+
+    #[test]
+    fn levels_below_the_minimum_use_the_minimum() {
+        assert_eq!(apron_for_levels(0), apron_for_levels(2));
+        assert_eq!(apron_for_levels(1), apron_for_levels(2));
+    }
+}

@@ -1,0 +1,84 @@
+// The 38 stacking settings edited in the settings dialog.
+//
+// THE SETTINGS CONTRACT (one data flow, whatever the layout):
+//   1. A control writes its property here and fires `settings-edited()` once.
+//   2. Rust reads all 38 properties into a `StackingSettings`, runs
+//      `sanitized()`, pushes the clamped values back into this global and hands
+//      the result to the debounced persister.
+//
+// `settings_version` is the 39th key of the settings file; it is not edited here
+// (Rust writes the current version on every save).
+//
+// This tree carries NO setting default of its own. Every property below is left
+// at the Slint type default (0, false, ""), and Rust pushes the real values from
+// `StackingSettings::default()` / the settings file before the window shows
+// (`ui_helpers::push_settings_to_ui`). A literal here would be a second copy of
+// the defaults that drifts away from the core (it did: 6/3/8/90 against
+// 8/5/2/95). `tests/settings_contract_test.rs` fails on any default written
+// into this file.
+//
+// All numeric values that a slider drives are `float`; Rust rounds them into
+// the typed fields. The `*-options` lists are the combo-box entries, also
+// pushed from Rust so the dialog never offers a choice the core does not list
+// (the Neural alignment mode, for one, exists only in an AI build).
+export global SettingsModel {
+    callback settings-edited();
+
+    // Combo-box entries, pushed from Rust (`settings_contract::*_options`).
+    in property <[string]> alignment-options;
+    in property <[string]> optimizer-options;
+    in property <[string]> compute-device-options;
+    in property <[string]> tile-size-options;
+    in property <[string]> output-format-options;
+
+    // ── Alignment and frame selection (General tab) ──────────────────────────
+    in-out property <string> alignment;
+    in-out property <string> optimizer;
+    in-out property <bool>   bounded-search;
+    in-out property <bool>   akaze-seeding;
+    in-out property <bool>   correct-brightness;
+    in-out property <bool>   chain-alignment;
+    in-out property <bool>   neural-refine-classically;
+    in-out property <bool>   auto-cull;
+    in-out property <float>  auto-cull-threshold-pct;
+    in-out property <bool>   sort-by-sharpness;
+    in-out property <float>  stack-every-nth;
+    in-out property <string> compute-device;
+    // The combo text: "In Memory" or "<n> px" (see `settings_contract::tile_size_label`).
+    in-out property <string> tile-size;
+
+    // ── Apex ─────────────────────────────────────────────────────────────────
+    in-out property <float>  pyramid-levels;
+    in-out property <bool>   use-all-color-channels;
+    in-out property <bool>   grit-suppression;
+
+    // ── Relief ─────────────────────────────────────────────────────────────────
+    in-out property <float>  relief-estimation-radius;
+    in-out property <float>  relief-smoothing-radius;
+    in-out property <float>  relief-contrast-pct;
+    in-out property <bool>   relief-show-preview;
+    in-out property <bool>   relief-auto-detect;
+    in-out property <bool>   relief-use-multigrid;
+
+    // ── Strata ─────────────────────────────────────────────────────────────────
+    in-out property <float>  strata-base-radius;
+    in-out property <float>  strata-detail-focus;
+
+    // ── Preprocessing (Input tab) ────────────────────────────────────────────
+    in-out property <int>    pre-rotation;
+    in-out property <bool>   pre-crop-enabled;
+    in-out property <string> pre-crop-spec;
+    in-out property <float>  pre-resize-percent;
+    in-out property <bool>   sort-reverse;
+    in-out property <bool>   ignore-exif;
+
+    // ── Image saving (Output tab) ────────────────────────────────────────────
+    in-out property <bool>   crop-to-common-area;
+    in-out property <bool>   resize-cropped-to-original;
+    in-out property <string> output-format;
+    in-out property <int>    bit-depth;
+    in-out property <float>  jpeg-quality;
+    in-out property <string> filename-template;
+    in-out property <string> default-output-dir;
+    in-out property <bool>   copy-metadata;
+}

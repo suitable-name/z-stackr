@@ -1,10 +1,13 @@
+//! Named capacity presets shared by every architecture.
+
 use serde::{Deserialize, Serialize};
 
 /// Named capacity presets.
 ///
 /// Larger presets widen the channels and deepen the dilated-context stack; the
 /// architecture is otherwise identical, so a model trained at any size loads and
-/// runs through the same code path.
+/// runs through the same code path. The alignment networks use their own
+/// `(width, depth)` table for the same six names (see [`ModelSize::align_dims`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelSize {
@@ -53,8 +56,9 @@ impl ModelSize {
         }
     }
 
-    /// `(width, depth)` for this preset. Width is always a multiple of 8 so the
-    /// fixed `GroupNorm` group count (8) divides every feature map.
+    /// `(width, depth)` of the fusion networks for this preset. Width is always a
+    /// multiple of 8, so any power-of-two group count up to 8 divides every
+    /// feature map.
     pub(crate) const fn dims(self) -> (usize, usize) {
         match self {
             Self::Xs => (16, 2),
@@ -63,6 +67,21 @@ impl ModelSize {
             Self::L => (48, 6),
             Self::Xl => (64, 9),
             Self::Xxl => (96, 12),
+        }
+    }
+
+    /// `(width, depth)` of the alignment networks
+    /// ([`crate::model::BatchAlignNet`], [`crate::model::FusionAlignNet`]) for this
+    /// preset. `depth` counts the residual blocks in *each* of the two encoder
+    /// stages. Width is always even.
+    pub(crate) const fn align_dims(self) -> (usize, usize) {
+        match self {
+            Self::Xs => (32, 1),
+            Self::S => (48, 1),
+            Self::M => (64, 2),
+            Self::L => (96, 2),
+            Self::Xl => (128, 3),
+            Self::Xxl => (160, 3),
         }
     }
 }

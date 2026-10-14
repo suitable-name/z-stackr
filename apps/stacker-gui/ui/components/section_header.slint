@@ -1,0 +1,63 @@
+import { Theme } from "../theme.slint";
+
+// A collapsible-section header: a 24px row with a chevron, an uppercase muted title
+// and an optional right-side slot (`@children`) for controls that must stay
+// reachable while the section is collapsed.
+//
+// The chevron is a `Path` that swaps between a right- and a down-pointing shape;
+// this component owns no state: `collapsed` is an `in` property the caller drives,
+// and `toggled` is the only way it asks for a change. The caller's own
+// `if !collapsed:` around the section body does the hiding.
+export component SectionHeader inherits Rectangle {
+    in property <string> title;
+    in property <bool> collapsed: false;
+    callback toggled();
+
+    height: 24px;
+    background: touch.has-hover ? Theme.bg-hover : transparent;
+    border-radius: Theme.radius-sm;
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.toggled(); }
+    }
+
+    HorizontalLayout {
+        padding-left: Theme.space-xs;
+        padding-right: Theme.space-xs;
+        spacing: Theme.space-xs;
+
+        Rectangle {
+            width: 10px;
+            VerticalLayout {
+                alignment: center;
+                Path {
+                    width: 8px;
+                    height: 8px;
+                    viewbox-width: 8;
+                    viewbox-height: 8;
+                    stroke: Theme.text-muted;
+                    stroke-width: 1.5px;
+                    // Pointing right while collapsed, down while expanded.
+                    commands: root.collapsed
+                        ? "M 2 1.5 L 6 4 L 2 6.5"
+                        : "M 1.5 2.5 L 4 6.5 L 6.5 2.5";
+                }
+            }
+        }
+
+        Text {
+            text: root.title;
+            font-size: Theme.font-xs;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            color: Theme.text-muted;
+            vertical-alignment: center;
+        }
+
+        Rectangle { horizontal-stretch: 1; }
+
+        // Right-side slot.
+        @children
+    }
+}

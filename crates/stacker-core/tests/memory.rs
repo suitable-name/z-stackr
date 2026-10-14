@@ -2,12 +2,12 @@ use stacker_core::{image::PlanarImage, memory::*};
 use std::collections::HashMap;
 
 #[test]
-fn test_tile_manager_round_trip() {
-    let temp_dir = std::env::temp_dir().join(format!("stacker_test_{}", std::process::id()));
+fn test_mmap_tile_manager_round_trip() {
+    let temp_dir = std::env::temp_dir().join(format!("stacker_test_mmap_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&temp_dir);
     std::fs::create_dir_all(&temp_dir).unwrap();
 
-    let mut manager = TileManager {
+    let mut manager = MmapTileManager {
         temp_dir: temp_dir.clone(),
         tiles: HashMap::new(),
     };
@@ -42,7 +42,7 @@ fn test_tile_manager_round_trip() {
 
 #[test]
 fn test_fetch_missing_tile_returns_err() {
-    let manager = TileManager {
+    let manager = MmapTileManager {
         temp_dir: std::env::temp_dir(),
         tiles: HashMap::new(),
     };
@@ -174,16 +174,13 @@ fn test_apron_boundary_math() {
 /// `extract_tile` must faithfully copy the requested region from the source.
 #[test]
 fn test_extract_tile_values() {
-    let img_width = 8;
-    let img_height = 8;
-    let mut img = PlanarImage::new(img_width, img_height);
-    for row in 0..img_height {
-        for col in 0..img_width {
-            let i = row * img_width + col;
-
-            {
-                img.luma[i] = (row * img_width + col) as f32;
-            }
+    let w = 8;
+    let h = 8;
+    let mut img = PlanarImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            img.luma[i] = f32::from(u16::try_from(i).expect("an 8x8 image has 64 pixels"));
         }
     }
 
@@ -192,9 +189,48 @@ fn test_extract_tile_values() {
     assert_eq!(tile.width, 4);
     assert_eq!(tile.height, 3);
     // Pixel (0,0) of tile == pixel (2,1) of source.
-    assert!((tile.luma[0] - img.luma[img_width + 2]).abs() < f32::EPSILON);
+    assert_eq!(tile.luma[0].to_bits(), img.luma[w + 2].to_bits());
     // Pixel (3,2) of tile == pixel (5,3) of source.
-    assert!((tile.luma[2 * 4 + 3] - img.luma[3 * img_width + 5]).abs() < f32::EPSILON);
+    assert_eq!(
+        tile.luma[2 * 4 + 3].to_bits(),
+        img.luma[3 * w + 5].to_bits()
+    );
+}
+
+/// The row-copy `extract_tile` equals the per-pixel clamped gather it replaced,
+/// for crops inside the image, overhanging the right and bottom edges, and
+/// starting beyond them (where every sample is the replicated corner).
+#[test]
+fn test_extract_tile_matches_clamped_reference() {
+    let (w, h) = (7_usize, 5_usize);
+    let luma: Vec<f32> = (0..35_u16).map(f32::from).collect();
+    let chroma_a = luma.iter().map(|v| v * 2.0).collect();
+    let chroma_b = luma.iter().map(|v| -v).collect();
+    let img = PlanarImage::from_planes(w, h, luma, chroma_a, chroma_b).unwrap();
+    let crops = [
+        (0, 0, 7, 5),
+        (2, 1, 3, 2),
+        (5, 3, 6, 4),
+        (6, 4, 3, 3),
+        (7, 0, 4, 2),
+        (20, 20, 3, 3),
+        (3, 0, 0, 4),
+    ];
+    for (cx, cy, cw, ch) in crops {
+        let tile = extract_tile(&img, cx, cy, cw, ch);
+        assert_eq!((tile.width, tile.height), (cw, ch));
+        assert!(tile.is_consistent());
+        for oy in 0..ch {
+            for ox in 0..cw {
+                let sx = (cx + ox).min(w - 1);
+                let sy = (cy + oy).min(h - 1);
+                let (si, di) = (sy * w + sx, oy * cw + ox);
+                assert_eq!(tile.luma[di].to_bits(), img.luma[si].to_bits());
+                assert_eq!(tile.chroma_a[di].to_bits(), img.chroma_a[si].to_bits());
+                assert_eq!(tile.chroma_b[di].to_bits(), img.chroma_b[si].to_bits());
+            }
+        }
+    }
 }
 
 /// `paste_interior` must write into the correct output region.
@@ -202,13 +238,8 @@ fn test_extract_tile_values() {
 fn test_paste_interior_correctness() {
     let mut output = PlanarImage::new(16, 16);
     // Padded tile: 8×8, all luma = 7.0.
-    let padded = PlanarImage {
-        width: 8,
-        height: 8,
-        luma: vec![7.0; 64],
-        chroma_a: vec![2.0; 64],
-        chroma_b: vec![3.0; 64],
-    };
+    let padded =
+        PlanarImage::from_planes(8, 8, vec![7.0; 64], vec![2.0; 64], vec![3.0; 64]).unwrap();
     // Paste interior (4×4) starting at offset (2,2) in padded, into (4,4) of output.
     paste_interior(&mut output, &padded, 2, 2, 4, 4, 4, 4);
 
@@ -222,4 +253,142 @@ fn test_paste_interior_correctness() {
     }
     // Outside the pasted region must still be zero.
     assert!((output.luma[0]).abs() < f32::EPSILON);
+}
+
+// ── CORE-2: the store validates what it is given ─────────────────────────────
+
+fn scratch_store(tag: &str) -> (MmapTileManager, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("stacker_core_store_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    (MmapTileManager::new(dir.clone()), dir)
+}
+
+const fn coord(width: usize, height: usize) -> TileCoordinate {
+    TileCoordinate {
+        start_x: 0,
+        start_y: 0,
+        width,
+        height,
+    }
+}
+
+/// A tile whose size does not match its coordinate is rejected at commit, not
+/// silently written and misread later.
+#[test]
+fn commit_rejects_a_tile_that_does_not_match_its_coordinate() {
+    let (mut store, dir) = scratch_store("mismatch");
+    let err = store
+        .commit_tile(0, &coord(4, 4), PlanarImage::new(2, 2))
+        .unwrap_err();
+    assert!(err.to_string().contains("expected 16"), "{err}");
+    assert!(
+        store.is_empty(),
+        "nothing may be recorded for a rejected tile"
+    );
+
+    // Planes of unequal length whose sum happens to match are rejected too.
+    let skewed = PlanarImage {
+        width: 2,
+        height: 2,
+        luma: vec![0.0; 6],
+        chroma_a: vec![0.0; 4],
+        chroma_b: vec![0.0; 2],
+    };
+    assert!(store.commit_tile(0, &coord(2, 2), skewed).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A missing tile surfaces as the typed error that names the coordinate.
+#[test]
+fn fetching_a_missing_tile_is_tile_not_found() {
+    let (store, dir) = scratch_store("missing");
+    let key = TileCoordinate {
+        start_x: 7,
+        start_y: 9,
+        width: 2,
+        height: 2,
+    };
+    match store.fetch_tile(3, &key) {
+        Err(stacker_core::error::StackerError::TileNotFound(x, y)) => assert_eq!((x, y), (7, 9)),
+        other => panic!("expected TileNotFound, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Committing a key twice replaces the tile; `clear` removes the files it wrote
+/// and nothing else.
+#[test]
+fn recommit_replaces_and_clear_removes_only_its_own_files() {
+    let (mut store, dir) = scratch_store("clear");
+    let bystander = dir.join("not_a_tile.txt");
+    std::fs::write(&bystander, b"keep me").unwrap();
+
+    let mut first = PlanarImage::new(2, 2);
+    first.luma[0] = 1.0;
+    let mut second = PlanarImage::new(2, 2);
+    second.luma[0] = 2.0;
+    store.commit_tile(0, &coord(2, 2), first).unwrap();
+    store.commit_tile(0, &coord(2, 2), second).unwrap();
+    assert_eq!(store.len(), 1);
+    assert!((store.fetch_tile(0, &coord(2, 2)).unwrap().luma[0] - 2.0).abs() < f32::EPSILON);
+
+    store.clear().unwrap();
+    assert!(store.is_empty());
+    assert!(store.fetch_tile(0, &coord(2, 2)).is_err());
+    assert!(bystander.exists(), "clear must not touch foreign files");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The coordinate is the padded rectangle the caller stores: tiles keyed by
+/// padded rectangles of different size coexist and round-trip.
+#[test]
+fn tiles_are_keyed_by_the_rectangle_the_caller_stores() {
+    let (mut store, dir) = scratch_store("padded");
+    let interior = TileCoordinate {
+        start_x: 40,
+        start_y: 40,
+        width: 8,
+        height: 8,
+    };
+    let (px, py, pw, ph) = interior.padded_region_with(100, 100, 6);
+    assert_eq!((px, py, pw, ph), (34, 34, 20, 20));
+    let padded = TileCoordinate {
+        start_x: px,
+        start_y: py,
+        width: pw,
+        height: ph,
+    };
+    let mut tile = PlanarImage::new(pw, ph);
+    tile.luma[5] = 3.5;
+    store.commit_tile(1, &padded, tile).unwrap();
+    assert!((store.fetch_tile(1, &padded).unwrap().luma[5] - 3.5).abs() < f32::EPSILON);
+    // The interior rectangle was never committed.
+    assert!(store.fetch_tile(1, &interior).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `padded_region_with` clamps at the image border and reports the interior
+/// offset for any apron; the default apron is `APRON_PX`.
+#[test]
+fn padded_region_with_matches_the_default_for_apron_px() {
+    let tile = TileCoordinate {
+        start_x: 300,
+        start_y: 10,
+        width: 64,
+        height: 64,
+    };
+    assert_eq!(
+        tile.padded_region(1000, 500),
+        tile.padded_region_with(1000, 500, APRON_PX)
+    );
+    assert_eq!(
+        tile.interior_offset_in_padded(1000, 500),
+        tile.interior_offset_in_padded_with(1000, 500, APRON_PX)
+    );
+    // Apron 4: every side grows by 4 (the tile is clear of the borders).
+    assert_eq!(tile.padded_region_with(1000, 500, 4), (296, 6, 72, 72));
+    assert_eq!(tile.interior_offset_in_padded_with(1000, 500, 4), (4, 4));
+    assert_eq!(tile.padded_region_with(1000, 500, 0), (300, 10, 64, 64));
 }

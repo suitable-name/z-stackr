@@ -1,0 +1,20 @@
+[package]
+name = "z-stackr-web-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The message protocol and the memory budget policy shared by the z-stackr browser page and its Web Worker."
+
+[lib]
+# Keep the crate identifier `stacker_web_core` (the package is `z-stackr-web-core`).
+name = "stacker_web_core"
+
+[dependencies]
+z-stackr-core = { workspace = true }
+z-stackr-pipeline = { workspace = true }
+image = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+
+[lints]
+workspace = true

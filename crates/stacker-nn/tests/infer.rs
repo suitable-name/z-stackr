@@ -1,4 +1,5 @@
 //! Integration tests for [`stacker_nn::infer`].
+#![cfg(feature = "ndarray")]
 
 use burn::{
     backend::NdArray,
@@ -6,15 +7,14 @@ use burn::{
     tensor::{Distribution, Tensor},
 };
 use stacker_nn::{
-    FusionModel, FusionStrategy,
     infer::{InferError, TileConfig, fuse_stack},
     model::FocusMergeNetConfig,
 };
 
 type B = NdArray;
 
-fn device() -> burn::prelude::Device<B> {
-    burn::prelude::Device::<B>::default()
+fn device() -> <B as Backend>::Device {
+    <B as Backend>::Device::default()
 }
 
 fn default_model() -> stacker_nn::model::FocusMergeNet<B> {
@@ -26,25 +26,65 @@ fn rand_frame(h: usize, w: usize) -> Tensor<B, 3> {
     Tensor::<B, 3>::random([3, h, w], Distribution::Uniform(0.0, 1.0), &device())
 }
 
+/// All values of a tensor as `f32`.
+fn values(t: Tensor<B, 3>) -> Vec<f32> {
+    t.into_data().iter::<f32>().collect()
+}
+
 // ---------------------------------------------------------------------------
-// Test 1: single-frame stack — output shape matches input.
+// Test 1: single-frame stack — the fold never calls the model, so the output
+// is the input frame itself, value for value.
 // ---------------------------------------------------------------------------
 #[test]
-fn fuse_stack_single_frame_is_identity_shape() {
+fn fuse_stack_single_frame_is_the_frame_itself() {
     let model = default_model();
     let frame = rand_frame(12, 12);
     let cfg = TileConfig {
         tile: 32,
         overlap: 4,
     };
-    let out = fuse_stack(&model, &[frame], cfg, &device()).expect("fuse_stack failed");
+    let out = fuse_stack(&model, std::slice::from_ref(&frame), cfg, &device())
+        .expect("fuse_stack failed");
     assert_eq!(out.dims(), [3, 12, 12], "output shape mismatch");
 
-    // Check all values are finite.
-    let data = out.into_data();
-    for v in data.iter::<f32>() {
-        assert!(v.is_finite(), "output contains non-finite value: {v}");
+    let got = values(out);
+    let want = values(frame);
+    assert_eq!(got.len(), want.len());
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert_eq!(g.to_bits(), w.to_bits(), "value {i}: {g} vs {w}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Test 1b: with two different frames the model IS invoked, so the result is
+// neither frame.
+// ---------------------------------------------------------------------------
+#[test]
+fn fuse_stack_two_frames_invokes_the_model() {
+    let model = default_model();
+    let first = rand_frame(12, 12);
+    let second = rand_frame(12, 12);
+    let cfg = TileConfig {
+        tile: 32,
+        overlap: 4,
+    };
+    let out = fuse_stack(&model, &[first.clone(), second.clone()], cfg, &device())
+        .expect("fuse_stack failed");
+
+    let merged = values(out);
+    for (name, frame) in [("first", first), ("second", second)] {
+        let reference = values(frame);
+        let worst = merged
+            .iter()
+            .zip(&reference)
+            .map(|(m, r)| (m - r).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            worst > 1e-4,
+            "the merge of two different frames equals the {name} frame (max diff {worst})"
+        );
+    }
+    assert!(merged.iter().all(|v| v.is_finite()));
 }
 
 // ---------------------------------------------------------------------------
@@ -90,15 +130,10 @@ fn fuse_stack_tiled_path() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 4: repeatable — same model + input produces the same output within
-// a tight tolerance. NOT bit-exact: the ndarray backend parallelises
-// reductions (rayon), so f32 accumulation order — and therefore the last
-// ULP of a sum — can differ between two runs of the identical computation.
-// Repeatability within a small epsilon is the guarantee inference actually
-// provides; bit-equality assertions here are flaky by construction.
+// Test 4: deterministic — same model + input produces identical output.
 // ---------------------------------------------------------------------------
 #[test]
-fn fuse_stack_repeatable_within_tolerance() {
+fn fuse_stack_deterministic() {
     let model = default_model();
     let frames: Vec<Tensor<B, 3>> = (0..2).map(|_| rand_frame(20, 20)).collect();
     let cfg = TileConfig {
@@ -117,10 +152,7 @@ fn fuse_stack_repeatable_within_tolerance() {
 
     assert_eq!(vals1.len(), vals2.len());
     for (a, b) in vals1.iter().zip(vals2.iter()) {
-        assert!(
-            (a - b).abs() < 1e-6,
-            "outputs differ beyond tolerance: {a} vs {b}"
-        );
+        assert!(a.to_bits() == b.to_bits(), "outputs differ: {a} vs {b}");
     }
 }
 
@@ -131,7 +163,7 @@ fn fuse_stack_repeatable_within_tolerance() {
 fn fuse_stack_empty_is_error() {
     let model = default_model();
     let cfg = TileConfig::default();
-    let result = fuse_stack::<B, _>(&model, &[], cfg, &device());
+    let result = fuse_stack::<B>(&model, &[], cfg, &device());
     assert!(
         matches!(result, Err(InferError::EmptyStack)),
         "expected EmptyStack, got: {result:?}"
@@ -155,67 +187,39 @@ fn fuse_stack_shape_mismatch_is_error() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 7: fuse_batch_tiled equivalence (tiled vs untiled batch fusion).
+// Test 7 (NN-13): the streaming fold gives bit-identical output to the slice
+// fold, and pulls each frame only when it is folded in (the bridge relies on
+// this to convert one frame at a time instead of holding a tensor copy of the
+// whole stack).
 // ---------------------------------------------------------------------------
-
-/// Minimal test-only [`FusionModel`] implementing [`FusionStrategy::Batch`]:
-/// averages the frames across the `S` dimension. No spatial mixing at all, so
-/// `receptive_field() == 0` and tiling (with any overlap) must reproduce the
-/// exact untiled result — a deterministic, per-pixel-predictable batch
-/// reduction that lets the test assert tiled/untiled equivalence exactly.
-struct AverageBatchMerge;
-
-impl<B: Backend> FusionModel<B> for AverageBatchMerge {
-    fn strategy(&self) -> FusionStrategy {
-        FusionStrategy::Batch
-    }
-
-    fn fuse_batch(&self, stack: Tensor<B, 5>) -> Tensor<B, 4> {
-        stack.mean_dim(1).squeeze_dim(1)
-    }
-
-    fn receptive_field(&self) -> usize {
-        0
-    }
-}
-
-/// Tiled batch fusion ([`fuse_batch_tiled`](stacker_nn::infer), exercised
-/// indirectly via [`fuse_stack`] dispatching on [`FusionStrategy::Batch`])
-/// must reproduce the untiled (single-tile) result closely: run the same
-/// stack once with a `TileConfig` that forces multiple tiles and once with a
-/// `TileConfig` that fits the whole image in a single tile, and compare.
 #[test]
-fn fuse_batch_tiled_matches_untiled() {
-    let model = AverageBatchMerge;
-    let dev = device();
-    let (h, w) = (24, 24);
-    let frames: Vec<Tensor<B, 3>> = (0..4).map(|_| rand_frame(h, w)).collect();
-
-    // Forces tiling: tile smaller than the image.
-    let tiled_cfg = TileConfig {
-        tile: 10,
-        overlap: 3,
-    };
-    // Fits in a single tile: no tiling.
-    let untiled_cfg = TileConfig {
-        tile: 64,
-        overlap: 3,
+fn fuse_stream_matches_fuse_stack_and_is_lazy() {
+    let model = default_model();
+    let frames: Vec<Tensor<B, 3>> = (0..3).map(|_| rand_frame(20, 20)).collect();
+    let cfg = TileConfig {
+        tile: 16,
+        overlap: 4,
     };
 
-    let out_tiled = fuse_stack(&model, &frames, tiled_cfg, &dev).expect("tiled fuse_stack failed");
-    let out_untiled =
-        fuse_stack(&model, &frames, untiled_cfg, &dev).expect("untiled fuse_stack failed");
+    let want = values(fuse_stack(&model, &frames, cfg, &device()).expect("slice fold"));
 
-    assert_eq!(out_tiled.dims(), [3, h, w]);
-    assert_eq!(out_untiled.dims(), [3, h, w]);
+    let produced = std::cell::Cell::new(0_usize);
+    let pulled_at_step = std::cell::RefCell::new(Vec::new());
+    let lazy = frames.iter().map(|f| {
+        produced.set(produced.get() + 1);
+        f.clone()
+    });
+    let got = values(
+        stacker_nn::infer::fuse_stream_with(&model, lazy, cfg, &device(), |index, _running| {
+            pulled_at_step.borrow_mut().push((index, produced.get()));
+        })
+        .expect("stream fold"),
+    );
 
-    let tiled_data: Vec<f32> = out_tiled.into_data().iter::<f32>().collect();
-    let untiled_data: Vec<f32> = out_untiled.into_data().iter::<f32>().collect();
-
-    for (a, b) in tiled_data.iter().zip(untiled_data.iter()) {
-        assert!(
-            (a - b).abs() < 1e-4,
-            "tiled vs untiled batch fusion mismatch: {a} vs {b}"
-        );
+    assert_eq!(got.len(), want.len());
+    for (a, b) in got.iter().zip(&want) {
+        assert_eq!(a.to_bits(), b.to_bits(), "stream and slice folds differ");
     }
+    // Step k has seen exactly k + 1 frames: none is converted ahead of its fold.
+    assert_eq!(*pulled_at_step.borrow(), vec![(0, 1), (1, 2), (2, 3)]);
 }

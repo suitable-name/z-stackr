@@ -1,65 +1,106 @@
 [workspace]
 resolver = "3"
 members = ["apps/*", "crates/*"]
+# The Python bindings are a maturin project with their own `[workspace]` (path
+# dependencies on the crates above); keeping them out of the workspace means
+# `cargo test --workspace --all-features` never links libpython.
+exclude = ["crates/stacker-python"]
 
 [workspace.package]
-version = "1.0.1"
+version = "1.0.0"
 edition = "2024"
-license = "MIT"
-repository = "https://github.com/suitable-name/z-stackr"
+license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-z-stackr-core = { path = "crates/stacker-core", version = "1.0.0" }
-z-stackr-align = { path = "crates/stacker-align", version = "1.0.0" }
-z-stackr-algo = { path = "crates/stacker-algo", version = "1.0.0" }
-z-stackr-nn = { path = "crates/stacker-nn", version = "1.0.0", default-features = false }
-z-stackr-pipeline = { path = "crates/stacker-pipeline", version = "1.0.0", default-features = false }
-image = "0.25.10"
-rayon = "1.12"
-thiserror = "2.0.18"
-tracing = "0.1.44"
-tracing-subscriber = "0.3.23"
-smol = "2.0.2"
-notify = "8.2.0"
+z-stackr-core = { path = "crates/stacker-core" }
+z-stackr-align = { path = "crates/stacker-align" }
+z-stackr-algo = { path = "crates/stacker-algo" }
+z-stackr-pipeline = { path = "crates/stacker-pipeline" }
+z-stackr-gpu = { path = "crates/stacker-gpu" }
+z-stackr-nn = { path = "crates/stacker-nn", default-features = false }
+z-stackr-web-core = { path = "crates/stacker-web-core" }
+# `image` stays at 0.23.14: `akaze 0.7.0` depends on it (the upgrade is deferred, owner decision D11).
+image = "0.23.14"
+akaze = "0.7.0"
+bitarray = "0.2.6"
 nalgebra = "0.35.0"
-tikv-jemallocator = "0.7.0"
-mimalloc = "0.1.52"
+burn = { version = "0.16", default-features = false }
+bytemuck = "1.25"
+# The GPU kernels use the same wgpu as Burn's backend, so the lock holds one copy.
+wgpu = "=23.0.1"
+pollster = "0.4.0"
+num-traits = "0.2.19"
+rayon = "1.12"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 toml = "1.1.2"
-wgpu = "30.0.0"
-pollster = "0.4.0"
-bytemuck = { version = "1.15.0", features = ["derive"] }
+thiserror = "2.0.18"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+notify = "8.2.0"
+clap = { version = "4.6.1", features = ["derive"] }
+indicatif = "0.18.4"
+slint = "1.18.1"
+slint-build = "1.18.1"
+# The headless UI harness (apps/stacker-gui/tests/ui.rs) and its std-only seams. The harness
+# pins Slint exactly (`slint-harness 0.18.x` = Slint 1.18.x), so a Slint bump needs a matching
+# harness release.
+slint-harness = "=0.18.3"
+slint-harness-hooks = "0.1.0"
+# Embeds the application icon into the Windows executables (build scripts of the GUI and the CLI).
+winresource = "0.1.31"
+rfd = "0.17.2"
+directories = "6.0.0"
+tikv-jemallocator = "0.7.0"
+mimalloc = "0.1.52"
+criterion = { version = "0.8.2", features = ["html_reports"] }
+tempfile = "3.27.0"
+# `Instant` / `SystemTime` that work in the browser (std's panic on wasm32).
+web-time = "1.1.0"
+# The wire format between the browser page and its Web Worker.
+postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
+# The browser build (`apps/stacker-web`, `apps/stacker-web-worker`).
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+js-sys = "0.3.106"
+console_error_panic_hook = "0.1.7"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
-cast_precision_loss = "allow"
-cast_possible_truncation = "allow"
-cast_sign_loss = "allow"
-cast_possible_wrap = "allow"
 
-# ── Release profile ───────────────────────────────────────────────────────────
-# Maximum-optimisation shipping profile: full (fat) LTO across the whole
-# dependency graph, a single codegen unit for cross-module inlining, and
-# symbol stripping for small distributable binaries. `panic` stays at the
-# default (unwind) on purpose: the GUI runs alignment/fusion on worker threads
-# whose panics must not abort the whole process.
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
-strip = "symbols"
 
-# ── PGO / BOLT profile ────────────────────────────────────────────────────────
-# Same optimisation level as `release`, but keeps symbols and line tables:
-# BOLT needs symbol + relocation information to rewrite the binary layout, and
-# profile-guided builds are far easier to debug/inspect with line tables
-# present. Used by the PGO/BOLT tasks in the VS Code tasks file
-# (docs/vscode-tasks.json → .vscode/tasks.json); the extra linker flag BOLT
-# needs (--emit-relocs) is passed via RUSTFLAGS there, not here, because it is
-# ELF/Linux-only.
+# The release profile with line tables kept and symbols unstripped, for the PGO and BOLT chains in
+# `docs/vscode-tasks.json` (profile-guided optimisation matches profile data to functions through
+# their debug line tables, and BOLT needs the symbol table) and for profilers. The generated code
+# is the same as `release`; only the binary is larger.
 [profile.release-perf]
 inherits = "release"
-strip = false
 debug = "line-tables-only"
+strip = false
+
+# The browser build's dev profile (`data-cargo-profile-dev` in `apps/stacker-web/index.html`):
+# debug wasm stacks and rasterises far too slowly to use, so the dependencies (the pipeline, the
+# aligner, Slint's renderer) are optimised and carry no debug info. The page crate alone stays at
+# opt-level 1, which keeps dev rebuilds short: it is mostly Slint-generated UI code, and the hot
+# loops live in dependency crates. Native builds never use it.
+[profile.stacker-web-dev]
+inherits = "dev"
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+
+[profile.stacker-web-dev.package.z-stackr-web]
+opt-level = 1
+
+# `trunk build --release`: the release profile, with the page crate optimised for size.
+[profile.stacker-web-release]
+inherits = "release"
+
+[profile.stacker-web-release.package.z-stackr-web]
+opt-level = "s"

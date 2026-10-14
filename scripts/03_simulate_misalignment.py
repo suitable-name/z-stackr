@@ -5,7 +5,11 @@
 Takes a perfectly aligned focus stack (from 02_blender_focus_stack.py) and
 generates a new dataset with simulated misalignment (focus breathing,
 anisotropic scale, translation, rotation, shear) for training
-`z-stackr-nn`'s alignment network (`BatchAlignNet`). To avoid black/replicated
+the `stacker-nn` crate's alignment network (`BatchAlignNet`; trained with
+`z-stackr-train --strategy align`, evaluated with `scripts/04_eval_alignment.py`
+and the `stacker-nn-eval` binary). It is independent of the fusion algorithms
+(Apex, Relief, Strata): it only produces unaligned, photometrically perturbed
+copies of a ground-truth stack. To avoid black/replicated
 borders ever appearing anywhere in the training set, every frame (including
 the reference) is warped and then centre-cropped by a fixed safety margin
 that is provably larger than the maximum possible per-frame displacement —
@@ -32,6 +36,10 @@ Usage:
     # Run the standalone self-check (synthetic data, no dataset required):
     python3 scripts/03_simulate_misalignment.py --self-test
 
+Requirements: `pip install opencv-python numpy` (see scripts/requirements.txt).
+Pipeline order: 01_estimate_depth.py -> 02_blender_focus_stack.py -> this script
+-> `z-stackr-train --strategy align` (or `fusion-align`) and 04_eval_alignment.py.
+
 Ground-truth matrix convention (`metadata.json["alignment_gt"]`)
 ------------------------------------------------------------------
 `alignment_gt` is a list of 3x3 row-major matrices, one per `stack` entry,
@@ -56,7 +64,7 @@ Frame index 0 is always the reference: it receives NO random perturbation
 exactly the identity matrix and it is never photometrically augmented — see
 `process_dataset()` and §4.2/§4.3 below for the rationale.
 
-`z-stackr-nn`'s Rust loader (`stacker_nn::data::AlignSample`) converts these
+The `stacker-nn` Rust loader (`stacker_nn::data::AlignSample`) converts these
 PIXEL-space matrices to the crate-wide NORMALIZED `[-1, 1]^2` convention (see
 `stacker_nn::bridge::align_planar`'s docs for the exact conjugation) using
 the CROPPED `[w, h]` from `metadata.json["cropped_dims"]` — this script
@@ -145,7 +153,7 @@ Transform ranges (design doc §4.4)
     an off-diagonal shear term in the linear part of the affine matrix.
 
 These ranges are deliberately kept well inside the Rust model's tanh output
-bounds (from docs/batchalign-v2-design.md §3.4: tx/ty <= 0.30 normalized,
+bounds of `BatchAlignNet` in `crates/stacker-nn` (tx/ty <= 0.30 normalized,
 rotation <= 0.10 rad, log-scale <= 0.08, shear <= 0.05) so that every
 training sample is representable by the model without saturating its
 output activations:
@@ -156,8 +164,8 @@ output activations:
                  proxy for the normalized-unit bound of 0.30; it is well
                  inside it.
 If you change any of `--max-angle` / `--max-log-scale` / `--max-shear` /
-the shift range, cross-check against docs/batchalign-v2-design.md §3.4
-so the sampled ground truth stays representable by the model's tanh heads.
+the shift range, cross-check against the `BatchAlignNet` head bounds
+(`crates/stacker-nn`) so the sampled ground truth stays representable by the model's tanh heads.
 
 Self-test (design doc §4.1 — "add a self-check")
 ------------------------------------------------------------------
@@ -189,11 +197,10 @@ _AUGMENT_REFERENCE = False
 
 # ---------------------------------------------------------------------------
 # Design-doc §4.4 cross-reference: these bounds must stay well inside the
-# Rust model's tanh output bounds documented in
-# docs/batchalign-v2-design.md §3.4 (tx/ty: 0.30 normalized, rotation:
-# 0.10 rad, log-scale: 0.08, shear: 0.05). See module docstring for the
-# margin-of-safety arithmetic. If you touch these defaults, re-check that
-# doc so the two stay consistent.
+# Rust model's tanh output bounds (BatchAlignNet in crates/stacker-nn; tx/ty:
+# 0.30 normalized, rotation: 0.10 rad, log-scale: 0.08, shear: 0.05). See the
+# module docstring for the margin-of-safety arithmetic. If you touch these
+# defaults, re-check the model's head bounds so the two stay consistent.
 # ---------------------------------------------------------------------------
 DEFAULT_MAX_SHIFT_MIN = 0.01
 DEFAULT_MAX_SHIFT_MAX = 0.05

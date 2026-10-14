@@ -1,0 +1,27 @@
+// The project (session) document: name, dirty state and the recent-projects
+// list. Rust owns the values; the menu bar, the window title and the empty
+// state read them, and the callbacks below are the only way to act on them.
+export global ProjectModel {
+    // Display name of the open project ("Untitled" until saved).
+    in-out property <string> name: "Untitled";
+    // The project file's path, empty until saved.
+    in-out property <string> path: "";
+    // True when sources, settings or strokes changed since the last save.
+    in-out property <bool> dirty: false;
+    // Recent project files, newest first, as display paths.
+    in-out property <[string]> recent: [];
+    // The first four recents as "name — folder" card labels (the empty state);
+    // entry i answers to `open-recent(i)` like the same entry of `recent`.
+    in-out property <[string]> recent-cards: [];
+
+    // File actions (Rust shows the unsaved-changes guard where needed).
+    callback new-project();
+    callback open-project();
+    // Open the project file at this path (a file dropped on the window); an
+    // empty path does nothing.
+    callback open-path(string);
+    callback open-recent(int);
+    callback save-project();
+    callback save-project-as();
+    callback clear-recent();
+}

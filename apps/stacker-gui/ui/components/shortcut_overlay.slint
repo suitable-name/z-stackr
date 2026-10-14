@@ -1,0 +1,143 @@
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { ShortcutsModel } from "../models/shortcuts.slint";
+
+// The in-app "Keyboard Shortcuts" overlay, opened with `?` or from the toolbar.
+// Renders `ShortcutsModel.shortcuts`, grouped by context.
+export component ShortcutOverlay inherits Rectangle {
+    background: Theme.overlay-backdrop;
+
+    TouchArea {
+        clicked => { ShortcutsModel.close(); }
+    }
+
+    Rectangle {
+        width: min(600px, parent.width - 2 * Theme.space-xl);
+        height: min(560px, parent.height - 2 * Theme.space-xl);
+        background: Theme.surface-dialog;
+        border-radius: Theme.radius-md;
+        border-width: Theme.hairline;
+        border-color: Theme.border-dialog;
+        drop-shadow-blur: 24px;
+        drop-shadow-color: Theme.modal-shadow;
+        clip: true;
+
+        TouchArea {} // Isolates clicks inside the dialog from the backdrop above.
+
+        VerticalLayout {
+            padding: Theme.space-lg;
+            spacing: Theme.space-sm;
+
+            HorizontalLayout {
+                Text {
+                    horizontal-stretch: 1;
+                    text: "Keyboard Shortcuts";
+                    font-size: Theme.font-label;
+                    font-weight: 700;
+                    color: Theme.text-strong;
+                }
+                Rectangle {
+                    width: 20px;
+                    height: 20px;
+                    border-radius: Theme.radius-sm;
+                    background: close-touch.has-hover ? Theme.bg-hover : transparent;
+                    Text {
+                        text: "\u{2715}";
+                        font-size: Theme.font-sm;
+                        color: Theme.text-muted;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    close-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        accessible-role: button;
+                        accessible-label: "Close dialog";
+                        accessible-action-default => { ShortcutsModel.close(); }
+                        clicked => { ShortcutsModel.close(); }
+                    }
+                }
+            }
+
+            ScrollView {
+                vertical-stretch: 1;
+                // Each row is a layout holding an `if`: a layout passes its child's
+                // height up (a plain Rectangle does not, which squashed the rows), and
+                // a row of the other group has no child and takes no height. The gap
+                // between rows is the shown row's own top padding, so hidden rows add
+                // no spacing either.
+                VerticalLayout {
+                    spacing: 0px;
+                    padding-right: Theme.space-md;
+
+                    Text { text: "Global"; font-size: Theme.font-xs; font-weight: 700; color: Theme.accent; }
+                    for item in ShortcutsModel.shortcuts: VerticalLayout {
+                        if item.context == "Global": HorizontalLayout {
+                            spacing: Theme.space-sm;
+                            padding-top: Theme.space-xs;
+                            Rectangle {
+                                width: 110px;
+                                min-height: 22px;
+                                background: Theme.bg-input;
+                                border-radius: Theme.radius-sm;
+                                Text {
+                                    text: item.keys;
+                                    font-size: Theme.font-xs;
+                                    font-weight: 600;
+                                    color: Theme.warning;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: item.action;
+                                font-size: Theme.font-xs;
+                                color: Theme.text-primary;
+                                wrap: word-wrap;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+
+                    VerticalLayout {
+                        padding-top: Theme.space-md;
+                        padding-bottom: Theme.space-md;
+                        Rectangle { height: Theme.hairline; background: Theme.border-subtle; }
+                    }
+
+                    Text { text: "Image view"; font-size: Theme.font-xs; font-weight: 700; color: Theme.accent; }
+                    for item in ShortcutsModel.shortcuts: VerticalLayout {
+                        if item.context == "Image view": HorizontalLayout {
+                            spacing: Theme.space-sm;
+                            padding-top: Theme.space-xs;
+                            Rectangle {
+                                width: 110px;
+                                min-height: 22px;
+                                background: Theme.bg-input;
+                                border-radius: Theme.radius-sm;
+                                Text {
+                                    text: item.keys;
+                                    font-size: Theme.font-xs;
+                                    font-weight: 600;
+                                    color: Theme.warning;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: item.action;
+                                font-size: Theme.font-xs;
+                                color: Theme.text-primary;
+                                wrap: word-wrap;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

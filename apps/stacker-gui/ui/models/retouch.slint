@@ -1,0 +1,47 @@
+// The Retouch tool: whether it is on, the brush, the source-frame picker and the
+// undo/redo affordances.
+//
+// `brush-size` (raster pixels) and `brush-opacity` are bound two-way to the
+// Retouch options row and the canvas. Strokes arrive through
+// `ViewportModel.brush-down/moved/up` (canvas coordinates; Rust maps them to
+// raster pixels), not through a callback of this global, and the canvas emits them
+// only while `tool-on`. Everything below `can-undo` is written by Rust
+// (`gui/retouch.rs`).
+export global RetouchModel {
+    // ── The tool ────────────────────────────────────────────────────────────
+    // While on, a left-drag on the canvas paints and the options row is shown;
+    // while off, a left-drag pans. Slint owns the value: the toolbar toggle, the
+    // `R` key, the Edit menu, Esc and the options row's Done button all write it
+    // through `App.set-retouch-tool`, which also fires `tool-toggled`.
+    in-out property <bool> tool-on: false;
+    // The tool was switched on (true) or off (false); Rust shows the first-use
+    // explainer and refreshes the source list.
+    callback tool-toggled(bool);
+
+    in-out property <float> brush-size: 20.0;
+    in-out property <float> brush-opacity: 0.5;
+    in-out property <bool> can-undo: false;
+    in-out property <bool> can-redo: false;
+    // Descriptions of the stroke that Undo/Redo would act on ("Undo: brush stroke"),
+    // for the button captions and accessible labels. Empty: nothing to undo/redo.
+    in-out property <string> undo-label: "";
+    in-out property <string> redo-label: "";
+
+    // ── Source frame (the layer the brush paints in) ────────────────────────
+    // Picker entries, e.g. "3. IMG_0003.jpg"; refilled when the file list or the
+    // Align result changes.
+    in-out property <[string]> source-names: [];
+    // Selected entry; -1 = none chosen yet (the brush is blocked until one is).
+    in-out property <int> source-index: -1;
+    // Fired when the user picks an entry. Changing the source keeps the painted
+    // strokes and their undo history: the history stores where was painted, not
+    // what, so the strokes now show the newly chosen frame.
+    callback source-chosen(int);
+
+    // ── Availability ────────────────────────────────────────────────────────
+    // true while the canvas shows the newest result and a stroke can be painted
+    // once a source is chosen.
+    in-out property <bool> active: false;
+    // Why the brush is blocked right now; empty when it is not.
+    in-out property <string> hint: "";
+}

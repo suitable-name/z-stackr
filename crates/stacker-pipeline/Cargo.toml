@@ -1,57 +1,50 @@
 [package]
 name = "z-stackr-pipeline"
-version = { workspace = true }
-edition = { workspace = true }
-license = { workspace = true }
-description = "The shared out-of-core tiled focus-stacking pipeline for the z-stackr suite: alignment pre-pass, tile store, per-tile fusion orchestration and output encoding"
-readme = "README.md"
-repository = { workspace = true }
-keywords = ["focus-stacking", "image-processing", "out-of-core", "tiling"]
-categories = ["multimedia::images", "computer-vision"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [lib]
+# Keep the crate identifier `stacker_pipeline` (the package is `z-stackr-pipeline`).
 name = "stacker_pipeline"
 
 [dependencies]
 z-stackr-core = { workspace = true }
 z-stackr-align = { workspace = true }
 z-stackr-algo = { workspace = true }
-z-stackr-nn = { workspace = true, optional = true, default-features = false, features = ["ndarray"] }
+z-stackr-gpu = { workspace = true, optional = true }
 image = { workspace = true }
 rayon = { workspace = true }
-smol = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-# Bulk byte<->typed-slice casts for the RAW frame-cache blob format
-# (`src/cache.rs`), mirroring `stacker_core::memory::TileManager`'s style.
-bytemuck = "1.25"
+toml = { workspace = true }
+
+# The alignment networks run native only (burn is not built for wasm32).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+z-stackr-nn = { workspace = true, optional = true }
 
 [features]
 default = []
+# AKAZE feature matching seeds the intensity-based aligner (see `align::Seeder`).
 akaze = ["z-stackr-align/akaze"]
-# AI ("neural") stacking mode on the CPU (ndarray) backend.
-# `z-stackr-align/nn` must be enabled together with `z-stackr-core/nn`:
-# feature unification makes core's `Neural` variant exist for every crate in
-# the build graph, and stacker-align's exhaustive `AlignmentModeSetting`
-# matches only compile their `Neural` arms under its own `nn` marker feature.
-nn = ["dep:z-stackr-nn", "z-stackr-core/nn", "z-stackr-align/nn"]
-# Adds the wgpu/Vulkan GPU backend to the AI mode (implies `nn`).
-nn-gpu = ["nn", "z-stackr-nn/wgpu"]
-# Pure-Rust RAW image support (see `z-stackr-core::io`'s module docs). This
-# crate owns the decode-once cache that makes RAW practical for the tiled
-# pipeline (see `src/cache.rs`'s `FrameCache` docs) but the actual `rawler`
-# dependency lives in `z-stackr-core`, so this is a pure forward.
+# `Apex` on the GPU through wgpu (see `compute::Compute`); the CPU stays the
+# fallback. Off by default: the CPU crates never need a GPU stack.
+gpu = ["dep:z-stackr-gpu"]
+# Camera RAW input (`load::decode_frame` reads `.cr2`, `.nef`, `.dng`, ...); native only, no
+# effect on wasm32.
 raw = ["z-stackr-core/raw"]
-# GPU-accelerated tiled/batch Apex fusion, production warp, Strata saliency
-# and Relief guided-filter/multigrid (see
-# `docs/gpu_acceleration_summary.md`). Forwards `z-stackr-algo/gpu` and
-# `z-stackr-align/gpu` (the actual compute paths) AND `z-stackr-core/gpu`
-# directly, since `run_pipeline` itself calls
-# `stacker_core::gpu::set_enabled` once per run (the
-# `StackingSettings::use_gpu` runtime toggle) before any stacking work
-# starts. Never in this crate's own default set, so a default pipeline
-# build stays pure-CPU/SIMD and has no `wgpu` dependency at all.
-gpu = ["z-stackr-algo/gpu", "z-stackr-align/gpu", "z-stackr-core/gpu"]
+# Neural alignment (`alignment_mode = "neural"`, see `align::AlignModel`); native only. Pulls
+# the CPU backend of the networks; an app that wants the GPU adds `z-stackr-nn/wgpu` itself.
+nn = ["dep:z-stackr-nn", "z-stackr-nn/ndarray"]
+
+# CPU against GPU on real frames; needs the device.
+[[example]]
+name = "gpu_profile"
+required-features = ["gpu"]
+
+[[example]]
+name = "align_stack"
+required-features = ["gpu"]
 
 [lints]
 workspace = true

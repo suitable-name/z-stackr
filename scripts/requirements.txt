@@ -1,0 +1,17 @@
+# Python packages for the training-data scripts in this folder.
+#
+# Stage 1 (01_estimate_depth.py) runs in an ordinary Python environment:
+#     pip install -r scripts/requirements.txt
+# and additionally needs Depth Anything 3, which is not on PyPI; follow the
+# "One-time setup" notes in the docstring of 01_estimate_depth.py.
+#
+# Stage 2 (02_blender_focus_stack.py) runs INSIDE Blender (blender -b -P ...).
+# It uses only Blender's bundled Python, which ships numpy; it needs nothing
+# from this file and must not be given OpenCV.
+# 03_simulate_misalignment.py needs numpy + opencv-python; 04_eval_alignment.py needs
+# numpy and, optionally, scipy (paired Wilcoxon test; without it a sign summary is printed).
+numpy
+opencv-python
+scipy
+torch>=2
+torchvision

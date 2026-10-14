@@ -1,202 +1,175 @@
-//! Batch-processing support for `--input-dir` folders that contain
-//! image-bearing subfolders.
+//! Batch stacking: an `--input-dir` whose subfolders each hold a stack.
 //!
-//! # The three-way split
+//! # What `--input-dir` can be
 //!
-//! `--input-dir` can point at one of three shapes of folder:
+//! 1. **Frames only** (no subfolder holds a frame): one stack, one output file
+//!    at `--output-file`.
+//! 2. **Subfolders with frames, no direct frames**: every direct subfolder that
+//!    itself directly holds at least one frame is a candidate stack.
+//! 3. **Mixed**: direct frames and frame-holding subfolders. The user says which
+//!    is meant with `--stacks`, or is asked on a terminal; nothing is guessed.
 //!
-//! 1. **Images only** (no subfolder contains images) — the plain case: one
-//!    stack, one output file at `--output-file`.
-//! 2. **Subfolders with images, no direct images** — every direct child
-//!    directory that itself directly contains at least one recognised image
-//!    is a candidate stack.
-//! 3. **Mixed** — both direct images *and* image-bearing subfolders are
-//!    present. The user is asked (interactively) or must say (via
-//!    `--stacks`) which of the two they mean; there is no folder shape that
-//!    silently guesses.
-//!
-//! [`classify_input_dir`] is the pure, unit-tested decision function for
-//! this split. The interactive prompt itself ([`prompt_stacks_mode`]) is a
-//! thin, untested wrapper isolated specifically so the decision logic above
-//! it stays testable without a real terminal.
+//! [`classify_input_dir`] is the pure decision function for this split,
+//! [`decide_stacks`] resolves the question and [`plan`] ties them to the command
+//! line.
 //!
 //! # Discovery rule
 //!
-//! A "subfolder with images" is a **direct child directory** of
-//! `--input-dir` whose own **direct children** include at least one file
-//! with a recognised image extension (standard formats always; RAW
-//! extensions when built with the `raw` feature) — exactly the same
-//! extension test [`stacker_pipeline::collect_image_paths`] uses, so batch
-//! discovery automatically tracks whatever formats that function recognises
-//! (including RAW, without this module hardcoding a second extension list).
-//! This is **non-recursive beyond one level**: a subfolder's own
-//! subfolders are never inspected, and a subfolder with no direct images
-//! (even if *its* subfolders have some) is not counted as a stack and is
-//! silently ignored.
+//! A "subfolder with frames" is a **direct child directory** of `--input-dir`
+//! whose own **direct children** include at least one file with a frame
+//! extension (`stacker_pipeline::order::has_frame_extension`, the test the
+//! directory scan uses, so RAW files count in builds that read them). The search
+//! goes one level down only: a subfolder's own subfolders are never inspected. The
+//! folder `--output-file` names is never a stack, so a batch can write its results
+//! inside the input folder and run again.
 //!
-//! # Output naming (subfolder-batch mode only)
+//! # Output names (subfolder mode)
 //!
-//! In subfolder-batch mode `--output-file` is reinterpreted as an output
-//! *directory* (created if missing). Each subfolder's output filename reuses
-//! the exact naming rule the GUI's Save dialog uses
-//! (`apps/stacker-gui/src/main.rs`'s `perform_save_current_image`): the
-//! configured `image_saving.filename_template` with `{name}` substituted by
-//! the subfolder's name, plus the extension for the configured
-//! `image_saving.output_format` (via
-//! [`stacker_core::settings::OutputFormat::extension`], the same helper the
-//! GUI mapping was factored out into). Single-stack mode is unaffected:
-//! `--output-file` keeps meaning an explicit output file.
+//! `--output-file` is the output *directory* (created when missing; a path that
+//! has an image extension is refused). Each stack is written to
+//! `image_saving.filename_template` with `{name}` replaced by the subfolder name,
+//! plus the extension of `image_saving.output_format`. With `--mode both` or `all`
+//! every algorithm adds its `_<algorithm>` suffix as in a single run.
+//!
+//! The stacks run one after the other (each run is parallel inside, and several at
+//! once would multiply the memory); a failing stack is reported and the batch
+//! goes on. The exit status is an error when any stack failed.
 
 use std::{
     io::IsTerminal,
     path::{Path, PathBuf},
 };
 
-use stacker_core::{error::StackerError, settings::ImageSavingSettings};
+use stacker_core::{
+    error::StackerError,
+    settings::{ImageSavingSettings, StackingSettings},
+};
+use stacker_pipeline::order::{has_frame_extension, is_excluded};
 
-/// The three-way classification of an `--input-dir` folder.
-///
-/// Pure function output ([`classify_input_dir`]) — no I/O side effects, no
-/// prompting; every field is plain data so this is trivially unit-testable
-/// against temp-dir fixtures.
+use crate::{
+    args::{CliArgs, StacksMode},
+    pipeline::{self, output::templated_file_in},
+};
+
+/// The three-way classification of an `--input-dir` ([`classify_input_dir`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputKind {
-    /// No image-bearing subfolders: the plain "one folder of images" case.
-    /// Carries the direct image count purely for diagnostics/logging (it is
-    /// always `> 0`, since an all-empty folder is [`InputKind::Empty`]
-    /// instead).
-    ImagesOnly { direct_images: usize },
-    /// At least one direct child subfolder contains images. `direct_images`
-    /// is the count of images directly inside `--input-dir` itself (`0` in
-    /// the pure subfolder case, `> 0` in the mixed case) and `subfolders` is
-    /// the sorted list of image-bearing subfolder paths.
-    HasStackSubfolders {
-        subfolders: Vec<PathBuf>,
+    /// No subfolder holds frames: the plain "one folder of frames" case.
+    ImagesOnly {
+        /// The frames directly inside the folder (always more than 0).
         direct_images: usize,
     },
-    /// Neither direct images nor image-bearing subfolders were found.
+    /// At least one direct subfolder holds frames.
+    HasStackSubfolders {
+        /// The frame-holding subfolders, sorted by path.
+        subfolders: Vec<PathBuf>,
+        /// The frames directly inside the folder (0 when it only has subfolders).
+        direct_images: usize,
+    },
+    /// Neither direct frames nor frame-holding subfolders.
     Empty,
 }
 
-/// Returns `true` if `path`'s extension is recognised as an image format —
-/// the exact same rule `stacker_pipeline::collect_image_paths` filters
-/// directory scans by (standard formats always; RAW extensions only when
-/// this binary was built with the `raw` feature). Extension-only (no
-/// `is_file()` check), so it can also be used on paths that don't exist yet
-/// (see [`looks_like_image_file`]).
-fn has_recognised_image_extension(path: &Path) -> bool {
-    let Some(ext) = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase)
-    else {
-        return false;
-    };
-    let is_standard = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "tif" | "tiff");
-    let is_raw = cfg!(feature = "raw") && stacker_core::io::is_raw_extension(&ext);
-    is_standard || is_raw
+/// `true` when `path` is an existing file with a frame extension.
+fn is_frame_file(path: &Path) -> bool {
+    path.is_file() && has_frame_extension(path)
 }
 
-/// Returns `true` if `path` is an existing file with a recognised image
-/// extension — see [`has_recognised_image_extension`] for the extension
-/// rule. Used by the subfolder/direct-image scan in
-/// [`classify_input_dir`], which only ever looks at paths that already
-/// exist (unlike [`looks_like_image_file`], which must also work for a
-/// not-yet-created output path).
-fn is_recognised_image_file(path: &Path) -> bool {
-    path.is_file() && has_recognised_image_extension(path)
-}
-
-/// Count direct-child image files inside `dir` (non-recursive). Returns `0`
-/// if `dir` cannot be read (treated as "no images" rather than propagating
-/// the error — callers that need a hard I/O error already get one from
-/// `collect_image_paths` when they actually try to stack the folder).
+/// The frames directly inside `dir`; an unreadable folder counts as having none
+/// (the stack run reports the real error when it tries to read it).
 fn count_direct_images(dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
     entries
-        .filter_map(std::result::Result::ok)
-        .map(|e| e.path())
-        .filter(|p| is_recognised_image_file(p))
+        .filter_map(Result::ok)
+        .filter(|e| is_frame_file(&e.path()))
         .count()
 }
 
-/// Classify `input_dir` per the module docs' three-way split.
-///
-/// Non-recursive beyond one level: only `input_dir`'s direct children are
-/// inspected for direct images, and only each direct child *directory*'s own
-/// direct children are inspected when deciding whether that subfolder
-/// "contains images" — a subfolder's own subfolders are never examined.
+/// Classify `input_dir` as described in the module documentation. The folders in
+/// `exclude` (the output directory) are never stacks.
 ///
 /// # Errors
-/// Returns [`StackerError`] only if `input_dir` itself cannot be read.
-pub fn classify_input_dir(input_dir: &Path) -> Result<InputKind, StackerError> {
+/// An I/O error when `input_dir` itself cannot be read.
+pub fn classify_input_dir(
+    input_dir: &Path,
+    exclude: &[PathBuf],
+) -> Result<InputKind, StackerError> {
     let direct_images = count_direct_images(input_dir);
 
     let mut subfolders: Vec<PathBuf> = std::fs::read_dir(input_dir)?
-        .filter_map(std::result::Result::ok)
+        .filter_map(Result::ok)
         .map(|e| e.path())
-        .filter(|p| p.is_dir() && count_direct_images(p) > 0)
+        .filter(|p| p.is_dir() && !is_excluded(p, exclude) && count_direct_images(p) > 0)
         .collect();
     subfolders.sort();
 
-    if subfolders.is_empty() {
-        if direct_images == 0 {
-            Ok(InputKind::Empty)
-        } else {
-            Ok(InputKind::ImagesOnly { direct_images })
-        }
-    } else {
-        Ok(InputKind::HasStackSubfolders {
+    Ok(if !subfolders.is_empty() {
+        InputKind::HasStackSubfolders {
             subfolders,
             direct_images,
-        })
-    }
+        }
+    } else if direct_images == 0 {
+        InputKind::Empty
+    } else {
+        InputKind::ImagesOnly { direct_images }
+    })
 }
 
-/// Non-interactive / interactive resolution of "which target did the user
-/// mean" for an `--input-dir` that [`classify_input_dir`] reported as
-/// [`InputKind::HasStackSubfolders`].
-///
-/// `flag` is `--stacks`'s value, if given — it always wins and skips the
-/// prompt (even on a TTY). Otherwise, if stdin is a TTY, the caller should
-/// use [`prompt_stacks_mode`]; if not, this is a hard error.
+/// Which target a folder with subfolders means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StacksDecision {
+    /// Each subfolder is a stack.
     Subfolders,
+    /// Only the frames directly inside the folder.
     Single,
 }
 
-/// Resolve [`StacksDecision`] from an explicit `--stacks` flag value.
-///
-/// Does not touch stdin at all. Returns `None` when no flag was given — the
-/// caller then decides between prompting (TTY) or erroring (no TTY).
-#[must_use]
-pub const fn decision_from_flag(flag: Option<crate::args::StacksMode>) -> Option<StacksDecision> {
-    match flag {
-        Some(crate::args::StacksMode::Subfolders) => Some(StacksDecision::Subfolders),
-        Some(crate::args::StacksMode::Single) => Some(StacksDecision::Single),
-        None => None,
+impl From<StacksMode> for StacksDecision {
+    fn from(mode: StacksMode) -> Self {
+        match mode {
+            StacksMode::Subfolders => Self::Subfolders,
+            StacksMode::Single => Self::Single,
+        }
     }
 }
 
-/// Thin, deliberately untested wrapper around an interactive stdin/stderr prompt.
+/// Resolve [`StacksDecision`] for a folder with `subfolders` frame-holding
+/// subfolders and `direct_images` frames of its own.
 ///
-/// Kept to the absolute minimum of logic (read a line, match it)
-/// specifically so every decision this module makes is otherwise covered by
-/// unit tests against [`classify_input_dir`] / [`decision_from_flag`] /
-/// [`resolve_batch_output_path`] — only this function actually touches a
-/// real terminal, and it is only ever called after
-/// [`std::io::IsTerminal::is_terminal`] has confirmed stdin is interactive.
-///
-/// Prints the prompt (with the subfolder/direct-image counts, per the
-/// product requirement) to stderr, reads one line from stdin, and loops
-/// until the answer is recognised.
+/// The `--stacks` flag always wins. Without it, `ask` is called when
+/// `interactive` (stdin is a terminal); otherwise the question cannot be answered
+/// and the run stops.
 ///
 /// # Errors
-/// Returns [`StackerError`] only if stdin is closed/unreadable before a
-/// valid answer is given.
+/// [`StackerError::Validation`] when there is neither a flag nor a terminal;
+/// whatever `ask` fails with.
+pub fn decide_stacks(
+    flag: Option<StacksMode>,
+    interactive: bool,
+    subfolders: usize,
+    direct_images: usize,
+    ask: impl FnOnce(usize, usize) -> Result<StacksDecision, StackerError>,
+) -> Result<StacksDecision, StackerError> {
+    if let Some(mode) = flag {
+        return Ok(mode.into());
+    }
+    if interactive {
+        return ask(subfolders, direct_images);
+    }
+    Err(StackerError::Validation(format!(
+        "--input-dir holds {subfolders} subfolder(s) with images and {direct_images} image(s) of \
+         its own, and stdin is not a terminal: pass `--stacks subfolders` or `--stacks single` \
+         to say which one is meant"
+    )))
+}
+
+/// Ask on the terminal which target is meant, until the answer is understood.
+///
+/// # Errors
+/// [`StackerError::Io`] when stdin cannot be read, [`StackerError::Validation`]
+/// when it is closed before an answer.
 pub fn prompt_stacks_mode(
     subfolders: usize,
     direct_images: usize,
@@ -204,26 +177,22 @@ pub fn prompt_stacks_mode(
     use std::io::Write;
 
     eprintln!(
-        "'--input-dir' contains {subfolders} subfolder{s1} with images and {direct_images} image{s2} directly \
-         in the folder.\n\
-         Stack each subfolder independently, or only the images directly in this folder?\n  \
+        "'--input-dir' holds {subfolders} subfolder{} with images and {direct_images} image{} \
+         directly in the folder.\n\
+         Stack each subfolder on its own, or only the images directly in this folder?\n  \
          [s] each subfolder is its own stack\n  \
          [d] only the direct images in this folder\n\
-         (pass --stacks subfolders / --stacks single to skip this prompt next time)",
-        s1 = if subfolders == 1 { "" } else { "s" },
-        s2 = if direct_images == 1 { "" } else { "s" },
+         (pass --stacks subfolders or --stacks single to skip this question)",
+        if subfolders == 1 { "" } else { "s" },
+        if direct_images == 1 { "" } else { "s" },
     );
-
     loop {
         eprint!("> ");
         std::io::stderr().flush().ok();
         let mut line = String::new();
-        let n = std::io::stdin()
-            .read_line(&mut line)
-            .map_err(StackerError::Io)?;
-        if n == 0 {
-            return Err(StackerError::AlignmentFailed(
-                "stdin closed before answering the --stacks prompt".to_owned(),
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            return Err(StackerError::Validation(
+                "stdin closed before the --stacks question was answered".to_owned(),
             ));
         }
         match line.trim().to_ascii_lowercase().as_str() {
@@ -234,86 +203,182 @@ pub fn prompt_stacks_mode(
     }
 }
 
-/// Returns `true` if stdin is an interactive terminal.
-///
-/// The sole gate for whether [`prompt_stacks_mode`] may be used at all.
-/// Exists as its own function purely so call sites read as intent ("are we
-/// allowed to prompt?") rather than an inline `std::io::stdin().is_terminal()`.
+/// `true` when stdin is a terminal: the only case in which the question may be
+/// asked.
 #[must_use]
 pub fn stdin_is_tty() -> bool {
     std::io::stdin().is_terminal()
 }
 
-/// Resolve the per-subfolder output file path in subfolder-batch mode.
-///
-/// `output_dir` is `--output-file` reinterpreted as a directory (the caller
-/// is responsible for creating it — see [`ensure_batch_output_dir`] — and
-/// for having already rejected an `--output-file` that looks like an image
-/// file via [`looks_like_image_file`]). `subfolder_name`
-/// is the subfolder's own directory name (e.g. `"stack_03"` for
-/// `.../input/stack_03`). `image_saving` supplies the filename template and
-/// output format exactly as the GUI's Save dialog would.
-///
-/// Naming rule (mirrors `apps/stacker-gui/src/main.rs`'s
-/// `perform_save_current_image`): `filename_template` with every `{name}`
-/// occurrence replaced by `subfolder_name`, plus a `.` and
-/// `image_saving.output_format.extension()`.
-///
-/// # Example
-/// `filename_template = "{name}_stacked"`, `output_format = Tiff`,
-/// `subfolder_name = "coin_03"` → `coin_03_stacked.tiff`.
-#[must_use]
-pub fn resolve_batch_output_path(
-    output_dir: &Path,
-    subfolder_name: &str,
-    image_saving: &ImageSavingSettings,
-) -> PathBuf {
-    let stem = image_saving
-        .filename_template
-        .replace("{name}", subfolder_name);
-    let filename = format!("{stem}.{ext}", ext = image_saving.output_format.extension());
-    output_dir.join(filename)
+/// What a run does with its `--input-dir`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Plan {
+    /// One stack of the frames directly inside `--input-dir`.
+    Single,
+    /// One stack per listed subfolder.
+    Batch(Vec<PathBuf>),
 }
 
-/// Returns `true` if `path` has an extension recognised as an image format.
-///
-/// Standard formats always, or RAW in `raw`-feature builds — used to reject
-/// an `--output-file` that looks like a single file when subfolder-batch
-/// mode needs it to be a directory instead. Deliberately does not check
-/// whether `path` exists: the whole point is to catch the mistake *before*
-/// creating a directory there.
+/// `true` when `path` looks like an image file (it has a frame extension), which
+/// the batch's output directory must not.
 #[must_use]
 pub fn looks_like_image_file(path: &Path) -> bool {
-    has_recognised_image_extension(path)
+    has_frame_extension(path)
 }
 
-/// Create `output_dir` (and any missing parents) if it doesn't already exist.
-///
-/// Separated out from [`resolve_batch_output_path`] so the pure path
-/// computation stays side-effect-free and unit-testable without touching
-/// the filesystem.
+/// The plan for `args`: classify the input folder and resolve `--stacks`, asking
+/// on the terminal when needed.
 ///
 /// # Errors
-/// Returns [`StackerError`] if directory creation fails.
-pub fn ensure_batch_output_dir(output_dir: &Path) -> Result<(), StackerError> {
-    std::fs::create_dir_all(output_dir)?;
-    Ok(())
+/// An unreadable input folder, an unanswerable `--stacks` question, or a batch
+/// that cannot run: `--monitor` with subfolder mode, or an `--output-file` that
+/// looks like an image file.
+pub fn plan(args: &CliArgs) -> Result<Plan, StackerError> {
+    plan_with(args, stdin_is_tty(), prompt_stacks_mode)
 }
 
-/// One subfolder's batch-run outcome, for the end-of-run summary table.
+/// [`plan`] with the terminal check and the question injected.
+///
+/// # Errors
+/// As [`plan`].
+pub fn plan_with(
+    args: &CliArgs,
+    interactive: bool,
+    ask: impl FnOnce(usize, usize) -> Result<StacksDecision, StackerError>,
+) -> Result<Plan, StackerError> {
+    if args.stacks == Some(StacksMode::Single) {
+        return Ok(Plan::Single);
+    }
+    let kind = classify_input_dir(&args.input_dir, std::slice::from_ref(&args.output_file))?;
+    let InputKind::HasStackSubfolders {
+        subfolders,
+        direct_images,
+    } = kind
+    else {
+        return Ok(Plan::Single);
+    };
+    let decision = decide_stacks(
+        args.stacks,
+        interactive,
+        subfolders.len(),
+        direct_images,
+        ask,
+    )?;
+    if decision == StacksDecision::Single {
+        return Ok(Plan::Single);
+    }
+    if args.monitor {
+        return Err(StackerError::Validation(
+            "--monitor cannot watch several stacks: run without --monitor, or pass --stacks single \
+             to stack only the images directly in --input-dir"
+                .to_owned(),
+        ));
+    }
+    if looks_like_image_file(&args.output_file) {
+        return Err(StackerError::Validation(format!(
+            "with --stacks subfolders, --output-file is the output directory, not an image file \
+             (got '{}'); the file name of each stack comes from image_saving.filename_template",
+            args.output_file.display()
+        )));
+    }
+    Ok(Plan::Batch(subfolders))
+}
+
+/// The file a stack named `name` is written to inside `output_dir`:
+/// `filename_template` with `{name}` replaced, plus the extension of
+/// `output_format`.
+///
+/// # Errors
+/// [`StackerError::Validation`] when the template produces an empty name.
+pub fn resolve_batch_output_path(
+    output_dir: &Path,
+    name: &str,
+    saving: &ImageSavingSettings,
+) -> Result<PathBuf, StackerError> {
+    templated_file_in(output_dir, saving, name)
+}
+
+/// What one subfolder's run came to.
 #[derive(Debug)]
 pub struct StackOutcome {
+    /// The subfolder's name.
     pub name: String,
-    pub result: Result<PathBuf, String>,
+    /// The files written (one per algorithm), or the error message.
+    pub result: Result<Vec<PathBuf>, String>,
 }
 
-/// Render the end-of-batch summary table to stdout (ok/failed per
-/// subfolder, in the order they were run) and return `true` if every stack
-/// succeeded.
+/// The name of a subfolder: its last path component.
+fn folder_name(folder: &Path) -> String {
+    folder
+        .file_name()
+        .map_or_else(|| "stack".to_owned(), |n| n.to_string_lossy().into_owned())
+}
+
+/// Stack one subfolder into `output_dir`.
+fn run_subfolder(
+    args: &CliArgs,
+    settings: &StackingSettings,
+    folder: &Path,
+    name: &str,
+    scratch_root: &Path,
+) -> Result<Vec<PathBuf>, StackerError> {
+    let file = resolve_batch_output_path(&args.output_file, name, &settings.image_saving)?;
+    let stack_args = CliArgs {
+        input_dir: folder.to_path_buf(),
+        output_file: file,
+        monitor: false,
+        ..args.clone()
+    };
+    pipeline::run_stack_in(&stack_args, settings, scratch_root)
+}
+
+/// Run every folder of `subfolders` as a stack of its own, one after the other.
 ///
-/// A failing subfolder never aborts the batch — the caller logs the error
-/// and continues to the next subfolder; this function is only responsible
-/// for the final report and the aggregate exit-code decision.
+/// The results go into the directory `args.output_file` (created when missing). A
+/// failing stack is logged and reported in its outcome; the others still run.
+///
+/// # Errors
+/// [`StackerError::Io`] when the output directory cannot be created.
+pub fn run_batch_in(
+    args: &CliArgs,
+    settings: &StackingSettings,
+    subfolders: &[PathBuf],
+    scratch_root: &Path,
+) -> Result<Vec<StackOutcome>, StackerError> {
+    std::fs::create_dir_all(&args.output_file)?;
+    let mut outcomes = Vec::with_capacity(subfolders.len());
+    for folder in subfolders {
+        let name = folder_name(folder);
+        println!("=== [{name}] stacking '{}' ===", folder.display());
+        tracing::info!(folder = %folder.display(), "batch: starting stack");
+        let result = run_subfolder(args, settings, folder, &name, scratch_root).map_err(|error| {
+            tracing::error!(folder = %folder.display(), %error, "batch: stack failed");
+            error.to_string()
+        });
+        if let Ok(files) = &result {
+            for file in files {
+                println!("=== [{name}] done -> {} ===", file.display());
+            }
+        }
+        outcomes.push(StackOutcome { name, result });
+    }
+    Ok(outcomes)
+}
+
+/// [`run_batch_in`] with the system temporary directory as scratch root.
+///
+/// # Errors
+/// As [`run_batch_in`].
+pub fn run_batch(
+    args: &CliArgs,
+    settings: &StackingSettings,
+    subfolders: &[PathBuf],
+) -> Result<Vec<StackOutcome>, StackerError> {
+    run_batch_in(args, settings, subfolders, &std::env::temp_dir())
+}
+
+/// Print the summary table of a batch to stdout and return `true` when every
+/// stack succeeded.
 #[must_use]
 pub fn print_batch_summary(outcomes: &[StackOutcome]) -> bool {
     println!();
@@ -325,10 +390,13 @@ pub fn print_batch_summary(outcomes: &[StackOutcome]) -> bool {
     let mut all_ok = true;
     for outcome in outcomes {
         match &outcome.result {
-            Ok(path) => println!("  [ok]     {} -> {}", outcome.name, path.display()),
-            Err(e) => {
+            Ok(files) => {
+                let list: Vec<String> = files.iter().map(|f| f.display().to_string()).collect();
+                println!("  [ok]     {} -> {}", outcome.name, list.join(", "));
+            }
+            Err(error) => {
                 all_ok = false;
-                println!("  [FAILED] {} -> {e}", outcome.name);
+                println!("  [FAILED] {} -> {error}", outcome.name);
             }
         }
     }
@@ -338,225 +406,360 @@ pub fn print_batch_summary(outcomes: &[StackOutcome]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::RgbImage;
+    use stacker_core::settings::{AlignmentModeSetting, OutputFormat};
 
-    fn unique_temp_dir(tag: &str) -> PathBuf {
+    fn unique_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "z_stackr_batch_test_{tag}_{}_{}",
+            "z_stackr_batch_{tag}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.subsec_nanos())
         ));
-        std::fs::create_dir_all(&dir).expect("create unique temp test dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test dir");
         dir
     }
 
-    fn touch_image(dir: &Path, filename: &str) {
-        std::fs::write(
-            dir.join(filename),
-            b"not a real image, extension is all that matters",
-        )
+    fn touch(dir: &Path, name: &str) {
+        std::fs::write(dir.join(name), b"extension is all that matters").unwrap();
+    }
+
+    fn real_frame(dir: &Path, name: &str, seed: u32) {
+        RgbImage::from_fn(40, 40, |x, y| {
+            let v = x
+                .wrapping_mul(31)
+                .wrapping_add(y.wrapping_mul(17))
+                .wrapping_add(seed * 53);
+            let [b0, b1, b2, _] = v.wrapping_mul(0x9E37_79B1).to_le_bytes();
+            image::Rgb([b0, b1, b2])
+        })
+        .save(dir.join(name))
         .unwrap();
     }
 
-    fn touch_non_image(dir: &Path, filename: &str) {
-        std::fs::write(dir.join(filename), b"irrelevant").unwrap();
+    fn args_for(input: &Path, output: &Path) -> CliArgs {
+        CliArgs::for_test(input, output, "apex", 64)
     }
 
     // ── classify_input_dir ───────────────────────────────────────────────
 
     #[test]
-    fn classify_images_only_folder() {
-        let dir = unique_temp_dir("images_only");
-        touch_image(&dir, "a.png");
-        touch_image(&dir, "b.jpg");
-        touch_non_image(&dir, "readme.txt");
-
-        let kind = classify_input_dir(&dir).unwrap();
-        assert_eq!(kind, InputKind::ImagesOnly { direct_images: 2 });
-
+    fn frames_only_folder() {
+        let dir = unique_dir("images_only");
+        touch(&dir, "a.png");
+        touch(&dir, "b.JPG");
+        touch(&dir, "readme.txt");
+        assert_eq!(
+            classify_input_dir(&dir, &[]).unwrap(),
+            InputKind::ImagesOnly { direct_images: 2 }
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn classify_subfolders_only_folder() {
-        let dir = unique_temp_dir("subfolders_only");
-        let sub_a = dir.join("stack_a");
-        let sub_b = dir.join("stack_b");
-        std::fs::create_dir_all(&sub_a).unwrap();
-        std::fs::create_dir_all(&sub_b).unwrap();
-        touch_image(&sub_a, "1.png");
-        touch_image(&sub_b, "1.tif");
-        touch_image(&sub_b, "2.tif");
-
-        let kind = classify_input_dir(&dir).unwrap();
-        match kind {
+    fn subfolders_only_folder_lists_them_sorted() {
+        let dir = unique_dir("subfolders_only");
+        let (b, a) = (dir.join("stack_b"), dir.join("stack_a"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        touch(&a, "1.png");
+        touch(&b, "1.tif");
+        touch(&b, "2.tif");
+        assert_eq!(
+            classify_input_dir(&dir, &[]).unwrap(),
             InputKind::HasStackSubfolders {
-                subfolders,
-                direct_images,
-            } => {
-                assert_eq!(direct_images, 0);
-                assert_eq!(subfolders, vec![sub_a, sub_b]);
+                subfolders: vec![a, b],
+                direct_images: 0
             }
-            other => panic!("expected HasStackSubfolders, got {other:?}"),
-        }
-
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn classify_mixed_folder_reports_both_counts() {
-        let dir = unique_temp_dir("mixed");
-        touch_image(&dir, "direct1.png");
-        touch_image(&dir, "direct2.png");
+    fn mixed_folder_reports_both_counts() {
+        let dir = unique_dir("mixed");
+        touch(&dir, "direct1.png");
+        touch(&dir, "direct2.png");
         let sub = dir.join("stack_a");
         std::fs::create_dir_all(&sub).unwrap();
-        touch_image(&sub, "1.png");
-
-        let kind = classify_input_dir(&dir).unwrap();
-        match kind {
-            InputKind::HasStackSubfolders {
-                subfolders,
-                direct_images,
-            } => {
-                assert_eq!(direct_images, 2);
-                assert_eq!(subfolders, vec![sub]);
-            }
-            other => panic!("expected HasStackSubfolders, got {other:?}"),
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn classify_empty_folder() {
-        let dir = unique_temp_dir("empty");
-        let kind = classify_input_dir(&dir).unwrap();
-        assert_eq!(kind, InputKind::Empty);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn classify_ignores_subfolder_without_images() {
-        let dir = unique_temp_dir("sub_without_images");
-        let sub_empty = dir.join("not_a_stack");
-        std::fs::create_dir_all(&sub_empty).unwrap();
-        touch_non_image(&sub_empty, "notes.txt");
-        let sub_real = dir.join("real_stack");
-        std::fs::create_dir_all(&sub_real).unwrap();
-        touch_image(&sub_real, "1.png");
-
-        let kind = classify_input_dir(&dir).unwrap();
-        match kind {
-            InputKind::HasStackSubfolders {
-                subfolders,
-                direct_images,
-            } => {
-                assert_eq!(direct_images, 0);
-                // Only the subfolder that actually has images is counted —
-                // `not_a_stack` (images-less) is silently ignored.
-                assert_eq!(subfolders, vec![sub_real]);
-            }
-            other => panic!("expected HasStackSubfolders, got {other:?}"),
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn classify_ignores_grandchildren_non_recursive() {
-        // A subfolder whose own direct children have no images, but whose
-        // grandchild directory does, must NOT be counted — discovery is
-        // non-recursive beyond one level.
-        let dir = unique_temp_dir("grandchildren");
-        let sub = dir.join("outer");
-        let grandchild = sub.join("inner");
-        std::fs::create_dir_all(&grandchild).unwrap();
-        touch_image(&grandchild, "deep.png");
-
-        let kind = classify_input_dir(&dir).unwrap();
-        assert_eq!(kind, InputKind::Empty);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // ── decision_from_flag ───────────────────────────────────────────────
-
-    #[test]
-    fn decision_from_flag_maps_both_variants() {
+        touch(&sub, "1.png");
         assert_eq!(
-            decision_from_flag(Some(crate::args::StacksMode::Subfolders)),
-            Some(StacksDecision::Subfolders)
+            classify_input_dir(&dir, &[]).unwrap(),
+            InputKind::HasStackSubfolders {
+                subfolders: vec![sub],
+                direct_images: 2
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_folder_and_folders_without_frame_subfolders() {
+        let dir = unique_dir("empty");
+        assert_eq!(classify_input_dir(&dir, &[]).unwrap(), InputKind::Empty);
+
+        // A subfolder without frames is ignored, and the search goes one level only.
+        let notes = dir.join("not_a_stack");
+        std::fs::create_dir_all(&notes).unwrap();
+        touch(&notes, "notes.txt");
+        let deep = dir.join("outer").join("inner");
+        std::fs::create_dir_all(&deep).unwrap();
+        touch(&deep, "deep.png");
+        assert_eq!(classify_input_dir(&dir, &[]).unwrap(), InputKind::Empty);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_output_folder_is_never_a_stack() {
+        let dir = unique_dir("outdir");
+        let stack = dir.join("stack");
+        let results = dir.join("results");
+        std::fs::create_dir_all(&stack).unwrap();
+        std::fs::create_dir_all(&results).unwrap();
+        touch(&stack, "1.png");
+        touch(&results, "stack_stacked.png");
+        assert_eq!(
+            classify_input_dir(&dir, std::slice::from_ref(&results)).unwrap(),
+            InputKind::HasStackSubfolders {
+                subfolders: vec![stack],
+                direct_images: 0
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── decide_stacks ────────────────────────────────────────────────────
+
+    #[test]
+    fn the_flag_wins_and_nothing_is_asked() {
+        let never = |_: usize, _: usize| -> Result<StacksDecision, StackerError> {
+            panic!("the flag must make the question unnecessary")
+        };
+        assert_eq!(
+            decide_stacks(Some(StacksMode::Subfolders), true, 2, 1, never).unwrap(),
+            StacksDecision::Subfolders
         );
         assert_eq!(
-            decision_from_flag(Some(crate::args::StacksMode::Single)),
-            Some(StacksDecision::Single)
+            decide_stacks(Some(StacksMode::Single), false, 2, 1, never).unwrap(),
+            StacksDecision::Single
         );
-        assert_eq!(decision_from_flag(None), None);
     }
 
-    // ── resolve_batch_output_path ────────────────────────────────────────
+    #[test]
+    fn without_a_flag_a_terminal_is_asked_and_a_pipe_is_an_error() {
+        let asked = decide_stacks(None, true, 3, 0, |subfolders, direct| {
+            assert_eq!((subfolders, direct), (3, 0));
+            Ok(StacksDecision::Subfolders)
+        })
+        .unwrap();
+        assert_eq!(asked, StacksDecision::Subfolders);
+
+        let err = decide_stacks(None, false, 3, 0, |_, _| Ok(StacksDecision::Single))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--stacks"), "{err}");
+    }
+
+    // ── plan ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn resolve_batch_output_path_substitutes_name_and_extension() {
+    fn plan_is_single_for_frames_and_for_the_single_flag() {
+        let dir = unique_dir("plan_single");
+        touch(&dir, "a.png");
+        let args = args_for(&dir, &dir.join("out.png"));
+        assert_eq!(
+            plan_with(&args, false, |_, _| unreachable!()).unwrap(),
+            Plan::Single
+        );
+
+        let nested = unique_dir("plan_single_nested");
+        let sub = nested.join("s");
+        std::fs::create_dir_all(&sub).unwrap();
+        touch(&sub, "1.png");
+        let mut args = args_for(&nested, &nested.join("out"));
+        args.stacks = Some(StacksMode::Single);
+        assert_eq!(
+            plan_with(&args, false, |_, _| unreachable!()).unwrap(),
+            Plan::Single
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&nested);
+    }
+
+    #[test]
+    fn plan_lists_the_subfolders_and_refuses_unusable_batches() {
+        let dir = unique_dir("plan_batch");
+        let sub = dir.join("s");
+        std::fs::create_dir_all(&sub).unwrap();
+        touch(&sub, "1.png");
+
+        let mut args = args_for(&dir, &dir.join("out"));
+        args.stacks = Some(StacksMode::Subfolders);
+        assert_eq!(
+            plan_with(&args, false, |_, _| unreachable!()).unwrap(),
+            Plan::Batch(vec![sub.clone()])
+        );
+
+        // The question is asked when there is no flag and a terminal.
+        args.stacks = None;
+        assert_eq!(
+            plan_with(&args, true, |n, d| {
+                assert_eq!((n, d), (1, 0));
+                Ok(StacksDecision::Subfolders)
+            })
+            .unwrap(),
+            Plan::Batch(vec![sub])
+        );
+
+        // No flag and no terminal: the run stops.
+        assert!(plan_with(&args, false, |_, _| unreachable!()).is_err());
+
+        // Subfolder mode and --monitor exclude each other.
+        args.stacks = Some(StacksMode::Subfolders);
+        args.monitor = true;
+        let err = plan_with(&args, false, |_, _| unreachable!())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--monitor"), "{err}");
+
+        // --output-file must be a directory in subfolder mode.
+        args.monitor = false;
+        args.output_file = dir.join("result.png");
+        let err = plan_with(&args, false, |_, _| unreachable!())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("output directory"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── output names ─────────────────────────────────────────────────────
+
+    #[test]
+    fn output_name_is_the_template_with_the_format_extension() {
         let saving = ImageSavingSettings {
             filename_template: "{name}_stacked".to_owned(),
-            output_format: stacker_core::settings::OutputFormat::Tiff,
+            output_format: OutputFormat::Tiff,
             ..ImageSavingSettings::default()
         };
+        let out = Path::new("batch_out");
+        assert_eq!(
+            resolve_batch_output_path(out, "coin_03", &saving).unwrap(),
+            out.join("coin_03_stacked.tiff")
+        );
 
-        let out_dir = Path::new("/tmp/batch_out");
-        let path = resolve_batch_output_path(out_dir, "coin_03", &saving);
-        assert_eq!(path, out_dir.join("coin_03_stacked.tiff"));
-    }
-
-    #[test]
-    fn resolve_batch_output_path_honours_configured_format_extension() {
-        let saving = ImageSavingSettings {
-            filename_template: "{name}".to_owned(),
-            output_format: stacker_core::settings::OutputFormat::Jpeg,
-            ..ImageSavingSettings::default()
-        };
-
-        let out_dir = Path::new("/tmp/batch_out");
-        let path = resolve_batch_output_path(out_dir, "leaf", &saving);
-        assert_eq!(path, out_dir.join("leaf.jpg"));
-    }
-
-    #[test]
-    fn resolve_batch_output_path_handles_multiple_name_occurrences() {
         let saving = ImageSavingSettings {
             filename_template: "{name}_{name}".to_owned(),
-            output_format: stacker_core::settings::OutputFormat::Png,
+            output_format: OutputFormat::Png,
             ..ImageSavingSettings::default()
         };
+        assert_eq!(
+            resolve_batch_output_path(out, "x", &saving).unwrap(),
+            out.join("x_x.png")
+        );
 
-        let out_dir = Path::new("/tmp/batch_out");
-        let path = resolve_batch_output_path(out_dir, "x", &saving);
-        assert_eq!(path, out_dir.join("x_x.png"));
+        let saving = ImageSavingSettings {
+            filename_template: "  ".to_owned(),
+            ..ImageSavingSettings::default()
+        };
+        assert!(resolve_batch_output_path(out, "x", &saving).is_err());
     }
 
-    // ── looks_like_image_file (the batch-mode --output-file guard) ───────
-
     #[test]
-    fn looks_like_image_file_recognises_standard_extensions() {
+    fn image_paths_are_not_output_directories() {
         for name in [
             "out.png", "out.PNG", "out.tif", "out.tiff", "out.jpg", "out.jpeg",
         ] {
-            assert!(
-                looks_like_image_file(Path::new(name)),
-                "expected '{name}' to look like an image file"
-            );
+            assert!(looks_like_image_file(Path::new(name)), "{name}");
+        }
+        for name in ["out_dir", "batch_results", "out"] {
+            assert!(!looks_like_image_file(Path::new(name)), "{name}");
         }
     }
 
+    // ── a batch on a temporary tree ──────────────────────────────────────
+
     #[test]
-    fn looks_like_image_file_rejects_directory_like_paths() {
-        for name in ["out_dir", "batch_results", "out.", "out"] {
-            assert!(
-                !looks_like_image_file(Path::new(name)),
-                "expected '{name}' to NOT look like an image file"
-            );
+    fn a_batch_stacks_every_subfolder_and_reports_the_failing_one() {
+        let root = unique_dir("run");
+        let input = root.join("input");
+        let output = root.join("output");
+        let scratch = root.join("scratch");
+        for (name, seed) in [("coin_a", 1), ("coin_b", 2)] {
+            let folder = input.join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            real_frame(&folder, "f0.png", seed);
+            real_frame(&folder, "f1.png", seed + 10);
         }
+        // A stack whose frames cannot be decoded fails, the others still run.
+        let broken = input.join("coin_c");
+        std::fs::create_dir_all(&broken).unwrap();
+        touch(&broken, "f0.png");
+        touch(&broken, "f1.png");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let mut settings = StackingSettings {
+            alignment_mode: AlignmentModeSetting::None,
+            auto_cull: false,
+            ..StackingSettings::default()
+        };
+        settings.image_saving.output_format = OutputFormat::Png;
+        settings.image_saving.bit_depth = 8;
+
+        let mut args = args_for(&input, &output);
+        args.stacks = Some(StacksMode::Subfolders);
+        let Plan::Batch(folders) = plan_with(&args, false, |_, _| unreachable!()).unwrap() else {
+            panic!("expected a batch");
+        };
+        assert_eq!(folders.len(), 3);
+
+        let outcomes = run_batch_in(&args, &settings, &folders, &scratch).unwrap();
+        let names: Vec<&str> = outcomes.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, ["coin_a", "coin_b", "coin_c"]);
+        assert!(outcomes[0].result.is_ok() && outcomes[1].result.is_ok());
+        assert!(outcomes[2].result.is_err(), "{:?}", outcomes[2]);
+        assert!(output.join("coin_a_stacked.png").is_file());
+        assert!(output.join("coin_b_stacked.png").is_file());
+        assert!(!output.join("coin_c_stacked.png").exists());
+        assert!(!print_batch_summary(&outcomes));
+        assert_eq!(
+            std::fs::read_dir(&scratch).map_or(0, std::iter::Iterator::count),
+            0,
+            "every stack removes its tile directory"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_second_batch_run_does_not_treat_the_output_folder_as_a_stack() {
+        let root = unique_dir("rerun");
+        let folder = root.join("coin");
+        std::fs::create_dir_all(&folder).unwrap();
+        real_frame(&folder, "f0.png", 3);
+        real_frame(&folder, "f1.png", 4);
+        let output = root.join("results");
+        let scratch = unique_dir("rerun_scratch");
+
+        let mut settings = StackingSettings {
+            alignment_mode: AlignmentModeSetting::None,
+            auto_cull: false,
+            ..StackingSettings::default()
+        };
+        settings.image_saving.output_format = OutputFormat::Png;
+        let mut args = args_for(&root, &output);
+        args.stacks = Some(StacksMode::Subfolders);
+
+        for _ in 0..2 {
+            let Plan::Batch(folders) = plan_with(&args, false, |_, _| unreachable!()).unwrap()
+            else {
+                panic!("expected a batch");
+            };
+            assert_eq!(folders, vec![folder.clone()]);
+            let outcomes = run_batch_in(&args, &settings, &folders, &scratch).unwrap();
+            assert!(print_batch_summary(&outcomes));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }

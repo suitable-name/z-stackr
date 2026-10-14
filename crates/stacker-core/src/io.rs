@@ -1,265 +1,186 @@
-//! Shared frame-loading abstraction.
+//! Camera RAW input.
 //!
-//! Routes standard image formats through the `image` crate and (optionally)
-//! camera RAW formats through `rawler`, so `z-stackr-cli`, `z-stackr-gui`,
-//! and `z-stackr-pipeline` all decode frames identically instead of each
-//! re-implementing extension sniffing and RAW dispatch.
+//! RAW files are recognised by their extension ([`is_raw_extension`], the list
+//! [`RAW_EXTENSIONS`]) in every build, so file pickers and directory scans
+//! agree whether or not RAW can actually be decoded. Decoding itself
+//! ([`decode_raw_file`]) needs the `raw` cargo feature and a native target;
+//! without either it returns [`RawError::Disabled`] with a message that says
+//! how to get RAW support. [`RAW_SUPPORTED`] tells which of the two this build
+//! is.
 //!
-//! # RAW support (`raw` feature)
+//! # What the decoder does
 //!
-//! Without the `raw` feature this crate has zero RAW dependencies: RAW
-//! extensions are still *recognised* by [`is_raw_extension`] (so callers can
-//! filter file pickers/directory scans consistently either way), but
-//! [`load_frame`] returns a clear [`LoadError::RawSupportDisabled`] instead
-//! of attempting to decode.
+//! With the feature on, [`decode_raw_file`] runs `rawler` (the decoding engine
+//! of dnglab): the container and the sensor data are parsed, then the default
+//! `RawDevelop` chain develops them: rescale to `[0, 1]`, demosaic (PPG for a
+//! Bayer sensor, bilinear for X-Trans), crop to the active area, apply the
+//! camera white balance stored in the file, calibrate to sRGB primaries with
+//! the file's colour matrix (D65, else the nearest illuminant adapted by
+//! Bradford), crop to the recommended output area and apply the sRGB transfer
+//! curve. The result is returned as a 16-bit sRGB `DynamicImage`, the same shape
+//! a 16-bit TIFF has, so the pipeline's loader linearises it with the exact
+//! IEC 61966-2-1 table and every later stage works in linear light like for
+//! any other frame.
 //!
-//! With the `raw` feature, [`load_frame`] decodes RAW frames via `rawler`
-//! (the actively-maintained dnglab decoding engine): `rawler::decode_file`
-//! parses the container and Bayer/X-Trans/etc. sensor data, then
-//! `rawler::imgop::develop::RawDevelop`'s default pipeline (rescale to
-//! `[0, 1]`, demosaic, active-area crop, camera white balance, colour-matrix
-//! calibration to sRGB, default-crop, sRGB gamma) produces a demosaiced,
-//! white-balanced, gamma-encoded sRGB image, returned as
-//! `DynamicImage::ImageRgb16` — the same shape the old `rawloader` +
-//! `imagepipe` pipeline produced.
+//! # Limits
 //!
-//! ## Honest limitations
-//!
-//! * **No lens corrections** (distortion, vignetting, chromatic aberration)
-//!   are applied — `RawDevelop`'s default pipeline only does demosaic +
-//!   camera white balance + colour-matrix calibration + gamma. Serious
-//!   colour-critical work may prefer converting RAW files to TIFF externally
-//!   (e.g. with `darktable` or Adobe Camera Raw) first, applying whatever
-//!   corrections/colour grading is needed there, and feeding the TIFFs to
-//!   z-stackr instead.
-//! * **No highlight recovery / advanced white balance tuning** — the camera
-//!   white balance embedded in the RAW file is used as-is; there is no
-//!   "as shot" vs. "auto" vs. custom white-balance picker.
-//! * **EXIF orientation is not applied to RAW pixel data** — exactly like
-//!   every other format `load_frame` handles: `rawler::decode_file` records
-//!   the file's `Orientation` tag but `RawDevelop`'s pipeline never rotates
-//!   pixels by it, matching the `image` crate's own `image::open` (which
-//!   likewise never auto-rotates). This means `ignore_exif_orientation`
-//!   continues to behave as a documented no-op for every format, RAW
-//!   included — see `preprocessing::preprocess_frame`'s module docs.
-//!
-//! Supported RAW extensions (from `rawler`'s own decoder registry): Canon
-//! `.cr2` and `.cr3`, Nikon `.nef`, Sony `.arw`, Adobe `.dng`, Fujifilm
-//! `.raf`, Olympus `.orf`, Panasonic `.rw2`, Pentax `.pef`, and a handful of
-//! other manufacturer formats `rawler` recognises regardless of extension —
-//! see [`RAW_EXTENSIONS`] for the exact list this crate filters directory
-//! scans and file dialogs by.
+//! * No lens corrections (distortion, vignetting, chromatic aberration), no
+//!   highlight recovery, no white-balance choice: the white balance stored in
+//!   the file is used as it is. For colour-critical work, develop the RAW files
+//!   in a RAW converter and stack the TIFFs.
+//! * The EXIF orientation is **not** applied to RAW pixels. (JPEG frames are
+//!   rotated on load; RAW frames are not.) The copied EXIF keeps the source's
+//!   orientation tag for them, so the output still displays upright.
+//! * A monochrome sensor yields a 16-bit grey image, which the loader widens to
+//!   RGB. A four-colour sensor whose colour matrix has not folded it to three
+//!   channels is rejected.
 
-use std::path::Path;
+use std::{fmt, path::Path};
 
-use image::DynamicImage;
+use ::image::DynamicImage;
 
-/// Canonical list of recognised RAW file extensions (lower-case, no dot).
+/// Lower-case, dot-less file extensions recognised as camera RAW.
 ///
-/// This is the single source of truth for "is this filename a RAW frame" —
-/// [`is_raw_extension`], `stacker_pipeline::load::collect_image_paths`, and
-/// the GUI's file-open dialog filter all read from this list so they can
-/// never drift apart. Sourced from `rawler`'s supported decoder registry
-/// (container formats it can parse); this is an extension allow-list, not a
-/// guarantee that every file with one of these extensions will decode
-/// (`rawler` may still reject an unsupported camera model's dialect).
-///
-/// **Includes `cr3`**: unlike the previous `rawloader`-based decoder, which
-/// could only parse Canon's older TIFF-based CR2 container, `rawler` has a
-/// native CR3 (ISO-BMFF-based) decoder — see the module docs.
+/// The single list: [`is_raw_extension`], the pipeline's directory scan and the
+/// apps' file pickers all read it. It is an allow-list of containers `rawler`
+/// can parse, not a promise that every camera model of such a file decodes.
 pub const RAW_EXTENSIONS: &[&str] = &[
     "cr2", "cr3", "nef", "arw", "dng", "raf", "orf", "rw2", "pef", "srw", "3fr", "erf", "kdc",
     "mrw", "nrw", "raw", "rwl", "sr2", "srf", "x3f",
 ];
 
-/// Returns `true` if `ext` (case-insensitive, no leading dot) is a
-/// recognised RAW file extension.
-///
-/// Uses [`RAW_EXTENSIONS`] as the single source of truth so directory scans
-/// and file-dialog filters can never drift apart from what [`load_frame`]
-/// actually knows how to route.
+/// `true` when this build can decode RAW files: the `raw` feature is on and the
+/// target is not `wasm32`.
+pub const RAW_SUPPORTED: bool = cfg!(all(feature = "raw", not(target_arch = "wasm32")));
+
+/// `true` when `ext` (any letter case, no leading dot) is one of the
+/// [`RAW_EXTENSIONS`].
 #[must_use]
 pub fn is_raw_extension(ext: &str) -> bool {
-    let lower = ext.to_ascii_lowercase();
-    RAW_EXTENSIONS.contains(&lower.as_str())
+    RAW_EXTENSIONS
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(ext))
 }
 
-/// Errors from [`load_frame`].
-#[derive(Debug, thiserror::Error)]
-pub enum LoadError {
-    /// A standard (non-RAW) format failed to decode via the `image` crate.
-    #[error("failed to decode {path}: {source}")]
-    Image {
-        path: std::path::PathBuf,
-        #[source]
-        source: image::ImageError,
-    },
-    /// The file's extension is a recognised RAW format, but this binary was
-    /// built without the `raw` feature.
-    #[error(
-        "'{path}' looks like a RAW file (.{ext}), but this build was compiled without RAW \
-         support — rebuild with `--features raw`, or convert the file to TIFF/DNG first"
-    )]
-    RawSupportDisabled {
-        path: std::path::PathBuf,
+/// `true` when `path` has one of the [`RAW_EXTENSIONS`].
+#[must_use]
+pub fn has_raw_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(is_raw_extension)
+}
+
+/// Why a RAW file could not be decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawError {
+    /// This build has no RAW support (`raw` feature off, or `wasm32`).
+    Disabled {
+        /// The file's extension, as given (without the dot).
         ext: String,
     },
-    /// RAW decoding itself failed (feature `raw` only).
-    #[cfg(feature = "raw")]
-    #[error("failed to decode RAW file {path}: {message}")]
-    RawDecode {
-        path: std::path::PathBuf,
+    /// `rawler` could not decode the file.
+    Decode {
+        /// The decoder's message.
         message: String,
     },
 }
 
-/// Load an image frame from `path`, routing by file extension.
-///
-/// - Standard formats (anything not in [`RAW_EXTENSIONS`]) are decoded via
-///   `image::open` directly, with zero added overhead or dependencies.
-/// - RAW formats are decoded via `rawler` when this crate is built with the
-///   `raw` feature (16-bit RGB output, camera white balance applied, default
-///   demosaic — see the module docs for the exact pipeline and its honest
-///   limitations); without the feature this returns
-///   [`LoadError::RawSupportDisabled`] with a clear remediation message.
+impl fmt::Display for RawError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Disabled { ext } => write!(
+                f,
+                "'.{ext}' is a camera RAW format, but this build has no RAW support: rebuild \
+                 with `--features raw` (desktop and command line only, not the browser), or \
+                 convert the file to TIFF or DNG first"
+            ),
+            Self::Decode { message } => write!(f, "RAW decoding failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for RawError {}
+
+/// Decode the RAW file at `path` into a 16-bit sRGB image (see the module
+/// documentation for the development chain).
 ///
 /// # Errors
-///
-/// Returns [`LoadError`] if the file cannot be read or decoded, or (in
-/// non-`raw` builds) if `path` has a RAW extension.
-pub fn load_frame(path: &Path) -> Result<DynamicImage, LoadError> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
+/// [`RawError::Decode`] when the file cannot be parsed or developed.
+#[cfg(all(feature = "raw", not(target_arch = "wasm32")))]
+pub fn decode_raw_file(path: &Path) -> Result<DynamicImage, RawError> {
+    use rawler::imgop::develop::{Intermediate, RawDevelop};
 
-    if is_raw_extension(&ext) {
-        return load_raw_frame(path, &ext);
-    }
-
-    image::open(path).map_err(|source| LoadError::Image {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-/// RAW-specific decode path, split out so the `#[cfg(feature = "raw")]`
-/// gate lives in exactly one place rather than smeared across
-/// [`load_frame`].
-#[cfg(feature = "raw")]
-fn load_raw_frame(path: &Path, _ext: &str) -> Result<DynamicImage, LoadError> {
-    // `rawler::decode_file` parses the container (CR2/CR3/NEF/ARW/DNG/…)
-    // and returns the raw sensor data plus all metadata needed to develop it
-    // (white balance coefficients, colour matrix, active/crop areas, the
-    // EXIF `Orientation` tag, etc.) — this is the `rawloader::decode_file`
-    // equivalent in the old pipeline.
-    let rawimage = rawler::decode_file(path).map_err(|source| LoadError::RawDecode {
-        path: path.to_path_buf(),
-        message: source.to_string(),
-    })?;
-
-    // `RawDevelop::default()`'s step list (Rescale, Demosaic,
-    // CropActiveArea, WhiteBalance, Calibrate, CropDefault, SRgb) is
-    // `rawler`'s equivalent of `imagepipe::Pipeline`'s default op chain:
-    // rescale black/white levels to `[0, 1]`, demosaic the CFA pattern,
-    // crop to the sensor's active area, apply the camera's embedded white
-    // balance, calibrate camera RGB to sRGB via the file's colour matrix,
-    // crop to the recommended output area, then apply the sRGB gamma
-    // curve. Like the old pipeline, this never rotates pixels according to
-    // the file's `Orientation` tag (see the module docs) — orientation
-    // handling stays a no-op regardless of `ignore_exif_orientation`,
-    // exactly matching every other format's behaviour.
-    let intermediate = rawler::imgop::develop::RawDevelop::default()
+    let decode_error = |e: &dyn fmt::Display| RawError::Decode {
+        message: e.to_string(),
+    };
+    let rawimage = rawler::decode_file(path).map_err(|e| decode_error(&e))?;
+    let developed = RawDevelop::default()
         .develop_intermediate(&rawimage)
-        .map_err(|source| LoadError::RawDecode {
-            path: path.to_path_buf(),
-            message: source.to_string(),
-        })?;
-
-    // 16-bit sRGB output. `None` cache: each RAW frame in this pipeline is
-    // decoded exactly once per run (see `z-stackr-pipeline`'s decode-once
-    // cache), so there is nothing to usefully cache across calls here.
-    // `to_dynamic_image` returns `ImageRgb16` for the normal three-colour
-    // case (the vast majority of cameras, after `Calibrate` folds any
-    // four-colour CFA down to three channels); a genuinely monochrome
-    // camera instead yields `ImageLuma16`, which downstream code already
-    // handles via `DynamicImage::to_rgb16()`.
-    intermediate
-        .to_dynamic_image()
-        .ok_or_else(|| LoadError::RawDecode {
-            path: path.to_path_buf(),
-            message: "decoded RAW pixel buffer size did not match its reported dimensions"
+        .map_err(|e| decode_error(&e))?;
+    match developed {
+        Intermediate::ThreeColor(px) => {
+            let mut samples = Vec::with_capacity(px.data.len() * 3);
+            for rgb in &px.data {
+                samples.extend(rgb.iter().map(|&c| to_u16(c)));
+            }
+            sized_buffer(px.width, px.height, samples).map(DynamicImage::ImageRgb16)
+        }
+        Intermediate::Monochrome(px) => {
+            let samples = px.data.iter().map(|&c| to_u16(c)).collect();
+            sized_buffer(px.width, px.height, samples).map(DynamicImage::ImageLuma16)
+        }
+        Intermediate::FourColor(_) => Err(RawError::Decode {
+            message: "the sensor has four colour channels that the colour matrix did not fold \
+                      to three"
                 .to_owned(),
-        })
+        }),
+    }
 }
 
-#[cfg(not(feature = "raw"))]
-fn load_raw_frame(path: &Path, ext: &str) -> Result<DynamicImage, LoadError> {
-    Err(LoadError::RawSupportDisabled {
-        path: path.to_path_buf(),
-        ext: ext.to_owned(),
+/// Without RAW support every decode fails with [`RawError::Disabled`].
+///
+/// # Errors
+/// Always [`RawError::Disabled`].
+#[cfg(not(all(feature = "raw", not(target_arch = "wasm32"))))]
+pub fn decode_raw_file(path: &Path) -> Result<DynamicImage, RawError> {
+    Err(RawError::Disabled {
+        ext: path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_owned(),
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_is_raw_extension_recognises_known_formats() {
-        for ext in ["cr2", "NEF", "Arw", "dng", "raf", "orf", "rw2", "pef"] {
-            assert!(
-                is_raw_extension(ext),
-                "expected '{ext}' to be recognised as RAW"
-            );
-        }
+/// A `[0, 1]` sample as a rounded, clamped 16-bit code (NaN becomes 0).
+#[cfg(all(feature = "raw", not(target_arch = "wasm32")))]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is clamped to 0..=65535 before the cast"
+)]
+fn to_u16(sample: f32) -> u16 {
+    if sample.is_nan() {
+        0
+    } else {
+        (sample.clamp(0.0, 1.0) * 65_535.0).round() as u16
     }
+}
 
-    #[test]
-    fn test_is_raw_extension_recognises_cr3() {
-        // CR3 is now supported — `rawler` has a native ISO-BMFF decoder for
-        // Canon's newer container, unlike the old `rawloader`-based path
-        // which could only parse the TIFF-based CR2 format. See the module
-        // docs.
-        assert!(is_raw_extension("cr3"));
-        assert!(is_raw_extension("CR3"));
-    }
-
-    #[test]
-    fn test_is_raw_extension_rejects_standard_formats() {
-        for ext in ["png", "jpg", "jpeg", "tif", "tiff", "PNG", "", "txt"] {
-            assert!(
-                !is_raw_extension(ext),
-                "expected '{ext}' to NOT be recognised as RAW"
-            );
-        }
-    }
-
-    #[test]
-    fn test_load_frame_raw_without_feature_gives_clear_error() {
-        // This test only exercises the reachable branch in a default
-        // (non-`raw`) build: a RAW extension without the feature must fail
-        // with a clear, actionable message rather than a generic I/O error
-        // or (worse) silently misinterpreting the RAW bytes as some other
-        // format. The file need not even exist — the extension check runs
-        // first, exactly like `metadata::inject_exif`'s unsupported-format
-        // check.
-        #[cfg(not(feature = "raw"))]
-        {
-            let path = Path::new("nonexistent_test_frame.nef");
-            let err = load_frame(path).unwrap_err();
-            assert!(matches!(err, LoadError::RawSupportDisabled { .. }));
-            let msg = err.to_string();
-            assert!(msg.contains("--features raw"));
-            assert!(msg.contains("nef") || msg.contains(".nef"));
-        }
-    }
-
-    #[test]
-    fn test_load_frame_standard_format_missing_file_is_image_error() {
-        let path = Path::new("this_file_really_does_not_exist_z_stackr_test.png");
-        let err = load_frame(path).unwrap_err();
-        assert!(matches!(err, LoadError::Image { .. }));
-    }
+/// An image buffer of `width × height` from interleaved `samples`.
+#[cfg(all(feature = "raw", not(target_arch = "wasm32")))]
+fn sized_buffer<P>(
+    width: usize,
+    height: usize,
+    samples: Vec<u16>,
+) -> Result<::image::ImageBuffer<P, Vec<u16>>, RawError>
+where
+    P: ::image::Pixel<Subpixel = u16> + 'static,
+{
+    let mismatch = || RawError::Decode {
+        message: "the decoded pixel buffer does not match its reported size".to_owned(),
+    };
+    let w = u32::try_from(width).map_err(|_| mismatch())?;
+    let h = u32::try_from(height).map_err(|_| mismatch())?;
+    ::image::ImageBuffer::from_raw(w, h, samples).ok_or_else(mismatch)
 }

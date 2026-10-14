@@ -1,0 +1,69 @@
+[package]
+name = "z-stackr-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The z-stackr browser app: the desktop's Slint interface on a canvas, with the stacking pipeline in a Web Worker. Built with Trunk."
+
+# `cdylib` is what wasm-bindgen/Trunk need; `rlib` lets a native `cargo check` of the
+# workspace type-check this crate as an ordinary (empty) library.
+[lib]
+name = "stacker_web"
+crate-type = ["cdylib", "rlib"]
+
+# Everything lives under the wasm32 target section: every module is
+# `#[cfg(target_arch = "wasm32")]`, so a native build references none of these and
+# declaring them here would only make them unused there.
+[dependencies]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The desktop's own window and wiring. No AKAZE in the browser (pure intensity alignment).
+z-stackr-gui = { path = "../stacker-gui", default-features = false }
+z-stackr-web-core = { workspace = true }
+z-stackr-pipeline = { workspace = true }
+z-stackr-core = { workspace = true }
+slint = { version = "1.18.1", default-features = false, features = [
+    "std",
+    # Required when `default-features = false` (a `compile_error!` otherwise).
+    "compat-1-2",
+    "backend-winit",
+    "renderer-femtovg",
+] }
+# The async file picker: on wasm32 a hidden `<input type="file">`. `file-handle-inner`
+# gives the picked `web_sys::File`, whose size is checked before the file is read.
+rfd = { workspace = true, features = ["file-handle-inner"] }
+toml = { workspace = true }
+# Turns a Rust panic into a readable `console.error` line.
+console_error_panic_hook = { workspace = true }
+js-sys = { workspace = true }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+web-sys = { version = "0.3.106", default-features = false, features = [
+    "BeforeUnloadEvent",
+    "Blob",
+    "BlobPropertyBag",
+    "console",
+    "DataTransfer",
+    "Document",
+    "DragEvent",
+    "Element",
+    "ErrorEvent",
+    "Event",
+    "EventTarget",
+    "File",
+    "FileList",
+    "HtmlAnchorElement",
+    "HtmlCanvasElement",
+    "HtmlElement",
+    "MessageEvent",
+    "Navigator",
+    "Node",
+    "Performance",
+    "Storage",
+    "Url",
+    "Window",
+    "Worker",
+] }
+
+[lints]
+workspace = true

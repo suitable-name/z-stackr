@@ -1,0 +1,127 @@
+// z-stackr design tokens. Every colour, spacing step, font size and radius in the
+// Slint tree comes from here, so a re-palette touches this one file. Colours are
+// named by ROLE (what they are used for), not by hue: two roles may share a value
+// today and still move independently in a later palette change.
+export global Theme {
+    // ── Surfaces ─────────────────────────────────────────────────────────────
+    /// The window background behind everything.
+    out property <color> bg-window: #181818;
+    /// A side panel or card (sidebar, Retouch options row, dialog cards).
+    out property <color> bg-panel: #252526;
+    /// The image canvas and other recessed areas.
+    out property <color> bg-canvas: #1e1e1e;
+    /// The top toolbar.
+    out property <color> bg-toolbar: #2d2d2d;
+    /// The bottom status strip.
+    out property <color> bg-statusbar: #1a1a1a;
+    /// A hovered row / button on a panel.
+    out property <color> bg-hover: #333333;
+    /// A recessed input or key-cap background.
+    out property <color> bg-input: #1e1e1e;
+    /// A small control sitting on a panel (a dialog's close button).
+    out property <color> bg-control: #444444;
+    /// A floating tooltip card.
+    out property <color> bg-tooltip: #2b2b2b;
+    /// The track behind a progress bar.
+    out property <color> bg-track: #333333;
+    /// A modal dialog card.
+    out property <color> surface-dialog: #252526;
+
+    // ── Borders ──────────────────────────────────────────────────────────────
+    /// A hairline between regions and a panel's outline.
+    out property <color> border-subtle: #333333;
+    /// The line under the toolbar.
+    out property <color> border-toolbar: #3a3a3a;
+    /// A dialog card's outline and a tooltip outline.
+    out property <color> border-dialog: #555555;
+    /// A control outline one step brighter than `border-subtle`.
+    out property <color> border-control: #444444;
+
+    // ── Text ─────────────────────────────────────────────────────────────────
+    /// A heading or text that must stand out.
+    out property <color> text-strong: #ffffff;
+    /// Normal readable text and labels.
+    out property <color> text-primary: #cccccc;
+    /// Values and supporting text.
+    out property <color> text-secondary: #999999;
+    /// Status-bar text and other quiet text.
+    out property <color> text-muted: #888888;
+    /// Text that is present but low priority (frame counts, timings).
+    out property <color> text-dim: #666666;
+    /// Placeholder hints (the empty-state second line).
+    out property <color> text-faint: #444444;
+    /// Text of a control that is currently not actionable.
+    out property <color> text-disabled: #555555;
+    /// Text inside a tooltip card.
+    out property <color> text-tooltip: #eeeeee;
+    /// Ink drawn on an accent fill.
+    out property <color> text-on-accent: #ffffff;
+
+    // ── Accent and state ─────────────────────────────────────────────────────
+    /// The brand accent: section titles, progress fill, focus.
+    out property <color> accent: #007acc;
+    /// A hovered accent element.
+    out property <color> accent-hover: #1f9bf0;
+    /// The accent at low opacity: a section rule or a stale-badge fill.
+    out property <color> accent-faint: #007acc44;
+    /// A link to a produced result file.
+    out property <color> accent-result: #00ccff;
+    /// Danger, error and destructive-action ink.
+    out property <color> danger: #ff5555;
+    /// Success ink (toast icon).
+    out property <color> success: #34d399;
+    /// Warning ink and the stale badge outline.
+    out property <color> warning: #f59e0b;
+    /// The warning colour at low opacity.
+    out property <color> warning-glow: #f59e0b33;
+
+    // ── Overlays ─────────────────────────────────────────────────────────────
+    /// The backdrop behind every modal dialog.
+    out property <color> overlay-backdrop: #00000099;
+    /// A heavier backdrop for a dialog that hides busy content (the depth-map preview).
+    out property <color> overlay-backdrop-strong: #000000aa;
+    /// A hover fill for a control with no surface of its own.
+    out property <color> overlay-hover: #ffffff22;
+    /// The drop shadow under a floating card.
+    out property <color> shadow: #00000080;
+    /// The drop shadow under a modal dialog card.
+    out property <color> modal-shadow: #000000bb;
+
+    // ── Toasts (translucent: they float over live content) ───────────────────
+    out property <color> toast-success-surface: #064e3bcc;
+    out property <color> toast-error-surface: #7f1d1dcc;
+    out property <color> toast-warning-surface: #78350fcc;
+    out property <color> toast-info-surface: #0f172acc;
+    out property <color> toast-shadow: #000000aa;
+
+    // ── Spacing ──────────────────────────────────────────────────────────────
+    out property <length> space-xs: 4px;
+    out property <length> space-sm: 8px;
+    out property <length> space-md: 12px;
+    out property <length> space-lg: 16px;
+    out property <length> space-xl: 24px;
+
+    // ── Font sizes ───────────────────────────────────────────────────────────
+    out property <length> font-xs: 11px;
+    out property <length> font-sm: 12px;
+    out property <length> font-md: 13px;
+    /// Section labels and card titles.
+    out property <length> font-label: 14px;
+    out property <length> font-lg: 16px;
+    /// A dialog title.
+    out property <length> font-title: 20px;
+    out property <length> font-xl: 24px;
+
+    // ── Radii ────────────────────────────────────────────────────────────────
+    out property <length> radius-sm: 4px;
+    out property <length> radius-md: 8px;
+    out property <length> radius-lg: 12px;
+
+    // ── Control and bar sizes ────────────────────────────────────────────────
+    out property <length> control-height: 36px;
+    out property <length> control-height-sm: 32px;
+    out property <length> toolbar-height: 52px;
+    out property <length> statusbar-height: 28px;
+    out property <length> sidebar-width: 280px;
+    out property <length> hairline: 1px;
+}

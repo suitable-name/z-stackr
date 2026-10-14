@@ -1,0 +1,48 @@
+import { Palette } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+
+// A toolbar toggle: the height of a `Button`, filled while `checked` with the same
+// accent as a primary `Button`, so it does not clash with Start Stacking or Done. It only reports a click; the host flips the state, so one function can
+// serve the button, the key shortcut and the menu item and they cannot disagree.
+export component ToolToggle inherits Rectangle {
+    in property <string> text;
+    in property <bool> checked: false;
+    in property <bool> enabled: true;
+    // Hover text; shown by the native tooltip.
+    in property <string> tip: "";
+    callback clicked();
+
+    height: Theme.control-height;
+    width: label.preferred-width + 2 * Theme.space-lg;
+    border-radius: Theme.radius-sm;
+    border-width: Theme.hairline;
+    border-color: root.checked ? Palette.accent-background : Theme.border-control;
+    background: root.checked
+        ? (touch.has-hover && root.enabled ? Palette.accent-background.brighter(0.1) : Palette.accent-background)
+        : (touch.has-hover && root.enabled ? Theme.bg-control : Theme.bg-hover);
+    animate background { duration: 100ms; }
+
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
+
+    if root.tip != "": Tooltip { text: @markdown("\{root.tip}"); }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+        clicked => { root.clicked(); }
+    }
+
+    label := Text {
+        text: root.text;
+        font-size: Theme.font-md;
+        color: !root.enabled ? Theme.text-disabled
+            : (root.checked ? Palette.accent-foreground : Theme.text-primary);
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}

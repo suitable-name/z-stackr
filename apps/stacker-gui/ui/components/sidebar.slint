@@ -1,0 +1,226 @@
+import { Button, ComboBox, ScrollView } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { AppModel } from "../models/app_model.slint";
+import { FilesModel } from "../models/files.slint";
+import { StaleBadge } from "stale_badge.slint";
+
+// The left sidebar: algorithm choice, the optional AI model picker, the lists of
+// source frames and produced results, and the currency badges. The badges and the
+// auto-cull marks read `FilesModel` directly (Rust fills it, see `gui/stale.rs`),
+// so they need no wiring in `app.slint`.
+export component Sidebar inherits Rectangle {
+    callback file-clicked(int);
+    callback result-clicked(int);
+    callback remove-file(int);
+    callback clear-all-files();
+    // Sort the frames sharpest-first / drop the frames that add nothing, without
+    // running a stack. Disabled while a job runs.
+    callback sort-frames();
+    callback cull-frames();
+
+    in property <[string]> loaded-files;
+    in property <[string]> result-files;
+
+    out property <string> algo-value: algo-box.current-value;
+    // Algorithm options are supplied by Rust so the "AI Model (Neural)" entry only
+    // appears when the app was built with the `nn` feature.
+    in property <[string]> algo-options: [
+        "Relief (Depth Map)", "Apex (Laplacian)", "Strata (Guided Fusion)",
+        "Both (Relief & Apex)", "All Three (Strata, Relief & Apex)"
+    ];
+    // AI model picker state (populated by Rust; empty / false when no models are
+    // installed or the app was built without the `nn` feature).
+    in property <[string]> ai-model-names;
+    in property <bool> ai-models-available;
+    in property <bool> ai-show-device;
+    in property <[string]> ai-device-names;
+    in-out property <int> ai-model-index;
+    in-out property <int> ai-device-index;
+    out property <string> ai-model-value:
+        (ai-model-names.length > 0 && ai-model-index < ai-model-names.length)
+            ? ai-model-names[ai-model-index] : "";
+    out property <string> ai-device-value:
+        (ai-device-names.length > 0 && ai-device-index < ai-device-names.length)
+            ? ai-device-names[ai-device-index] : "";
+
+    background: Theme.bg-panel;
+    border-width: Theme.hairline;
+    border-color: Theme.border-subtle;
+
+    VerticalLayout {
+        padding: Theme.space-xl;
+        spacing: Theme.space-lg;
+        alignment: start;
+
+        Text { text: "z-stackr"; color: Theme.text-strong; font-weight: 800; font-size: Theme.font-xl; }
+
+        VerticalLayout {
+            spacing: Theme.space-sm;
+            Text { text: "Algorithm"; color: Theme.text-primary; font-size: Theme.font-label; font-weight: 600; }
+            algo-box := ComboBox { accessible-label: "Algorithm"; model: root.algo-options; current-index: 0; }
+        }
+
+        // ── AI model picker (only relevant when "AI Model (Neural)" is chosen) ──
+        if (algo-box.current-value == "AI Model (Neural)") : VerticalLayout {
+            spacing: Theme.space-sm;
+            Text { text: "AI model"; color: Theme.text-primary; font-size: Theme.font-label; font-weight: 600; }
+            ai-model-box := ComboBox {
+                accessible-label: "AI model";
+                model: root.ai-models-available ? root.ai-model-names : ["(no models found)"];
+                enabled: root.ai-models-available;
+                current-index <=> root.ai-model-index;
+            }
+            if (root.ai-show-device) : Text { text: "Device"; color: Theme.text-primary; font-size: Theme.font-sm; }
+            if (root.ai-show-device) : ai-device-box := ComboBox {
+                accessible-label: "AI device";
+                model: root.ai-device-names;
+                current-index <=> root.ai-device-index;
+            }
+        }
+
+        Rectangle { height: Theme.hairline; background: Theme.border-subtle; }
+
+        if (root.loaded-files.length > 0) : VerticalLayout {
+            spacing: Theme.space-sm;
+            HorizontalLayout {
+                alignment: space-between;
+                Text {
+                    text: "Source Files (" + root.loaded-files.length + ")";
+                    color: Theme.text-primary;
+                    font-size: Theme.font-label;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
+                TouchArea {
+                    width: 40px;
+                    mouse-cursor: pointer;
+                    accessible-role: button;
+                    accessible-label: "Clear all files";
+                    accessible-action-default => { root.clear-all-files(); }
+                    clicked => { root.clear-all-files(); }
+                    Text { text: "Clear"; color: Theme.danger; font-size: Theme.font-sm; horizontal-alignment: right; vertical-alignment: center; }
+                }
+            }
+            // List actions. Sort orders the frames sharpest-first (the sharpest
+            // becomes the alignment reference); Cull drops the frames that add
+            // nothing. Both wait for a running job to finish.
+            HorizontalLayout {
+                spacing: Theme.space-sm;
+                alignment: start;
+                Rectangle {
+                    width: 64px;
+                    height: Theme.control-height-sm;
+                    Button {
+                        x: 0;
+                        y: 0;
+                        width: parent.width;
+                        height: parent.height;
+                        text: "Sort";
+                        enabled: !AppModel.busy && !AppModel.is-monitoring;
+                        clicked => { root.sort-frames(); }
+                    }
+                    Tooltip { text: @markdown("Order the frames sharpest-first, so the sharpest frame becomes the alignment reference."); }
+                }
+                Rectangle {
+                    width: 64px;
+                    height: Theme.control-height-sm;
+                    Button {
+                        x: 0;
+                        y: 0;
+                        width: parent.width;
+                        height: parent.height;
+                        text: "Cull";
+                        enabled: !AppModel.busy && !AppModel.is-monitoring;
+                        clicked => { root.cull-frames(); }
+                    }
+                    Tooltip { text: @markdown("Drop the frames that add almost nothing to the stack. The threshold is under Settings > General."); }
+                }
+            }
+            ScrollView {
+                height: 120px;
+                VerticalLayout {
+                    spacing: Theme.space-xs;
+                    alignment: start;
+                    for file[idx] in root.loaded-files : row := HorizontalLayout {
+                        // Dropped by the last auto-cull: still in the list (the list is
+                        // the user's), shown dimmed. Bound-checked because the flags
+                        // follow a list change by up to one poll tick.
+                        property <bool> culled: idx < FilesModel.culled-files.length && FilesModel.culled-files[idx];
+                        spacing: Theme.space-sm;
+                        height: 24px;
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            opacity: row.culled ? 0.5 : 1.0;
+                            TouchArea { accessible-role: button; accessible-label: "Show " + file; accessible-action-default => { root.file-clicked(idx); } clicked => { root.file-clicked(idx); } }
+                            Text {
+                                width: parent.width;
+                                height: parent.height;
+                                text: row.culled ? file + "  (culled)" : file;
+                                color: row.culled ? Theme.text-dim : Theme.text-secondary;
+                                font-size: Theme.font-sm;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            if row.culled : Tooltip { text: @markdown("Dropped by auto-cull in the last run"); }
+                        }
+                        Rectangle {
+                            width: Theme.space-lg;
+                            TouchArea { mouse-cursor: pointer; accessible-role: button; accessible-label: "Remove " + file; accessible-action-default => { root.remove-file(idx); } clicked => { root.remove-file(idx); } }
+                            Text { text: "×"; color: Theme.danger; font-size: Theme.font-lg; font-weight: 800; vertical-alignment: center; horizontal-alignment: center; }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── The Align cache, with a stale badge when its inputs changed ──
+        if (FilesModel.aligned-summary != "") : VerticalLayout {
+            spacing: Theme.space-xs;
+            Text { text: FilesModel.aligned-summary; color: Theme.text-primary; font-size: Theme.font-label; font-weight: 600; }
+            if FilesModel.aligned-stale : HorizontalLayout {
+                alignment: start;
+                StaleBadge {
+                    text: FilesModel.aligned-stale-text;
+                    enabled: !AppModel.busy && !AppModel.is-monitoring && FilesModel.has-images;
+                    recompute => { FilesModel.recompute-aligned(); }
+                }
+            }
+        }
+
+        if (root.result-files.length > 0) : VerticalLayout {
+            spacing: Theme.space-sm;
+            Text { text: "Results (" + root.result-files.length + ")"; color: Theme.text-primary; font-size: Theme.font-label; font-weight: 600; }
+            ScrollView {
+                // Room for the badge row under the newest result while it is stale.
+                height: FilesModel.result-stale ? 104px : 80px;
+                VerticalLayout {
+                    spacing: Theme.space-xs;
+                    alignment: start;
+                    for file[idx] in root.result-files : VerticalLayout {
+                        spacing: Theme.space-xs;
+                        TouchArea {
+                            height: 24px;
+                            mouse-cursor: pointer;
+                            accessible-role: button;
+                            accessible-label: "Show result " + file;
+                            accessible-action-default => { root.result-clicked(idx); }
+                            clicked => { root.result-clicked(idx); }
+                            Text { width: parent.width; height: parent.height; text: file; color: Theme.accent-result; font-size: Theme.font-sm; vertical-alignment: center; overflow: elide; }
+                        }
+                        // The newest result is the last one in the list.
+                        if idx == root.result-files.length - 1 && FilesModel.result-stale : HorizontalLayout {
+                            alignment: start;
+                            StaleBadge {
+                                text: FilesModel.result-stale-text;
+                                enabled: !AppModel.busy && !AppModel.is-monitoring && FilesModel.has-images;
+                                recompute => {
+                                    FilesModel.recompute-result(root.algo-value, root.ai-model-value, root.ai-device-value);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

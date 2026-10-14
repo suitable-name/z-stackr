@@ -1,19 +1,32 @@
+//! AKAZE keypoint extraction and brute-force descriptor matching on the luma
+//! plane of a [`PlanarImage`].
+//!
+//! Detection runs on a temporary 8-bit, gamma-encoded, contrast-stretched copy
+//! of the luma ([`luma_to_gray8`]); the linear-light planes the pipeline fuses
+//! are never touched. Matching is a Hamming-distance nearest-neighbour search
+//! with Lowe's ratio test, parallel over the query descriptors with an order
+//! preserving collect, so the result does not depend on scheduling.
+
 use akaze::Akaze;
 // Re-exported publicly because `KeyPoint` appears in this module's public API
 // (e.g. `extract_ref_features` returns `Vec<KeyPoint>`), so callers must be able
 // to name it via `stacker_align::akaze_match::KeyPoint`.
 pub use akaze::KeyPoint;
 use bitarray::BitArray;
-use image::{ImageBuffer, Luma};
+use image::{DynamicImage, ImageBuffer, Luma};
 use rayon::prelude::*;
-use stacker_core::{error::StackerError, image::PlanarImage};
+use stacker_core::{color::linear_to_srgb, error::StackerError, image::PlanarImage};
 
+/// Namespace for the keypoint matching entry points
+/// ([`Self::extract_and_match`], [`Self::match_target`]).
 pub struct KeypointMatcher;
 
 /// Match structure, defined locally because `akaze` 0.7.0 removed its built-in `Match` type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Match {
+    /// Index into the reference keypoints (and descriptors).
     pub index_0: usize,
+    /// Index into the target keypoints (and descriptors).
     pub index_1: usize,
 }
 
@@ -27,52 +40,99 @@ pub type Descriptor = BitArray<64>;
 /// Result of feature extraction + matching: matched index pairs and the two
 /// keypoint vectors needed to resolve them into coordinates.
 pub struct MatchResult {
+    /// The accepted matches, in ascending order of `index_0`.
     pub matches: Vec<Match>,
+    /// Reference keypoints; `Match::index_0` indexes this.
     pub kps0: Vec<KeyPoint>,
+    /// Target keypoints; `Match::index_1` indexes this.
     pub kps1: Vec<KeyPoint>,
 }
 
 // ── internal helpers ────────────────────────────────────────────────────────
 
-/// Build an 8-bit `Gray8Image` from the luma plane of a `PlanarImage<f32>`,
-/// applying a robust contrast stretch for the AKAZE detector.
+/// Build an 8-bit `Gray8Image` from the linear-light luma plane of a
+/// `PlanarImage<f32>`, applying two steps to restore perceptual contrast
+/// for the AKAZE detector:
 ///
-/// ## Colour-space contract
+/// ## Why two steps are needed
 ///
-/// The fusion pipeline stores `luma`/`chroma_a`/`chroma_b` in **gamma-encoded
-/// (sRGB) light** — no transfer function is applied on load (see
-/// `stacker_pipeline::load::dynamic_to_planar` / the GUI's
-/// `image_utils::load_as_planar`, both documented as such). Since the luma
-/// plane already has perceptual (gamma) contrast, no additional transfer
-/// function is needed before feeding it to AKAZE — only the robust
-/// contrast stretch below.
+/// The fusion pipeline stores luma in **scene-linear** light (after
+/// `srgb_to_linear`).  Linear light compresses midtone contrast: a
+/// perceptually mid-grey value (sRGB ≈ 0.50) sits at linear ≈ 0.214.
+/// AKAZE's contrast-based detector uses Scharr derivatives and a
+/// contrast-factor histogram computed on whatever buffer you feed it.  On
+/// a low-amplitude linear buffer the derivative magnitudes are tiny and
+/// the detector threshold filters out almost every candidate.
 ///
-/// ## Robust 1st–99th percentile contrast stretch
+/// ## Step 1 — gamma re-encode (linear → perceptual sRGB)
 ///
-/// A specific frame may only use a narrow sub-range of `[0, 1]`. We sort a
-/// histogram of 256 bins to find the pixel values at the 1st and 99th
-/// percentile, then linearly remap `[p1, p99]` → `[0, 255]`. Using the
-/// 1st/99th percentiles makes the stretch robust against isolated specular
-/// highlights or stuck pixels.
+/// Apply `stacker_core::color::linear_to_srgb` per pixel.  This is the
+/// exact inverse of the `srgb_to_linear` applied during loading, so it
+/// restores the midtone contrast the detector needs.
+///
+/// ## Step 2 — robust 1st–99th percentile contrast stretch
+///
+/// Even after gamma re-encoding a specific frame may use only a narrow
+/// sub-range of `[0, 1]`. We sort a histogram of 256 bins to find the
+/// pixel values at the 1st and 99th percentile, then linearly remap
+/// `[p1, p99]` → `[0, 255]`. Using the 1st/99th percentiles makes the
+/// stretch robust against isolated specular highlights or stuck pixels.
 ///
 /// ## What is NOT changed
 ///
 /// `PlanarImage::luma`, `chroma_a`, and `chroma_b` are **not** modified.
 /// The returned 8-bit image is a temporary, detector-only buffer.
-/// Fusion continues to see the original gamma-encoded f32 values.
+/// Fusion continues to see the original linear-light f32 values.
+///
+/// # Panics
+/// Never in practice: the output buffer is built with exactly
+/// `width * height` bytes, so wrapping it as an image cannot fail.
+#[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "image dimensions fit a u32; the histogram bin, percentile counts and 8-bit output are clamped or non-negative and exact to one pixel/bin (the f32 percentile is the long-standing detector input, kept bit-for-bit)"
+)]
 pub fn luma_to_gray8(img: &PlanarImage<f32>) -> Gray8Image {
+    /// Pixels per rayon work item in the gamma/histogram pass.
+    const CHUNK: usize = 1 << 16;
+
     let npx = img.width * img.height;
-    let mut gfi = Gray8Image::new(img.width as u32, img.height as u32);
+    let (width, height) = (img.width as u32, img.height as u32);
 
-    // ── Clamp to [0, 1]; the plane is already gamma-encoded ─────────────────
-    let gamma: Vec<f32> = img.luma.iter().map(|&v| v.clamp(0.0, 1.0)).collect();
+    // ── Step 1: gamma re-encode each pixel, histogramming as we go ──────────
+    //
+    // One parallel pass for the gamma encode and the histogram.  The histogram is
+    // an integer sum, so combining the per-chunk histograms in any order gives
+    // the same result as a serial pass.
+    let mut gamma = vec![0.0_f32; npx];
+    let hist: [u32; 256] = gamma
+        .par_chunks_mut(CHUNK)
+        .zip(img.luma.par_chunks(CHUNK))
+        .fold(
+            || [0u32; 256],
+            |mut hist, (g_chunk, l_chunk)| {
+                for (g, &l) in g_chunk.iter_mut().zip(l_chunk) {
+                    let v = linear_to_srgb(l.clamp(0.0, 1.0));
+                    *g = v;
+                    let bin = (v.clamp(0.0, 1.0) * 255.0) as usize;
+                    hist[bin.min(255)] += 1;
+                }
+                hist
+            },
+        )
+        .reduce(
+            || [0u32; 256],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b) {
+                    *x += y;
+                }
+                a
+            },
+        );
 
-    // ── 1st–99th percentile contrast stretch ─────────────────────────────────
-    let mut hist = [0u32; 256];
-    for &v in &gamma {
-        let bin = (v.clamp(0.0, 1.0) * 255.0) as usize;
-        hist[bin.min(255)] += 1;
-    }
+    // ── Step 2: 1st–99th percentile contrast stretch ────────────────────────
 
     let thresh_lo = (npx as f32 * 0.01) as u32;
     let thresh_hi = (npx as f32 * 0.99) as u32;
@@ -102,18 +162,17 @@ pub fn luma_to_gray8(img: &PlanarImage<f32>) -> Gray8Image {
 
     let range = p99 - p1;
     if range < 1e-6 {
-        for dst in gfi.pixels_mut() {
-            dst.0[0] = 127; // Flat mid-grey buffer for featureless image
-        }
-        return gfi;
+        // Flat mid-grey buffer for featureless image
+        return Gray8Image::from_raw(width, height, vec![127_u8; npx])
+            .expect("buffer length equals width * height");
     }
 
     let inv_range = 255.0 / range;
-    for (dst, &src) in gfi.pixels_mut().zip(gamma.iter()) {
-        dst.0[0] = ((src - p1) * inv_range).clamp(0.0, 255.0) as u8;
-    }
-
-    gfi
+    let stretched: Vec<u8> = gamma
+        .par_iter()
+        .map(|&src| ((src - p1) * inv_range).clamp(0.0, 255.0) as u8)
+        .collect();
+    Gray8Image::from_raw(width, height, stretched).expect("buffer length equals width * height")
 }
 
 /// Hamming distance between two equal-length binary descriptors, computed in
@@ -122,16 +181,15 @@ pub fn luma_to_gray8(img: &PlanarImage<f32>) -> Gray8Image {
 #[inline]
 fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
     let mut dist = 0u32;
-    let mut wa = a.chunks_exact(8);
-    let mut wb = b.chunks_exact(8);
-    for (ca, cb) in wa.by_ref().zip(wb.by_ref()) {
-        // `try_into` on an 8-byte `chunks_exact` slice never fails.
-        let xa = u64::from_ne_bytes(ca.try_into().unwrap());
-        let xb = u64::from_ne_bytes(cb.try_into().unwrap());
+    let (words_a, tail_a) = a.as_chunks::<8>();
+    let (words_b, tail_b) = b.as_chunks::<8>();
+    for (ca, cb) in words_a.iter().zip(words_b.iter()) {
+        let xa = u64::from_ne_bytes(*ca);
+        let xb = u64::from_ne_bytes(*cb);
         dist += (xa ^ xb).count_ones();
     }
     // Tail bytes (none for 64-byte descriptors, but keeps this length-agnostic).
-    for (x, y) in wa.remainder().iter().zip(wb.remainder().iter()) {
+    for (x, y) in tail_a.iter().zip(tail_b.iter()) {
         dist += (x ^ y).count_ones();
     }
     dist
@@ -141,10 +199,21 @@ fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
 /// `match_features`.  Brute-force nearest-descriptor search with Lowe's ratio
 /// test.
 ///
+/// A query is kept only when its nearest target descriptor is *strictly* closer
+/// than `ratio_test` times the second nearest.  The test needs a second
+/// candidate: a target set with a single descriptor yields no matches (there is
+/// nothing to be distinctive against), and two target descriptors at the same
+/// distance are ambiguous and rejected, even at distance 0.
+///
 /// The query descriptors (`desc0`) are searched in parallel with rayon, and
 /// each pairwise distance uses the 64-bit-lane [`hamming_distance`].  rayon
 /// collects the indexed iterator in order, so the output is identical and
 /// deterministic relative to a serial implementation.
+#[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Hamming distances of 512-bit descriptors are at most 512, exact in f32"
+)]
 pub fn match_features(desc0: &[Descriptor], desc1: &[Descriptor], ratio_test: f32) -> Vec<Match> {
     if desc0.is_empty() || desc1.is_empty() {
         return Vec::new();
@@ -170,8 +239,12 @@ pub fn match_features(desc0: &[Descriptor], desc1: &[Descriptor], ratio_test: f3
                 }
             }
 
-            // Lowe's ratio test directly on the discrete Hamming distance.
-            if (best_dist as f32) <= (second_best_dist as f32) * ratio_test {
+            // Lowe's ratio test directly on the discrete Hamming distance.  With
+            // fewer than two target descriptors there is no second-best
+            // (`u32::MAX`), and the test cannot be applied: reject.
+            if second_best_dist != u32::MAX
+                && (best_dist as f32) < (second_best_dist as f32) * ratio_test
+            {
                 Some(Match {
                     index_0: i,
                     index_1: best_idx,
@@ -187,30 +260,28 @@ pub fn match_features(desc0: &[Descriptor], desc1: &[Descriptor], ratio_test: f3
 
 /// Extract AKAZE features from `img` and return `(keypoints, descriptors)`.
 ///
-/// The luma plane (already gamma-encoded) is contrast-stretched before
-/// detection via [`luma_to_gray8`].  See that function's documentation for
-/// the full rationale.  Fusion still receives the original gamma-encoded
-/// values stored in `img`.
+/// The luma plane is converted to perceptual (gamma-encoded, contrast-stretched)
+/// space before detection via [`luma_to_gray8`].  See that function's
+/// documentation for the full rationale.  Fusion still receives the original
+/// linear-light values stored in `img`.
 ///
 /// This is the building block for the "extract reference once" optimisation:
 /// callers extract the reference frame's features once before the per-target
 /// loop and reuse them for every target via [`KeypointMatcher::match_target`].
 ///
-/// # Panics
-/// Panics if the raw buffer length does not exactly match `width * height`, which is mathematically impossible here since it was extracted from an `ImageBuffer` of those exact dimensions.
+/// An image with a side shorter than 64 px is below the detector's size gate:
+/// the function returns two empty vectors, **not** an error (it cannot fail).
+/// Callers must treat "no features" as "no seed" and fall back to the identity
+/// or the intensity refinement alone.
+#[must_use]
 pub fn extract_ref_features(img: &PlanarImage<f32>) -> (Vec<KeyPoint>, Vec<Descriptor>) {
     if img.width < 64 || img.height < 64 {
         return (Vec::new(), Vec::new());
     }
     let gfi = luma_to_gray8(img);
 
-    // Convert to 8-bit dynamic image using image023 for akaze
-    let width = gfi.width();
-    let height = gfi.height();
-    let raw = gfi.into_raw();
-    let gfi023 =
-        image023::ImageBuffer::<image023::Luma<u8>, Vec<u8>>::from_raw(width, height, raw).unwrap();
-    let dyn_img = image023::DynamicImage::ImageLuma8(gfi023);
+    // Convert to 8-bit dynamic image instead of 32F.
+    let dyn_img = DynamicImage::ImageLuma8(gfi);
 
     // Config struct was removed; instantiate Akaze directly.
     // Default threshold is 0.001; we reduce it to 0.0003 for macro stacks.
@@ -225,14 +296,16 @@ pub fn extract_ref_features(img: &PlanarImage<f32>) -> (Vec<KeyPoint>, Vec<Descr
 impl KeypointMatcher {
     /// Extract AKAZE features from two planar images and match them.
     ///
-    /// Luma planes (already gamma-encoded) are contrast-stretched **in
-    /// memory** via [`luma_to_gray8`] (1st–99th percentile stretch), then
-    /// fed to AKAZE with a lowered detector threshold. Fusion is
-    /// unaffected — only the temporary detection buffer is used.
+    /// Luma planes are converted to perceptual space **in memory** via
+    /// [`luma_to_gray8`] (gamma re-encode + 1st–99th percentile stretch),
+    /// then fed to AKAZE with a lowered detector threshold. Fusion is
+    /// unaffected — only the temporary detection buffer is gamma-encoded.
     ///
     /// # Errors
-    /// Returns [`StackerError::AlignmentFailed`] when the image is too small
-    /// for AKAZE to allocate any evolution steps.
+    /// Never fails today: an image below the 64-px size gate (see
+    /// [`extract_ref_features`]) or a featureless one gives an empty match list,
+    /// not an error.  The `Result` is kept so a future failure mode does not
+    /// change the signature.
     pub fn extract_and_match(
         ref_img: &PlanarImage<f32>,
         tgt_img: &PlanarImage<f32>,
@@ -257,14 +330,15 @@ impl KeypointMatcher {
     /// [`Self::extract_and_match`] which would redundantly re-extract the
     /// reference on every iteration.
     ///
-    /// The target luma is contrast-stretched identically to the reference
-    /// (same [`luma_to_gray8`] + `Akaze` configuration), ensuring descriptor
-    /// spaces are compatible.
+    /// The target luma is converted to perceptual space identically to the
+    /// reference (same [`luma_to_gray8`] + `Akaze` configuration), ensuring
+    /// descriptor spaces are compatible.
     ///
     /// # Errors
-    /// Returns [`StackerError::AlignmentFailed`] — currently unused (AKAZE
-    /// returns an empty match list for trivial inputs rather than an error),
-    /// but kept for API symmetry with [`Self::extract_and_match`].
+    /// Never fails today (a [`StackerError`] return is reserved): a target below
+    /// the 64-px size gate or without features gives an empty match list, so
+    /// callers must handle "no matches" themselves.  The `Result` mirrors
+    /// [`Self::extract_and_match`].
     pub fn match_target(
         ref_kps: &[KeyPoint],
         ref_desc: &[Descriptor],

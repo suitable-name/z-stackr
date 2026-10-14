@@ -1,0 +1,1 @@
+importScripts("./z-stackr-web-worker.js");wasm_bindgen("./z-stackr-web-worker_bg.wasm");

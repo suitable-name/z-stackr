@@ -1,440 +1,403 @@
 # z-stackr
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)
 ![Rust](https://img.shields.io/badge/rust-nightly-orange.svg)
-![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)
 
-![User interface](assets/ui.png)
+**z-stackr** is a focus-stacking application written in Rust. It takes a sequence of macro or micro photographs taken at different focus distances, aligns them, and fuses them into one picture that is sharp from front to back. There is a command-line tool (`z-stackr`), a desktop app (`z-stackr-gui`) and a web app (`z-stackr-web`) that runs the same interface in the browser, plus Python bindings; all run the same pipeline stages from one shared crate.
 
-**z-stackr** is a high-performance, professional-grade focus stacking application written entirely in Rust. It takes a sequence of macro or micro images captured at varying focus depths and seamlessly blends them into a single, completely sharp composite image.
-
-Whether you are shooting extreme macro photography, focus-bracketed landscapes, or scientific microscopy, z-stackr provides physically accurate, linear-light blending powered by advanced computer vision algorithms and an out-of-core architecture designed to handle massive image sets with minimal memory overhead.
+> **Renamed algorithms.** The fusion engines are now called **Apex** (was *PMax*, Laplacian pyramid), **Relief** (was *DMap*, depth map) and **Strata** (new, guided-filter blend). Everything that worked before still reads: the old `dmap_*` settings keys, `--mode pmax|dmap|both`, the GUI and project labels "PMax (Laplacian)", "DMap (Depth Map)" and "Both (DMap & PMax)", and the older `use_gpu` key. Writing always uses the new names, and the `{algo}` value in file-name templates is now `Apex`, `Relief` or `Strata`. See the [CHANGELOG](CHANGELOG.md).
 
 ---
 
-## 🌟 Key Features
+## Key features
 
-* **Advanced Alignment Engine**: A coarse-to-fine subpixel alignment engine (multi-scale Gaussian pyramid, always-bounded logit-space search, a finest-level schedule that's deliberately under-refined to avoid chasing sensor noise, and a post-refinement gate that falls back to identity whenever refinement scores worse than doing nothing) driven by a selectable `optimizer`: `auto` (default) tries a pyramid Lucas-Kanade / Gauss-Newton optimiser (analytic image-gradient Jacobians, far fewer iterations than blind function sampling) first and falls back to the original Nelder-Mead bounded simplex (coarsest-level random restarts) on failure or RMS regression; `lucaskanade`/`neldermead` force one optimiser unconditionally. Every classical mode (`affine`, `translation`, `registration`, `none`) shares whichever optimiser is selected, differing only in which degrees of freedom are solved — a strict ladder, `translation` ⊂ `registration` (default) ⊂ `affine`: `translation` solves shift **plus focus-breathing scale**, rotation held fixed; `registration` adds rotation (shift + uniform scale + rotation, a similarity transform); `affine` adds separate X/Y scale and shear on top of `registration` — a true 6-DOF affine solve; `none` skips refinement entirely. A fifth mode, `neural` (requires the `nn` feature, **experimental**), replaces this entirely with a trained alignment network — either the whole-stack `batchalign-v2` architecture (all matrices in one batched inference call) or the streaming pairwise `fusionalign-v1` architecture (one reference/frame pair per call, O(1) memory in stack size), selected automatically from the chosen model's manifest — see "Fusion Modes" and `crates/stacker-align/README.md` for the full contract. Warping is edge-clamped; by default (`crop_to_common_area = true`) the saved output is cropped to the largest rectangle covered by every aligned frame, removing the smeared edge-replication band that focus breathing leaves behind and excluding it from fusion processing — a rogue/misaligned frame that would shrink the crop below 25% of the canvas is ignored (falls back to full canvas, with a warning logged). Set `crop_to_common_area = false` to always save the full, uncropped canvas. Optionally, `resize_cropped_to_original` (default `false`) restretches that cropped result back up to the original canvas resolution with a high-quality edge-clamped resampler, instead of saving the smaller cropped size.
-* **Optional AKAZE + RANSAC Seed**: Compile with the `akaze` feature to allow an optional feature-matching seed for the intensity optimiser — useful for heavily shifted, well-textured handheld shots. Seeding is **off by default and never required**: with it off (or on glossy / featureless subjects where feature detectors fail) registration is pure intensity-based.
-* **Per-Frame Brightness Correction**: Per-frame brightness/gamma correction (on by default). After warping, each frame's luma is fit toward the first frame's target mean/std via a small 2-parameter `(scale, gamma)` solve, and the resulting ratio is applied to chroma too so hue is preserved — corrects for exposure/vignette drift between shots in a bracketed sequence without shifting colour.
-* **Gamma-Space Processing**: The pipeline deliberately stores and blends **gamma-encoded (sRGB) values** end to end — a reference-fidelity choice that reproduces the established look of classic stacking tools. Loading normalises samples to `[0, 1]` with no transfer function; fusion, alignment metrics, and saving all operate on those gamma-encoded values. (The one exception is the neural mode: its network was trained on linearised data, so its bridge converts to linear RGB and back at the model boundary.)
-* **SIMD Acceleration**: Hot paths — sRGB⇄linear colour conversion (lookup-table + SIMD), the separable pyramid blur, and the warp/bicubic resampler — use portable `std::simd`, lowering to AVX2 (zen3) or AVX-512 (zen4) and falling back to scalar on other targets.
-* **Out-of-Core Tiled Architecture**: Processes images tile-by-tile so peak memory scales with the configured tile size rather than the full image resolution. Tiles are streamed to/from temporary files by a file-backed manager (`TileManager`) using plain blocking `std::fs`, with each planar channel read/written as a single bulk `bytemuck` byte copy (no per-element conversion). True `mmap(2)` is intentionally avoided: the access pattern is write-once/read-once and `PlanarImage` owns its buffers, so a memory map would still be copied into them — capturing essentially none of mmap's benefit.
-* **Multiple Fusion Algorithms**: Choose between **Apex** (Laplacian Pyramid), **Relief** — with **two selectable engines**, a argmax + Guided Filter (default) and a confidence-weighted multigrid depth-solver —, **Strata** (guided-filter soft-blend: every frame contributes to every pixel, edge-aware weighted, for fewer halos at depth edges than a hard per-pixel/per-band pick), and a learned **AI Model** (neural) mode based on your specific subject requirements.
-* **Neural "AI Model" Stacking**: A specialized, fully-convolutional pairwise-merge network (`FocusMergeNet`) on the [Burn](https://burn.dev/) framework that folds a focus stack into one all-in-focus result. It ships with `xs`–`xxl` capacity presets, tiled inference for arbitrarily large (8K+) images, CPU (`ndarray`) and optional GPU (`wgpu`/Vulkan) backends, and a from-scratch training binary with crash-safe checkpointing and resume. The entire feature is **opt-in behind the `nn` feature** — the applications build with **zero ML / Burn dependencies by default**.
-* **Live Preview**: During alignment the canvas shows each frame as it is registered (the most-recently-aligned image) — both from the Align button and during the Stack pipeline's alignment stage. During Apex fusion the running composite refreshes on throttled checkpoints; during Relief fusion the per-frame focus-measure progress is reported and the raw depth-index map is shown before the solve; during AI stacking the running composite sharpens as each frame is folded in. A two-bar progress display shows monotonic total progress (load 0–15%, align 15–50%, fuse 50–95%, save 95–100%) plus per-step progress.
-* **16-bit Support**: End-to-end 16-bit processing pipeline. Input files (TIFF/PNG) are read in 16-bit, processed in `f32`, and optionally written back out as 16-bit to preserve sub-8-bit precision.
-* **EXIF Metadata Copy**: Optionally copies the raw EXIF blob from the first source frame into the output file (JPEG/PNG only) at the byte level — no pixel re-encode, no decoded-field reconstruction.
-* **Optional Pure-Rust RAW Support** (`raw` feature): Stack camera RAW files directly — CR2, CR3, NEF, ARW, DNG, RAF, ORF, RW2, PEF and more (see "RAW Image Support" below) — decoded via the pure-Rust `rawler` crate, no C/C++ dependency and no change to the project's PGO/BOLT pure-Rust build chain. A per-run decode-once cache ensures each RAW frame is demosaiced exactly once even though the pipeline's alignment stages would otherwise reload it 2-3 times.
-* **Python Bindings** (`z-stackr-python`, PyPI package `z-stackr`, import name `zstackr`): PyO3 bindings exposing both an out-of-core file API (`stack_files`, `batch_stack`) and an in-RAM numpy API (`stack_arrays`) for scripting, automation, and microscopy/lab pipelines — see `crates/stacker-python/README.md`.
-* **Optional GPU Acceleration** (`gpu` feature, **experimental**): A `wgpu` compute-shader path covering every fusion engine and the alignment warp — tiled/batch Apex (Laplacian-pyramid) fusion, the GUI's in-RAM incremental Apex accumulator (GPU-resident across frames, read back once at the end), the production edge-clamped warp, Strata's per-frame saliency pass, and both of Relief's hot loops (the guided filter's box-filter pass and the Multigrid solver's relaxation sweep). When compiled in, each of these tries the GPU and transparently falls back to the existing CPU/SIMD implementation whenever no adapter is available or any GPU call fails — including, for the incremental accumulator, a graceful mid-stack hand-off that reads back the GPU-accumulated state and finishes the remaining frames on the CPU rather than reprocessing or restarting. **The CPU path remains the default and the reference implementation** — GPU output is tolerance-equal (not bit-equal) to it. Off by default; build with `--features gpu` to enable. A runtime toggle (`use_gpu` in the config TOML, a GUI switch, `--no-gpu` on the CLI, and `PyStackingSettings.use_gpu` in Python) lets you disable the GPU path at runtime even in a `gpu`-feature build, without recompiling. 
+* **Alignment.** A coarse-to-fine intensity-based refinement of the luma planes, with a choice of motion model and optimiser. Four models (`translation`, `registration`, `affine`, `none`; `neural` in `nn` builds) and the optimisers Lucas-Kanade and Nelder-Mead (`optimizer = "auto"` tries Lucas-Kanade first), plus the toggles **Bounded search**, **AKAZE seeding**, **Correct Brightness** and **Chain Alignment**. A refined matrix that fits worse than doing nothing is replaced by the identity (an identity gate). After warping, the result is cropped to the rectangle that every frame covers (**Crop to Common Area**); a common rectangle below half of the frame area is refused and the output stays uncropped. See "Alignment" below.
+* **Optional AKAZE + RANSAC seed.** With the `akaze` feature compiled in (on by default in the GUI, off in the CLI), `akaze_seeding = true` seeds the refinement from feature matches. Seeding is off by default; a seed that is not plausible (non-finite, scale outside 0.5 to 2, or a shift larger than the frame) is discarded and the refinement starts from the identity. The RANSAC fit must be agreed on by at least a fifth of the matches (never asking for more than 50), so a lucky minimal sample cannot pass.
+* **Linear-light arithmetic.** Frames are decoded to linear light (exact lookup tables for 8-bit and 16-bit sources), stored as three `f32` planes (luma and two chroma planes, BT.601 weights on linear RGB), fused, and encoded back to sRGB with correct rounding (linear white is exactly 255 or 65535).
+* **Portable SIMD.** The warp, the pyramid blur and the 8-bit sRGB encoder use `std::simd`. The vector width is fixed when the code is compiled (16 lanes with `avx512f`, 8 with `avx2`, otherwise 4) and does not change the output: a plain build targets baseline `x86-64` (SSE2, 4 lanes), so wider vectors need the `RUSTFLAGS` described under "CPU features" below. The 16-bit sRGB encoder is scalar code: an exact table search classifies each sample and only a sample next to a code boundary evaluates the transfer function.
+* **Out-of-core CLI and GUI.** The CLI (and the GUI with a nonzero `tile_size`) writes every aligned frame to a temporary directory as padded tiles and fuses tile by tile, through the shared `stacker_pipeline::tiled` module. The alignment pass holds whole frames (about 39 bytes per pixel, independent of the frame count); the fusion pass holds one padded tile of every frame; the scratch disk scales with the padded tile area (see "Memory and disk" below and `crates/stacker-pipeline/README.md`). The CLI can also stack several folders in one run (`--stacks subfolders`).
+* **Four fusion engines.** **Apex** (Laplacian pyramid), **Relief** (plane-fit residual-variance focus measure, per-pixel selection and a guided filter, optionally with a multigrid depth solver), **Strata** (a guided-filter soft blend of every frame) and, in `nn` builds, an **AI model** (a learned pairwise-merge network). The GUI can also run combinations (**Both**: Relief and Apex; **All Three**: Strata, Relief and Apex) as passes of one job.
+* **Neural stacking and neural alignment (opt-in).** `FocusMergeNet` on the [Burn](https://burn.dev/) framework folds the stack into one image, with `xs` to `xxl` capacity presets, tiled inference, a CPU (`ndarray`) backend and an optional GPU (`wgpu`) backend. A second family of networks (`BatchMergeNet`, `BatchAlignNet`, `FusionAlignNet`) merges or aligns a whole stack; the trained alignment network is the `neural` alignment mode (desktop and CLI only). The training binary is `z-stackr-train`, the alignment evaluation binary `stacker-nn-eval`. Everything neural is behind the `nn` feature; without it the apps have no Burn dependency. No trained model ships with the repository.
+* **Brightness correction.** Exposure drift between frames (flicker, auto-exposure) shows up as brightness steps in a fused result. With **Correct Brightness** (on by default) every aligned frame is matched to the reference in linear light (a scale and a mild gamma fitted to the frame's mean and standard deviation over the pixels the warp covers), which leaves frames that already agree bit for bit unchanged.
+* **RAW input and EXIF copy.** Camera RAW files (CR2, CR3, NEF, ARW, DNG, RAF, ORF, RW2, PEF and others) are developed and stacked like any frame in a build with the `raw` feature (native only; the camera white balance and color matrix are used as stored, no lens corrections). **Copy Metadata to Output** copies the EXIF block of the source frames into JPEG and PNG outputs (the orientation tag is set to upright when the pixels were rotated on load). TIFF output cannot carry it and says so.
+* **Python bindings.** `crates/stacker-python` (a maturin project, kept outside the Cargo workspace) exposes the in-memory path (NumPy arrays) and the out-of-core file path to Python as the module `zstackr`; see "Python" below.
+* **Apex, Relief, Strata and alignment on the GPU (opt-in).** In a build with `--features gpu`, `compute_device = "gpu"` runs the heavy stages on the graphics card through wgpu (Vulkan, Direct3D 12 or Metal): the whole Apex and Relief fusions (frames folded in one at a time on the device, only the result comes back), kernels for the Strata saliency and guided-filter pair and the Relief multigrid solver (the pipeline hands them to `Compute::strata_kernels` and `Compute::multigrid_depth`; see `crates/stacker-gpu/README.md`), the alignment objective the optimiser evaluates hundreds of times per frame, and the final warp of each frame. Decoding, auto-cull, export and the AI mode stay on the CPU. Lucas-Kanade is a CPU path. The CPU stays the reference and the fallback: with no usable adapter, a call larger than the device budget (3 GiB) or any device failure the run continues on the CPU and a warning says why. Results agree with the CPU within a small tolerance, not bit for bit. See `crates/stacker-gpu/README.md` for the measured speed (provisional figures). It is independent of `nn-gpu`, which is the AI mode's backend.
+* **Live preview.** While the GUI aligns, the canvas shows each frame as it is registered; during AI stacking it shows the running composite after each folded frame. Live previews are thumbnails of at most 360 px on the long edge, offered at most every 500 ms; the finished result is shown at full size.
+* **16-bit output.** PNG and TIFF are written with 16 bits per channel by default (`image_saving.bit_depth = 16`); JPEG is always 8-bit. The GUI encodes its export from the full-precision linear result, so a 16-bit file holds real 16-bit samples.
+* **Desktop app.** Project files (`<name>.zstack.toml`) with an unsaved-changes guard and a recent list, a menu bar, drag-and-drop of images and folders, an export dialog with a file-name template, stale badges with Recompute, activity chips with an estimate of the time left and a cancel button, retouch from a chosen source frame with one undo step per stroke (the strokes are saved in the project and replayed when it is opened; the undo history itself is not saved), and a built-in manual (F1). See `apps/stacker-gui/README.md`.
+* **One settings file.** The GUI and the CLI read and write the same TOML schema with the same 39 keys (27 top-level, 6 in `[preprocessing]`, 6 in `[image_saving]`), starting with `settings_version = 2`. A file written by an older build is migrated when it is read (see the CHANGELOG).
+* **Performance.** The hot loops are tuned rather than traded for quality: the Nelder-Mead alignment spends its iterations on the coarse pyramid levels and finishes with a short full-resolution polish, Lucas-Kanade needs a few iterations per level, the Apex fold in `stacker-algo` takes frames one at a time with memory that does not grow with the frame count, and the Strata, Relief and alignment kernels have GPU forms. Speed also depends on how the binary is built: see "CPU features" and "Build tasks, PGO and BOLT" below. No timing figures are quoted here; the figures in the crate READMEs are provisional.
 
 ---
 
-## 🛠️ Architecture
+## Architecture
 
-The project is structured as a Cargo workspace with distinct, modular components. (Package names are `z-stackr-*`; the in-code crate identifiers remain `stacker_core`, `stacker_algo`, etc.)
+A Cargo workspace. Package names are `z-stackr-*`; the in-code crate identifiers remain `stacker_core`, `stacker_pipeline`, and so on.
 
 ### Applications (`apps/`)
-* **`z-stackr-cli`**: The high-performance command-line interface for batch processing and headless environments (binary: `z-stackr`).
-* **`z-stackr-gui`**: A graphical user interface built with Slint for visual stacking (binary: `z-stackr-gui`).
+* **`z-stackr-cli`**: the command-line tool for batch and headless use (binary `z-stackr`).
+* **`z-stackr-gui`**: the desktop app built with Slint (binary `z-stackr-gui`).
+* **`z-stackr-web`** (with its Web Worker `z-stackr-web-worker`): the same Slint interface in the browser, built with Trunk. The images stay on your machine; the stack runs in a worker with a 2 GiB memory budget (a stack that does not fit is offered a reduced Pre-resize percentage). Alignment runs on WebGPU only (Chrome or Edge 113+, Firefox 141+ on Windows, Safari 26); a browser without it can stack without alignment. Run it locally with `trunk serve` from `apps/stacker-web`; see [`apps/stacker-web/README.md`](apps/stacker-web/README.md).
 
 ### Crates (`crates/`)
-* **`z-stackr-core`**: Core image representations (`PlanarImage`), linear/sRGB color space conversions, shared frame preprocessing (rotation/crop/resize), and the out-of-core tiled memory manager.
-* **`z-stackr-align`**: Image alignment logic — the shared `pipeline::align_frame` dispatch (the single entry point both apps call), a coarse-to-fine subpixel refinement (selectable Lucas-Kanade / Gauss-Newton or Nelder-Mead optimiser, `auto` by default) with an *optional* AKAZE + RANSAC feature-matching seed, and per-frame brightness correction.
-* **`z-stackr-algo`**: The classical fusion algorithms — Laplacian pyramids (Apex), Relief (with two selectable engines: Guided Filter, and a Multigrid depth-solver), and Strata (guided-filter soft-blend fusion).
-* **`z-stackr-pipeline`**: The out-of-core, tiled `run_pipeline` engine — the single shared entry point both `z-stackr-cli` (always) and `z-stackr-gui` (when its `tile_size` setting is `> 0`) call, so the tiled processing path can never silently diverge between the two apps.
-* **`z-stackr-nn`**: The neural engine on the Burn framework — four built-in architectures (`FocusMergeNet` pairwise fusion, `BatchMergeNet` batch fusion, `BatchAlignNet` whole-stack alignment, `FusionAlignNet` streaming pairwise alignment) with `xs`–`xxl` presets, the training losses, tiled inference, the planar↔tensor bridge, model discovery, runtime backend dispatch, and the `z-stackr-train` training binary.
-* **`z-stackr-python`**: PyO3 Python bindings (crate identifier `stacker_python`, Python import name `zstackr`, PyPI package `z-stackr`) exposing both the out-of-core file pipeline (`stack_files`, `batch_stack`, `load_config`/`save_config`, `load_image`) and an in-RAM numpy API (`stack_arrays`) for scripting and automation — see `crates/stacker-python/README.md`.
+* **`z-stackr-core`**: `PlanarImage`, linear/sRGB conversions, the settings schema (`StackingSettings`), the file-backed tile store, RAW decoding (`io`, `raw` feature) and EXIF copy-through (`metadata`).
+* **`z-stackr-align`**: the alignment engine: motion models (shift, translation, similarity, affine), the Nelder-Mead and Lucas-Kanade optimisers, the identity gate, brightness correction, chain-alignment arithmetic, the warps, the coverage mask, and the optional AKAZE + RANSAC seed.
+* **`z-stackr-algo`**: the fusion algorithms (Laplacian-pyramid Apex, plane-fit Relief with guided filter and multigrid solver, guided-filter Strata), frame optimisation (auto-cull and ordering) and the retouch session.
+* **`z-stackr-pipeline`**: the pipeline stages both apps call: frame discovery and ordering, decoding (EXIF orientation, rotation, crop, resize, RAW), alignment, auto-cull, fusion, tile geometry, the out-of-core `tiled` runner, output encoding (with EXIF), and the settings loader.
+* **`z-stackr-gpu`**: GPU kernels through wgpu (Apex, Relief, Strata, the multigrid solver, the alignment objective and warp), kept out of the CPU crates; the pipeline uses it only in builds with the `gpu` feature.
+* **`z-stackr-web-core`**: the message protocol and memory-budget policy shared by the web page and its worker.
+* **`z-stackr-nn`**: the neural engine on Burn: the `FocusMergeNet`, `BatchMergeNet`, `BatchAlignNet` and `FusionAlignNet` models, the training losses, tiled inference, model discovery, the `z-stackr-train` binary and the `stacker-nn-eval` binary.
+* **`z-stackr-python`** (`crates/stacker-python`, outside the workspace): the Python bindings (`pip install z-stackr`, `import zstackr`).
 
-> **AKAZE**: Coarse feature-based pre-alignment uses the upstream [`akaze`](https://crates.io/crates/akaze) crate (v0.7.0) from crates.io, gated behind the optional `akaze` feature.
-
----
-
-## 🧩 Using the Crates as a Library
-
-The `z-stackr-core`, `z-stackr-align`, `z-stackr-algo`, `z-stackr-pipeline`, and `z-stackr-nn` crates are ordinary library crates with no dependency on the CLI or GUI — each is usable standalone in your own Rust project (e.g. a custom batch pipeline, a different frontend, or a headless service). They're published to crates.io, so a plain version dependency is enough:
-
-```toml
-[dependencies]
-z-stackr-core  = "1.0"
-z-stackr-align = { version = "1.0", features = ["akaze"] }
-z-stackr-algo  = "1.0"
-```
-
-> **Nightly required.** These crates use `#![feature(portable_simd)]`, so your own crate must also build with a nightly toolchain.
->
-> **API stability.** Versioned per semver from `1.0` onward — a `"1.0"` requirement accepts any compatible `1.x` release. Pin an exact version (`= "1.0.0"`) if you need fully reproducible builds ahead of a given breaking change.
-
-### Which crate does what
-
-| Crate | Provides | Relevant features |
-|---|---|---|
-| `z-stackr-core` (`stacker_core`) | `PlanarImage<T>`, linear/sRGB colour conversion, shared preprocessing, EXIF copy-through, the out-of-core tile manager, RAW frame loading (`io` module) | `raw` (pure-Rust `rawler` RAW decoding) |
-| `z-stackr-align` (`stacker_align`) | The shared `align_frame` dispatch, subpixel refinement (Lucas-Kanade / Gauss-Newton or Nelder-Mead), per-frame brightness correction | `akaze` (optional feature-matching seed) |
-| `z-stackr-algo` (`stacker_algo`) | Apex (Laplacian pyramid), Relief (Guided Filter / Multigrid), and Strata (guided-filter soft-blend) fusion, frame auto-cull scoring | — |
-| `z-stackr-nn` (`stacker_nn`) | The four neural architectures (pair/batch fusion, batch/pairwise alignment), training, and runtime backend dispatch | `ndarray` / `wgpu` / `cuda`, `autodiff` |
-
-Each crate's own README (`crates/*/README.md`) documents its module layout and public API in depth, and includes its own minimal usage snippet. What follows is the shortest path from "two JPEGs on disk" to an aligned, Apex-fused output using only `z-stackr-core`, `z-stackr-align`, and `z-stackr-algo` directly — no CLI or GUI code involved:
-
-### From Python
-
-Prefer Python? `z-stackr-python` (PyPI package `z-stackr`, `import zstackr`) wraps the same pipeline crates
-in a PyO3 extension module — an out-of-core file API (`stack_files`, `batch_stack`) mirroring the CLI, and
-an in-RAM numpy API (`stack_arrays`) for stacks that already fit in memory (with `auto_cull`/
-`sort_by_sharpness` support the file path can't offer). See `crates/stacker-python/README.md` for
-installation, the full API reference, and the config-interop workflow with the GUI/CLI.
-
-```python
-import zstackr
-
-params = zstackr.PyPipelineParams(paths=["a.jpg", "b.jpg"], output_file="stacked.tiff", mode="apex")
-zstackr.stack_files(params, zstackr.PyStackingSettings())
-```
-
-```rust
-use image::GenericImageView;
-use stacker_align::{align_frame, Matrix3};
-use stacker_algo::apex::fuse::fuse_pyramids_incremental;
-use stacker_core::{image::PlanarImage, settings::{AlignmentModeSetting, OptimizerSetting}};
-
-/// Minimal gamma-space RGB → planar YCbCr loader (Rec.601 coefficients).
-/// This mirrors what the CLI/GUI do internally; it isn't exported as a
-/// public helper today, so bring your own — a handful of lines either way.
-fn load_planar(img: &image::DynamicImage) -> PlanarImage<f32> {
-    let (w, h) = img.dimensions();
-    let mut out = PlanarImage::new(w as usize, h as usize);
-    for (i, p) in img.to_rgb8().pixels().enumerate() {
-        let (r, g, b) = (f32::from(p[0]) / 255.0, f32::from(p[1]) / 255.0, f32::from(p[2]) / 255.0);
-        out.luma[i] = 0.299 * r + 0.587 * g + 0.114 * b;
-        out.chroma_a[i] = -0.168_74 * r - 0.331_26 * g + 0.5 * b;
-        out.chroma_b[i] = 0.5 * r - 0.418_688 * g - 0.081_312 * b;
-    }
-    out
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let reference = load_planar(&image::open("frame_near.jpg")?);
-    let target = load_planar(&image::open("frame_far.jpg")?);
-
-    // Align `target` onto `reference`. `seed` is the initial-guess transform
-    // (identity for a first/only frame; the previous frame's solved matrix
-    // when chaining more than two); `bounded` is currently always-true
-    // internally regardless of what's passed. `None` skips brightness
-    // correction — pass `Some(&BrightnessTarget::new(&reference))` to enable it.
-    let (_matrix, aligned_target) = align_frame(
-        target,
-        &reference,
-        Matrix3::<f32>::identity(),
-        AlignmentModeSetting::Registration,
-        OptimizerSetting::Auto,
-        true,
-        1,
-        None,
-    );
-
-    // Fuse the aligned stack with Apex (Laplacian-pyramid multi-band blend).
-    // `use_color = false` selects luma-only focus scoring; `grit_suppression
-    // = true` filters isolated high-contrast noise on the finest band.
-    let fused = fuse_pyramids_incremental(&[reference, aligned_target], false, true);
-
-    // Convert back to interleaved 8-bit RGB and save. The planes are
-    // gamma-encoded YCbCr (see `load_planar` above), so this is a pure
-    // matrix inversion + quantise — no transfer function is applied.
-    let (w, h) = (fused.width as u32, fused.height as u32);
-    let mut rgb = vec![0u8; fused.luma.len() * 3];
-    for i in 0..fused.luma.len() {
-        let (y, cb, cr) = (fused.luma[i], fused.chroma_a[i], fused.chroma_b[i]);
-        rgb[i * 3]     = ((y + 1.402 * cr).clamp(0.0, 1.0) * 255.0) as u8;
-        rgb[i * 3 + 1] = ((y - 0.344_136 * cb - 0.714_136 * cr).clamp(0.0, 1.0) * 255.0) as u8;
-        rgb[i * 3 + 2] = ((y + 1.772 * cb).clamp(0.0, 1.0) * 255.0) as u8;
-    }
-    image::save_buffer("stacked.png", &rgb, w, h, image::ColorType::Rgb8)?;
-    Ok(())
-}
-```
-
-For more than two frames, chain `align_frame` sequentially — each call's `seed` is the previous call's solved matrix, and (per the "Advanced Alignment Engine" note above) the reference each frame aligns against can either stay fixed or roll forward to the previously-warped frame, depending on how faithfully you want to track focus-breathing across a long stack. See `apps/stacker-gui/src/main.rs`'s alignment loop for the exact pattern both shipped apps use.
+> **AKAZE**: feature-based seeding uses the [`akaze`](https://crates.io/crates/akaze) crate (v0.7.0) from crates.io, behind the optional `akaze` feature.
 
 ---
 
-## 🚀 Installation
+## Installation
 
 ### Prerequisites
-You need the Rust compiler and Cargo installed. If you don't have them, install them via [rustup.rs](https://rustup.rs/):
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
+A Rust toolchain installed with [rustup](https://rustup.rs/). The workspace needs a **nightly** compiler (it uses `#![feature(portable_simd)]`). The repository commits a `rust-toolchain.toml` that pins `nightly-2026-09-08` with the `clippy` and `rustfmt` components; running `rustup toolchain install` inside the checkout (no arguments) installs it. `.github/workflows/ci.yml` uses the same pin.
 
-> **Nightly toolchain required.** z-stackr uses the `portable_simd` feature, so it must be built with a nightly compiler: `rustup default nightly` (or prefix commands with `cargo +nightly …`).
-
-### Building from Source
-Clone the repository and build the CLI application:
+### Building from source
 ```bash
-git clone https://github.com/suitable-name/z-stackr.git
+git clone <repository-url> z-stackr
 cd z-stackr
 
-# Build the standard version (binary: z-stackr)
-cargo build --release --bin z-stackr
+# CLI (binary: z-stackr)
+cargo build --release -p z-stackr-cli
 
-# Build with AKAZE feature matching enabled
-cargo build --release --bin z-stackr --features akaze
+# CLI with AKAZE seeding available
+cargo build --release -p z-stackr-cli --features akaze
 
-# Build with the AI ("neural") stacking mode — CPU (ndarray) inference backend
-cargo build --release --bin z-stackr --features nn
+# CLI with the AI ("neural") mode, CPU (ndarray) backend
+cargo build --release -p z-stackr-cli --features nn
 
-# …or with the GPU (wgpu / Vulkan) inference backend (implies `nn`)
-cargo build --release --bin z-stackr --features nn-gpu
+# ... or with the GPU (wgpu / Vulkan) backend as well (implies `nn`)
+cargo build --release -p z-stackr-cli --features nn-gpu
 
-# Build with pure-Rust camera RAW support (CR2/CR3/NEF/ARW/DNG/RAF/ORF/RW2/PEF/…)
-cargo build --release --bin z-stackr --features raw
+# Desktop app (binary: z-stackr-gui; AKAZE is on by default)
+cargo build --release -p z-stackr-gui
 
-# Build with optional GPU acceleration (experimental — see "Key Features" above;
-# CPU remains the default/reference path, this adds an automatic
-# try-GPU-else-CPU fallback across every fusion engine (Apex, Relief, Strata)
-# and the alignment warp)
-cargo build --release --bin z-stackr --features gpu
+# Camera RAW input (native only)
+cargo build --release -p z-stackr-cli --features raw
+cargo build --release -p z-stackr-gui --features raw
+
+# Apex, Relief, Strata and alignment on the GPU (wgpu); independent of `nn-gpu`, and the CPU stays the fallback
+cargo build --release -p z-stackr-cli --features gpu
+cargo build --release -p z-stackr-gui --features gpu
+
+# The trainer and the alignment evaluation binary
+cargo build --release -p z-stackr-nn --bin z-stackr-train --bin stacker-nn-eval
 ```
-The compiled executable will be located at `target/release/z-stackr`.
+The executables are written to `target/release/`. `<repository-url>` is a placeholder: the repository URL is not set in the manifests. Features combine (`--features akaze,raw,gpu`).
 
-> **No ML by default.** Without `--features nn` (or `nn-gpu`) neither the CLI nor
-> the GUI pulls in Burn or any ML dependency, and the AI option is absent from
-> the UI. The GPU backend is a separate opt-in on top of `nn`.
->
-> **No RAW support by default.** Without `--features raw` neither app pulls in
-> `rawler`, and RAW files are rejected with a clear
-> "rebuild with `--features raw`" error instead of a confusing decode failure.
-> See "RAW Image Support" below.
+#### CPU features (important for speed)
+
+The SIMD code uses portable `std::simd`, which is fixed at **compile time**. The vector width follows the target features of the build: 16 `f32` lanes with `avx512f`, 8 with `avx2`, otherwise 4 (one 128-bit SSE2 operation). A plain `cargo build` targets baseline `x86-64`, i.e. SSE2 only, so it gets 4 lanes; and without the `fma` feature the warp's `mul_add` is a library call per lane. The 8-bit sRGB encoder reads its code table with a gather of bytes on every target (x86 has no 8-bit hardware gather, and a 32-bit table would need 64 KiB instead of 16 KiB). The output does not depend on the width or on FMA: results stay correct, only the speed of the vector code changes.
+
+For a build that runs on any AVX2 + FMA CPU (Intel Haswell or AMD Zen 1 and newer), pass the `x86-64-v3` level:
+```bash
+# bash / zsh
+RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -p z-stackr-cli
+# PowerShell
+$env:RUSTFLAGS = "-C target-cpu=x86-64-v3"; cargo build --release -p z-stackr-cli
+```
+`-C target-cpu=native` additionally enables AVX-512 where the CPU has it, but the binary then only runs on CPUs with the same features. A binary built for `x86-64-v3` does not run on older CPUs. Use the same `RUSTFLAGS` for `cargo clippy` and `cargo test`, otherwise cargo rebuilds everything when the flags change. No `.cargo/config.toml` is committed on purpose: the right CPU level depends on who runs the binary. `stacker_align::transform::simd_build_report()` returns a one-line description of what the build was compiled for, and `has_hardware_fma()` a boolean.
+
+#### Build tasks, PGO and BOLT
+
+`docs/vscode-tasks.json` is a set of VS Code tasks: the GUI, the CLI and the trainer for each CPU level (`generic`, `x86-64-v3`, `x86-64-v4`, `znver3`, `znver4`) on Windows and Linux, and profile-guided-optimisation chains (plus BOLT on Linux) for the CLI and the GUI. Copy it to `.vscode/tasks.json`; `docs/build-tasks.md` explains the tasks, the prerequisites (`llvm-profdata`, `llvm-bolt`) and the training workload (Apex, Relief with and without multigrid, and Strata on the frames in `sample/`, aligned with registration + Lucas-Kanade, registration + Nelder-Mead and the six-parameter affine model). They use the `release-perf` cargo profile: the release code with line tables and symbols kept. These builds take a long time and are run by hand; nothing in the repository starts them.
+
+> **No ML by default.** Without `--features nn` (or `nn-gpu`) neither app pulls in Burn, and the AI option is absent from the GUI. The GPU backend is a separate opt-in on top of `nn`.
+
+> **No GPU stack by default.** Without `--features gpu` neither app links wgpu for the stacking stages, and the Compute device box in the GUI lists the CPU only. A settings file that says `compute_device = "gpu"` still loads in such a build; the run uses the CPU and says so.
 
 ---
 
-## 📖 Usage
+## Usage (CLI)
 
-The CLI tool takes a directory of focus-bracketed images and outputs a single composite image.
+The CLI takes a directory of focus-bracketed images and writes one composite image.
 
-### Basic Example
 ```bash
-cargo run --release --bin z-stackr -- \
+cargo run --release -p z-stackr-cli -- \
     --input-dir ./sample/ \
     --output-file ./sample/result/stacked_output.tif \
     --mode apex \
     --tile-size 512
 ```
 
-### Command Line Arguments
+### Command-line arguments
 
-* `--input-dir <DIR>` **(Required)**: The path to the folder containing the source images (`JPG`, `PNG`, `TIF`, `TIFF`, and — in `raw`-feature builds — camera RAW formats; see "RAW Image Support" below). Images are sorted alphabetically before processing.
-* `--output-file <FILE>` **(Required)**: The destination path for the final stacked image. If the file extension is `.tif` or `.png`, the pipeline will automatically write the output as 16-bit to preserve depth.
-* `--mode <MODE>` **(Required)**: The focus fusion method to use (`apex`, `relief`, `strata`, or `ai`). `ai` requires a build with `--features nn`.
-* `--tile-size <SIZE>` **(Required)**: The size of the out-of-core processing tiles in pixels (e.g., `512`). Larger tiles process faster but consume more RAM.
-* `--model <NAME>` *(AI mode)*: Name (file stem) of the fusion model in the models directory to use. Defaults to the first fusion model found.
-* `--device <cpu\|gpu>` *(AI mode / neural alignment)*: Inference backend. Defaults to the best available (GPU if built with `nn-gpu`, otherwise CPU).
-* `--align-model <NAME>` *(neural alignment, `alignment_mode = "neural"` in the config)*: Name (file stem) of the alignment model in the models directory to use. Defaults to the first alignment model found. Independent of `--model` above — a fusion checkpoint and an alignment checkpoint are never interchangeable.
-* `--log-file <FILE>` *(Optional)*: Path to output a structured log file. Detailed trace and performance metrics are written here.
-* `--config <FILE>` *(Optional)*: Path to a TOML settings file. If it doesn't exist yet, it's created with commented defaults and the run proceeds with those defaults; if it exists, its values override the built-in defaults. Most stacking settings beyond the flags above (alignment DOF nuances, brightness correction, Relief tuning, auto-cull, preprocessing, image-saving options) are config-TOML-only — see `apps/stacker-cli/README.md` for the full list.
-* `--monitor` *(Optional flag)*: Watches `--input-dir` for new/changed files and re-runs the full stacking pipeline automatically on every change, in addition to an initial pass at startup. Useful for a tethered-capture workflow where frames land in the folder as they're shot. Incompatible with subfolder-batch mode (see below).
+* `--input-dir <DIR>` (required): the folder with the source frames (`.jpg`, `.jpeg`, `.png`, `.tif`, `.tiff`, any letter case, and camera RAW files in a build with `--features raw`). Files are used in natural file-name order (`frame_2` before `frame_10`); the first one is the alignment reference. The output file and the log file are never read as frames.
+* `--output-file <FILE>` (required): the result. The extension selects the format (`.png`, `.tif`/`.tiff`, `.jpg`/`.jpeg`); a name without an extension gets the one from `image_saving.output_format`. With `--mode both` or `--mode all` one file per algorithm is written, named `<stem>_<algo>.<ext>` (`result_apex.tif`, `result_relief.tif`, `result_strata.tif`); with `--stacks subfolders` this is the output directory. PNG and TIFF are written at 16 bits per channel unless `image_saving.bit_depth = 8`; JPEG is 8-bit. The path is checked before the first frame is decoded.
+* `--mode <MODE>` (required): `apex`, `relief`, `strata`, `both` (Relief and Apex on the same aligned stack), `all` (Strata, Relief and Apex on the same aligned stack) or `ai` (any letter case; `nn` is an alias of `ai`). The old names `pmax` and `dmap` are accepted as aliases of `apex` and `relief` (with a warning). `ai` needs a build with `--features nn`.
+* `--tile-size <SIZE>` (required): the tile size in pixels, at least 64 (512 is a good value). For `apex` it is rounded up to a multiple of `2^(pyramid_levels - 1)`. A tile larger than the image is one tile. Larger tiles lower the padding overhead on disk and in RAM.
+* `--config <FILE>`: a TOML settings file (the format the GUI writes). The file must exist and parse; an error stops the run instead of silently using defaults. Without `--config` the built-in defaults are used. A file without `settings_version = 2` is migrated as described under "Alignment"; `alignment_mode = "bounded"` is accepted as an alias for `registration` with `bounded_search = true`, and the old `dmap_*` keys and `use_gpu` still read.
+* `--optimizer <auto|lk|nm>` (any letter case): overrides the settings file's `optimizer` (`lk` is Lucas-Kanade, `nm` Nelder-Mead; see "Alignment"). The settings file itself spells the values `auto`, `lucaskanade` and `neldermead` (`lk` and `nm` read too).
+* `--no-gpu`: only in builds with `--features gpu` or `nn-gpu`. Keeps the run on the CPU whatever `compute_device` says (the same as `compute_device = "cpu"`, and the neural models run on the CPU as well, like `--device cpu`).
+* `--stacks <subfolders|single>`: what to do when `--input-dir` holds subfolders with images. `subfolders` stacks every such subfolder on its own, one after the other, into `--output-file` (a directory; the files are named by `image_saving.filename_template`); `single` stacks only the images directly inside `--input-dir`. Without the flag a terminal is asked; without a terminal the run stops and asks for the flag. Not combinable with `--monitor` in `subfolders` mode.
+* `--write-default-config`: with `--config`, create a missing file with commented defaults first.
+* `--monitor`: keep watching `--input-dir` and re-run the stack when a frame is added or changed.
+* `--log-file <FILE>`: also write the structured log to this file.
+* `--model <NAME>`, `--device <cpu|gpu>`: AI mode, and only in builds with `--features nn` or `nn-gpu` (other builds reject both flags). `--model` is the file stem of a fusion model in the `models/` folder (default: the first one in discovery order); `--device` defaults to the best backend in the build.
+* `--align-model <NAME>`: the alignment model for `alignment_mode = "neural"` (same `nn` builds); the file stem of an alignment model in `models/`.
 
-### Batch processing: one stack per subfolder
+> **Models folder.** AI mode and neural alignment look for models in a `models/` directory next to the executable and then in the current working directory. Each model is a pair `<name>.mpk` (weights) + `<name>.json` (architecture manifest, including the network architecture; a manifest without one is a `FocusMergeNet`). Fusion models and alignment models are listed separately. If no model of the kind is found the option is unavailable.
 
-If `--input-dir` contains subfolders that themselves hold images (e.g. one subfolder per subject in a shooting session), the CLI can stack each subfolder independently into its own output file instead of treating the whole tree as one stack. It asks interactively (or via the non-interactive `--stacks subfolders`/`--stacks single` flag) which you mean whenever that ambiguity exists; a plain folder of images with no image-bearing subfolders behaves exactly as before. Since the CLI loads the same TOML config the GUI writes, the intended workflow is to dial in settings visually in `z-stackr-gui`, save the config, then point the CLI's `--config` + `--stacks subfolders` at a folder of per-subject subfolders for headless batch runs. See `apps/stacker-cli/README.md`'s "Batch processing" section for the full walkthrough, output-naming rule, and failure-handling behaviour.
+### Memory and disk
 
-> **Models folder.** AI mode looks for trained models in a `models/` directory
-> next to the executable (and in the current working directory). Each model is a
-> pair: `<name>.mpk` (weights) + `<name>.json` (architecture manifest). If the
-> folder is empty the AI option is unavailable.
+Every frame is stored on disk as padded tiles during a CLI run. The tile directory (`stacker_tiles_*` below the system temp directory) takes `12 * ((T + 2A) / T)^2` bytes per source pixel per frame, where `T` is the tile size and `A` the apron. The apron follows what is computed:
 
----
+| Method | Apron `A` |
+|---|---|
+| `apex` | 128 px at 6 pyramid levels, 256 at 7, 512 at 8 (the default) |
+| `relief` | `estimation radius + 2 * smoothing radius + 1` (10 px at the defaults) |
+| `strata` | 101 px (the saliency reach plus the guided filter's two radius-45 boxes; fixed) |
+| `ai` | 128 px |
 
-## 🔬 Fusion Modes
+Relief with the multigrid solver (`relief_use_multigrid`) solves the depth on whole-image index and weight planes (about 8 bytes per pixel, plus the solver's own levels, about 28 bytes per pixel at its peak), so the result does not depend on the tile size and shows no seams.
 
-z-stackr provides four fusion algorithms designed for different scenarios:
-
-### 1. `apex` (Laplacian Pyramid)
-Uses a sophisticated Laplacian-pyramid multi-band blending algorithm (comparable to the pyramid-blending method used by other professional focus-stacking tools).
-* **Best For**: Extreme macro photography, highly complex overlapping subjects (e.g., insect bristles, dense foliage), and deep stacks (50+ frames).
-* **Characteristics**: Excellent at retaining fine details across depth intersections. However, it can occasionally increase apparent noise in out-of-focus background areas.
-
-### 2. `relief` (Depth Map)
-Uses a Sum-Modified Laplacian (SML)-style focus metric with **two selectable fusion engines** (see `crates/stacker-algo/README.md` → "Relief" for the full algorithmic detail): the default **Guided Filter** engine (argmax source pick + edge-preserving smoothing), or the **Multigrid** engine — a confidence-weighted geometric multigrid depth-solver. The method is comparable to the depth-map-based approach used by other depth-map-based stacking tools.
-* **Best For**: Continuous surfaces without heavy depth intersections (e.g., coins, flat mineral samples).
-* **Characteristics**: Preserves smooth textures beautifully and keeps background noise exceptionally low. The Multigrid engine trades a small amount of speed for greater depth-field continuity.
-
-### 3. `strata` (Guided-Filter Fusion)
-Makes a **soft** decision instead of `apex`'s/`relief`'s hard per-band/per-pixel pick: every frame contributes to every output pixel, weighted by how in-focus that frame is *there*. A per-frame Laplacian-based saliency map feeds a winner-take-all indicator per frame, refined by an edge-aware **Guided Filter** at two scales — wide/smooth for the low-frequency "base" layer, tight/crisp for the high-frequency "detail" layer — so weight transitions hug real image edges instead of cutting across them.
-* **Best For**: Subjects between Relief's smooth surfaces and Apex's dense bristles — where you want soft, edge-aware blending with fewer halos at depth edges than either hard-decision engine gives.
-* **Characteristics**: A genuine third option, not a variant of Apex or Relief. Two guided-filter passes per frame make it the most compute-intensive of the three classical engines. Exposes one setting, **Base radius** (the base/detail split point).
-
-### 4. `ai` (AI Model — neural)
-Folds the stack through a trained `FocusMergeNet`: starting from the first frame, each subsequent frame is merged into a running composite by a learned per-pixel soft-selection + residual-refinement network that also tracks a confidence channel.
-* **Best For**: Difficult cases the handcrafted metrics struggle with — transparent subjects, strong speculars, densely overlapping bristles — once a model is trained for your material.
-* **Characteristics**: Fully-convolutional and resolution-independent; large images are processed with apron-overlap tiling and a feathered (raised-cosine) blend. Requires a trained model in the `models/` folder and a build with `--features nn` (CPU) or `nn-gpu` (GPU). **Note: Large models (`xl`, `xxl`) or large tile sizes can consume significant amounts of VRAM, so choose a model size appropriate for your hardware.**
-
-> See **Training the AI model** below for how to produce a model.
-
-### Neural alignment (`alignment_mode = "neural"`) — experimental, separate from fusion
-
-Independent of the three fusion modes above, `alignment_mode` also accepts `neural` (requires `--features nn`): instead of the classical AKAZE + intensity-refinement pipeline, a trained alignment model predicts the frames' registration matrices, downscaled internally to a 512px-longest-side copy. Two alignment architectures are supported and picked automatically from the model's manifest: `batchalign-v2` (whole stack in one batched call) and `fusionalign-v1` (streaming, one reference/frame pair per call — O(1) memory in stack size). By default (`neural_refine_classically = true`) the model's matrix is used as a **seed** for the same classical intensity-based refinement the other modes use (`stacker_align::align_frame`, `Registration` DOFs) — every safety net (seed sanity-filtering, post-refinement identity gate) applies exactly as it does to an AKAZE seed. Set `neural_refine_classically = false` to use the network's matrix directly with no classical refinement, for benchmarking the network in isolation. This is orthogonal to the fusion mode: you can combine classical alignment with AI fusion, or neural alignment with Apex/Relief fusion, or neural alignment with AI fusion — each picks its own model independently via `--model` (fusion) / `--align-model` (alignment) on the CLI, or the separate model pickers in the GUI. No pretrained alignment model ships with this repository; see **Training the AI model** below.
+At the `apex` default (8 levels, `T` = 512) that is 108 bytes per source pixel per frame; with 6 levels (`A` = 128) it is 27. The CLI logs the padding factor and the scratch bytes per source pixel before it starts, and warns when a stored tile is more than 4 times its interior. The directory is removed when the run ends, also after an error; a killed process cannot clean up. The per-pixel RAM of every stage is in `crates/stacker-pipeline/README.md`.
 
 ---
 
-## 📷 RAW Image Support (`raw` feature)
+## Fusion modes
 
-Compiled with `--features raw`, both apps can stack camera RAW files directly instead of requiring a manual TIFF conversion first. This is implemented with **pure-Rust** decoding — `rawler` (the actively-maintained dnglab decoding engine: RAW container/Bayer-pattern decode plus its own default demosaic/white-balance/gamma develop pipeline) — so the project's zero-C/C++-dependency build chain (and its PGO/BOLT release profiles) is unaffected whether or not `raw` is enabled. Without the feature, RAW files are rejected with a clear "rebuild with `--features raw`, or convert to TIFF/DNG" error rather than a confusing decode failure.
+### 1. `apex` (Laplacian pyramid; was `pmax`)
+A Laplacian-pyramid blend. At every detail band the source with the largest selection energy (the squared Laplacian coefficient) supplies the coefficient, and the lowest band is averaged.
+* **Settings**: pyramid levels, *Use all color channels*, *Grit suppression* (see below).
+* **Character**: keeps fine detail across depth intersections; it can increase apparent noise in out-of-focus background areas.
 
-### Supported formats
+### 2. `relief` (depth map; was `dmap`)
+A plane-fit residual-variance focus measure per frame, a per-pixel choice of the sharpest frame, and a guided filter on the result.
+* **Multigrid** (`relief_use_multigrid`, off by default): instead of taking each pixel's own best frame, the frame index is solved as a smooth depth surface by a multigrid solver. Pixels with a confident focus pin the surface, the rest are interpolated, and the composite blends the two frames around the fractional depth. It suits subjects whose depth is smooth, such as a flat specimen tilted in the stack; it can smear a fine structure that jumps in depth.
+* **Character**: smooth, low-noise backgrounds; weaker than `apex` on interlocking geometry.
 
-Canon `.cr2` and `.cr3`, Nikon `.nef`, Sony `.arw`, Adobe `.dng`, Fujifilm `.raf`, Olympus `.orf`, Panasonic `.rw2`, Pentax `.pef`, and several other manufacturer formats `rawler` recognises (`.srw`, `.3fr`, `.erf`, `.kdc`, `.mrw`, `.nrw`, `.raw`, `.rwl`, `.sr2`, `.srf`, `.x3f`) — see `crates/stacker-core/src/io.rs`'s `RAW_EXTENSIONS` for the exact, single-source-of-truth list every part of the app (directory scan, file-open dialog) filters by.
+### 3. `strata` (guided-filter blend; new)
+A soft blend. Every frame contributes to every pixel, weighted by how sharp it is there, and the weights follow the edges of the image (a guided filter guided by the frame's own luma). Each frame is split into a coarse base layer and a detail layer; the base weights are wide and smooth, the detail weights tight and concentrated on the sharpest frame.
+* **Settings**: *Base radius* (`strata_base_radius`, 8 to 64, default 31) and *Detail focus* (`strata_detail_focus`, 1 to 5, default 3).
+* **Character**: no hard seams between the frames a pixel could come from, and no color fringes (the weights come from the luma and apply to all planes); softer than `apex` on very fine, high-contrast structure. Two passes over the frames, with memory that does not grow with the frame count.
 
-Canon's newer CR3 format (ISO base media file format / ISO-BMFF container) is fully supported via `rawler`'s native CR3 decoder — unlike the previous `rawloader`-based implementation, which could only parse the older TIFF-based CR2 container.
-
-### What the RAW pipeline does — and doesn't — do
-
-Each RAW frame is decoded to 16-bit RGB with the camera's embedded white balance applied and `rawler`'s default demosaic algorithm, then fed into the same gamma-space processing pipeline every other format uses. **No lens corrections** (distortion, vignetting, chromatic aberration) are applied, and there is no highlight-recovery or custom white-balance picker — the camera's "as shot" white balance is used as-is. If you need serious colour-critical RAW processing (lens profiles, custom white balance, highlight recovery), convert to 16-bit TIFF with a dedicated RAW processor (e.g. `darktable`, Adobe Camera Raw) first and feed the TIFFs to z-stackr instead; z-stackr's RAW support is aimed at convenience for stacking, not replacing a RAW developer.
-
-### Performance: decode-once cache
-
-Demosaicing a large RAW frame is expensive, and the tiled pipeline's alignment stages would otherwise reload/redecode every frame 2-3 times over the course of one run. When at least one input is a RAW file, `z-stackr-pipeline` runs a pre-pass that decodes each RAW frame **exactly once**, one at a time (bounded memory — never two decodes held in RAM simultaneously), and caches the result as a binary blob in the run's temporary directory; every later pipeline stage reads from that cache instead of re-decoding. This cache is ephemeral — created and destroyed with each run — and adds no overhead at all to a stack made entirely of standard (non-RAW) formats.
-
-### Building with RAW support
-
-```bash
-# CLI
-cargo build --release -p z-stackr-cli --features raw
-
-# GUI
-cargo run --release -p z-stackr-gui --features raw
-
-# Combine freely with the other optional features
-cargo build --release -p z-stackr-cli --features "akaze,nn,raw"
-```
+### 4. `ai` (AI model, neural)
+Folds the stack through a trained `FocusMergeNet`: the running composite starts as the first frame, and each following frame is merged into it by a learned soft selection plus a residual refinement that also tracks a confidence channel. Requires a trained model in `models/` and a build with `--features nn` (CPU) or `nn-gpu` (GPU). See "Training the AI model" below.
 
 ---
 
-## ⚙️ GUI Settings Overview
+## Alignment
 
-The `z-stackr-gui` application provides an intuitive interface for adjusting the stacking parameters. Below is a detailed explanation of all available settings.
+Every frame is registered to the reference (the first frame, or the sharpest with **Sort by Sharpness**) before fusion. The matrix a refiner returns maps reference coordinates to frame coordinates, and the frame is warped with its inverse. Pixels the warp cannot fill are masked out of the later steps.
 
-### General
-* **Alignment Mode**: The registration model used before blending. Every classical mode shares whichever **optimiser** is selected (see the **Optimizer** setting below) — differing only in which degrees of freedom are solved. The three active classical modes form a strict ladder: `Translation` ⊂ `Registration` (default) ⊂ `Affine`, each solving a superset of the last's DOFs.
-    * `Translation` — solves X/Y shift **plus focus-breathing scale** (rotation held fixed). The scale DOF stays enabled because essentially every macro focus stack breathes — a pure shift cannot represent per-frame magnification and produces unusable results on real stacks. Use this when your setup guarantees no rotation.
-    * `Registration` — solves shift + uniform scale + rotation (a similarity transform). **The GUI's default** and the best general-purpose choice.
-    * `Affine` — everything `Registration` solves, **plus** separate X/Y scale (anisotropic scale) and shear: a true 6-DOF affine solve. Use this when your source frames need independent X/Y scaling or shear correction that a similarity transform can't represent; it's more expensive to converge and more prone to overfitting sensor noise on otherwise-similarity-only misalignment, which is why `Registration` (not `Affine`) is the default.
-    * `None` — skips alignment entirely (requires a perfectly rigid camera/subject setup).
-    * `Neural` *(requires the `nn` feature, **experimental**)* — a trained alignment model (`batchalign-v2`, one batched whole-stack inference call, or `fusionalign-v1`, streamed one frame-vs-reference pair at a time; the architecture is read from the model's manifest) predicts one full-resolution affine matrix per frame (internally downscaled to a 512px-longest-side copy — see `crates/stacker-align/README.md`). By default (`neural_refine_classically = true`) that matrix seeds the same classical intensity-based refinement the other modes use, inheriting every safety net (seed sanity-filtering, post-refinement identity gate); toggle it off to use the network's matrix directly with no classical refinement. Only selectable when at least one alignment-capable model is discovered in `models/`; no pretrained alignment model ships with this repository.
-* **Optimizer**: Which subpixel refinement optimiser the classical alignment modes above use — all share the same multi-scale Gaussian pyramid, always-bounded logit-space search, and post-refinement identity gate, differing only in how each pyramid level's optimum is found.
-    * `Auto` *(default)* — tries the pyramid Lucas-Kanade / Gauss-Newton optimiser first; if it errors or its own finest-level RMS regresses noticeably versus its starting RMS, silently falls back to the Nelder-Mead bounded simplex for that frame instead. Recommended for almost all cases — it gets Lucas-Kanade's speed with Nelder-Mead's robustness as a safety net.
-    * `Lucas-Kanade` — forward-additive, coarse-to-fine Gauss-Newton refinement with analytic image-gradient Jacobians and Levenberg-style damping. Far fewer iterations per level than blind simplex sampling, at the cost of no fallback: if it fails to converge or produces a non-finite result, that frame's alignment for that level is simply not improved further (the existing post-refinement identity gate still protects the final result).
-    * `Nelder-Mead` — the original bounded-simplex optimiser with coarsest-level random restarts. More iterations per level, but doesn't depend on image-gradient quality, so it's the more conservative choice on noisy or low-texture footage.
-* **AKAZE seeding** *(toggle, off by default)*: Seeds the optimiser with an AKAZE feature-match estimate before intensity refinement. Helps on textured subjects with large frame-to-frame shifts. Leave it **off** for pure intensity registration, which is more robust on glossy / featureless subjects. Has no effect unless the app was built with the `akaze` feature.
-* **Correct brightness** *(toggle, on by default)*: After warping, fits each frame's luma toward the first frame's target mean/brightness via a 2-parameter `(scale, gamma)` solve and applies the same ratio to chroma, correcting exposure/vignette drift between shots without shifting hue. Turn it off if your source frames already have identical exposure and you want to skip the extra per-frame solve.
-* **Auto-Cull Frames** *(GUI only — see note below)*: Runs the frame-optimisation pass (`optimize_stack`) before fusion. It scores every frame with a Sum-Modified-Laplacian focus metric, then drops frames that never provide the sharpest version of any detail region — those contributing less than the **Cull threshold** slider's percentage (default 2%, range 0.1–5.0%) of the scene's in-focus "detail" pixels, i.e. redundant near-duplicates or frames focused on empty space. With this off, every loaded frame is used. See `crates/stacker-algo/README.md` → "Frame Optimisation" for the full algorithm.
-* **Sort by sharpness** *(GUI only)*: Re-orders the frames by a greedy nearest-neighbour walk over the centroid of each frame's in-focus region, so the sequence follows the focus sweep. This puts the sharpest frame first, making it the alignment reference. With this off, frames remain in their loaded order.
-  > **CLI note:** `z-stackr-cli` currently does **not** implement auto-cull, regardless of the `auto_cull` config setting (it logs a startup warning if you leave `auto_cull = true` in a config file). The GUI loads and aligns the whole stack into RAM up front, which is what lets it compare every frame's contribution at once; the CLI is deliberately out-of-core (memory scales with tile size, not frame count) and streams one frame at a time, which the current culling algorithm isn't compatible with. 
-* **Cull threshold** *(0.1–5.0%, default 2.0%)*: The minimum percentage of the scene's in-focus detail pixels a frame must uniquely win to survive Auto-Cull. Only has an effect while **Auto-Cull Frames** is on. Backed by `StackingSettings::auto_cull_threshold_pct`.
-* **Crop to common area** *(toggle, on by default)*: Crops the stacked output to the largest rectangle covered by every aligned frame, removing the smeared edge-replication band that focus-breathing zoom leaves at the borders and excluding those pixels from fusion processing entirely (culling scores, Apex pyramids, Relief SML/threshold statistics, AI). A rogue/misaligned frame that would shrink the crop below 25% of the canvas is ignored (falls back to full canvas, with a warning logged). Turn this off to keep the full, uncropped canvas output. Backed by `StackingSettings::crop_to_common_area`.
-* **Restretch to original size** *(toggle, off by default, enabled only while Crop to common area is on)*: Resamples the cropped result back up to the original canvas resolution (high-quality 4-tap spline in the GUI's in-RAM path, Lanczos3 in the tiled pipeline; both edge-clamped, so no border ringing) instead of saving the smaller cropped size. Since the crop rectangle's aspect ratio can differ fractionally from the canvas, this applies a slight non-uniform (independent X/Y) stretch — usually sub-pixel for typical focus-breathing crops. Backed by `StackingSettings::resize_cropped_to_original`.
-* **Stack every Nth frame**: Skips frames to speed up processing. Set to 1.0 to process all frames. Set to 2.0 to process every 2nd frame, etc. Useful for quick previews of deep stacks.
-* **Align / Show Aligned**: The **Align** button runs an alignment-only pass; the **Show Aligned** switch then toggles the preview between each source frame and its aligned (warped, common-area-cropped) version. While alignment runs, the canvas live-updates to show each frame as it is registered.
-* **Sort / Cull**: Next to **Align**, these two buttons run the **Sort by sharpness** and **Auto-Cull Frames** passes standalone, against the same aligned/cropped/subsampled frame set the Stack pipeline itself scores (aligning first — or reusing a matching cached alignment — exactly like the Align button). **Sort** and **Cull** are **fully independent commands**: pressing **Sort** always reorders the source-file list by sharpness, and pressing **Cull** always marks culled frames in place (dimmed, "(culled)") using the **Cull threshold** slider's current value — *regardless* of how the **Sort by sharpness** / **Auto-Cull Frames** Settings toggles are set. Those toggles are consulted only by **Stack**, never by the buttons. Re-pressing one button after the other (with nothing else changed) preserves the other's result rather than discarding it — e.g. Sort after Cull keeps the culled set and re-sorts the survivors. Pressing **Stack** afterwards with the matching toggle(s) on reuses whichever ops the cached result actually covers instead of recomputing them, as long as nothing relevant has changed (same files, same order, same alignment/crop/subsampling/cull-threshold settings) — tracked by the same kind of change-detection fingerprint the Align cache uses (note: the fingerprint itself does **not** depend on the Sort/Auto-Cull toggles, precisely because the buttons don't either — only op *coverage*, i.e. whether the cache actually ran what a given Stack press wants, is compared against those toggles). If something *did* change since the last Sort/Cull run, Stack pauses and asks whether to run Sort/Cull again with the new inputs or keep the current list order/selection as-is. With no cached Sort/Cull result at all, Stack behaves exactly as it always has (computing Sort/Cull inline when the corresponding toggle is on).
-* **Algorithm**: Selects the fusion method — `Relief`, `Apex`, `Strata`, `Both` (Relief & Apex), and (in `nn` builds) `AI Model (Neural)`.
-* **Cancel**: Appears next to **Align** whenever either background pipeline is running. Stops at the next checkpoint (between frames during alignment, or between stages/passes during stacking) rather than instantly — fusion itself (Apex/Relief/AI) is a single non-interruptible call once started, so a cancel mid-fusion takes effect once that pass finishes.
-* **Est. peak memory**: Shown under the source-file list once files are loaded — a rough (order-of-magnitude, not exact) estimate of the RAM the run will need, compared against total system RAM, with a warning colour if it looks tight.
-* **Tile size** *(0 = off by default)*: `0` keeps the GUI's normal in-RAM path, which is what makes **Auto-Cull Frames** and the live per-frame preview possible (both need the whole aligned stack resident in memory to compare frames). Setting this above `0` switches Stack to the same out-of-core tiled `z-stackr-pipeline` engine the CLI's `--tile-size` always uses — peak memory then scales with the tile size instead of image resolution or frame count, at the cost of **Auto-Cull Frames** and full live preview both being unavailable (status/progress reporting still works). Use this for low-memory machines or very large/many-frame stacks that don't fit in RAM with the normal path.
+### Modes
 
-### Apex (Laplacian Pyramid)
-* **Pyramid levels**: Controls how many frequency bands the image is split into. More levels blend larger structures and can reduce halos, but increase RAM usage and processing time.
-* **Use all color channels**: Instead of calculating focus purely based on luminosity (Luma), this evaluates and blends the Red, Green, and Blue channels independently. This fixes certain color-fringing artifacts but takes 3x longer.
-* **Grit suppression**: Aggressively filters isolated high-contrast pixels (like sensor dust or noise grains) to prevent them from dominating the final blended result.
+| `alignment_mode` | Degrees of freedom | Notes |
+|---|---|---|
+| `translation` | shift X and Y, one uniform scale | corrects focus breathing; no rotation |
+| `registration` (default) | shift, uniform scale, rotation | the former `affine` |
+| `affine` | shift, scale, rotation, aspect ratio, shear | always searched inside bounds |
+| `none` | none | frames are used as loaded |
+| `neural` | learned | `nn` builds, desktop and CLI only |
 
-### Relief (Depth Map)
-* **Relief engine**: `Guided Filter` (default, argmax source pick + edge-preserving smoothing) or `Multigrid` (a confidence-weighted geometric multigrid depth-solver). Both remain available and fully configurable — see `crates/stacker-algo/README.md` → "Relief" for the algorithmic difference.
-* **Estimation radius**: The radius of the box filter used to compute the Sum-Modified Laplacian (SML) focus metric. Larger values create a smoother depth map but reduce pixel-level precision.
-* **Smoothing radius**: The radius of the post-processing smoothing pass applied to the depth map/index field. Guided Filter engine: edge-preserving Guided Filter. Multigrid engine: a Gaussian-pyramid blur. Larger values smooth the transition boundaries between in-focus areas, reducing abrupt seams.
-* **Contrast threshold %**: Pixels below this contrast threshold will inherit the background color (Guided Filter engine) or be treated as low-confidence and filled in by diffusion (Multigrid engine) instead of competing to be the "sharpest" source. Useful for keeping smooth, out-of-focus backgrounds clean.
-* **Show preview during stacking**: Pauses the Relief process and shows a popup where you can adjust the contrast threshold and see the resulting mask overlaid on the image.
-* **Auto-detect optimum contrast**: When showing the preview, automatically suggests a threshold derived from the focus-measure noise floor (median + 1.5×MAD of the non-zero SML population — a robust statistic; Otsu's method degenerates to ~99% on the heavy-tailed SML distribution). The suggested value is a percentile of the *non-zero* focus-measure population, matching how the Contrast threshold slider is interpreted.
+Lucas-Kanade and the `affine` simplex search inside windows centred on the seed: 20 % of the image size for each shift, 20 % for the scale and 20 degrees for the rotation (10 % for aspect and shear). With Bounded Search on, the windows narrow to 5 %, 5 % and 5 degrees.
 
-### Strata (Guided Fusion)
-* **Base radius** *(8–64, default 31)*: Box-filter radius separating the low-frequency "base" layer from the high-frequency "detail" layer, before each is refined by an edge-aware Guided Filter at its own scale and blended. Larger values widen the smooth base-layer handover between frames. This is the only Strata setting exposed — the guided-filter radii/eps and blur sigma are fixed.
+### Optimizer
 
-### AI Model (Neural) — `nn` builds only
-* **Model**: Choose which trained fusion model (from the `models/` folder, filtered to fusion-capable checkpoints) to use. This picker is **greyed out when no fusion models are installed**.
-* **Device**: Choose the inference backend (CPU / GPU). This selector only appears when the binary was built with more than one backend (i.e. with `nn-gpu`); a CPU-only build shows no device choice.
-* **Live preview**: While AI stacking runs, the canvas updates after each frame is folded in, so you can watch the composite sharpen in real time.
-* **Alignment model** *(separate picker, shown when Alignment Mode is set to `Neural`)*: Choose which trained alignment model (filtered to alignment-capable checkpoints — never the same list as the fusion **Model** picker above) to use for neural alignment. Also greyed out when no alignment models are installed.
+* **Nelder-Mead** minimises the RMS difference of the luma planes over a luma pyramid. It spends its iterations on the coarse levels (150 each, restarting the coarsest level from several deterministic starts), gives the large levels near full resolution only 3, and ends with a short full-resolution polish. `bounded_search` runs it in a logit-bounded space.
+* **Lucas-Kanade** is a Gauss-Newton solver on the same pyramid and the same objective, clamped to the same search windows. It runs on the CPU only.
+* **Auto** (`optimizer = "auto"`, default) runs Lucas-Kanade first and the simplex from the same seed when Lucas-Kanade errors or ends no better than it started.
+* The browser build can only use the simplex, so `lucaskanade` and `auto` mean Nelder-Mead there.
 
-### Preprocessing
-* **Pre-rotation**: Rotates all incoming images by 90-degree increments (0°, 90°, 180°, 270°) before alignment or processing begins.
-* **Pre-crop & Crop spec**: Crops all images to a specified region before processing to save time and memory. The specification can be simple dimensions (e.g., `1920,1080` for a center crop) or absolute coordinates (`x,y,w,h`).
-* **Pre-resize %**: Downscales images by the specified percentage before processing. Extremely helpful for quick "proof-of-concept" stacks.
-* **Reverse sort order**: Frames are loaded in alphabetical filename order; enable this to reverse it (important if your macro rail captured images front-to-back instead of back-to-front). This sets the *loaded* order; if **Auto-Cull Frames** is enabled, the kept frames may then be re-ordered by their in-focus centroid (see Auto-Cull above).
-* **Ignore EXIF orientation**: Disregards the internal camera rotation flags inside the image files, forcing them to load exactly as the pixel data is stored.
+### Safeguards
 
-### Image Saving
-* **Output format**: Saves the final stacked result as a `TIFF` (lossless), `PNG` (lossless), or `JPEG` (lossy).
-* **Bit depth**: Saves the file as 16-bit to preserve sub-8-bit tonal precision from the `f32` processing pipeline, or 8-bit for standard web viewing. Note: JPEG only supports 8-bit.
-* **JPEG quality**: The compression quality (1-100) used when saving JPEG files.
-* **Filename template**: The naming pattern for the output file. `{name}` is automatically replaced by the input folder's name or the reference filename.
-* **Default output dir**: If specified, stacked files are automatically saved to this directory instead of prompting a "Save As" file dialog every time.
-* **Copy metadata to output**: Copies the raw EXIF blob (lens model, aperture, shutter speed, etc.) from the first input frame into the final stacked output file, via the shared `stacker_core::metadata` module (`kamadak-exif` to read, `img-parts` to inject — byte-level container editing, no pixel re-encode). Supported for **JPEG and PNG** output only; **TIFF output does not support it** (neither dependency exposes a hook to write EXIF into a freshly encoded baseline TIFF) and a warning is logged if you leave this on with TIFF output selected. A source frame with no EXIF data is a silent no-op, not an error.
+* **Identity gate.** After refinement the matrix is compared with the identity on a reduced copy (short side at most 256 px); if doing nothing fits strictly better, the frame keeps the identity. A bad seed or a frame that shares nothing with the reference therefore cannot be made worse.
+* **Seed check.** An AKAZE seed that is not plausible is discarded; the RANSAC fit needs at least a fifth of the matches to agree.
+* **Brightness correction** (`correct_brightness`, default on): fits `y' = (scale * y)^gamma` on the linear luma of each warped frame so that its mean and standard deviation match the reference's over the pixels the warp covers (gamma limited to 0.5 to 2); chroma follows the same per-pixel ratio. A frame that already agrees is left unchanged.
+* **Chain alignment** (`chain_alignment`, default off): frame `k` is registered to the raw frame `k - 1` and the steps are composed, `C_k = R_k * C_(k-1)`. The coverage of a frame is derived from the cumulative matrix, so the border of undefined pixels is excluded from the common area.
+
+### Neural alignment (`nn` builds)
+
+With `alignment_mode = "neural"` the stack is shown to an alignment network as thumbnails of at most 512 px (streamed frame by frame, not the full-resolution stack) and it predicts a matrix per frame. With `neural_refine_classically` (default) those matrices only seed the classical refinement; without it they are used directly. A neural run is part of the stale fingerprint, so changing the model recomputes the alignment. No trained model ships with the repository; train one with `z-stackr-train --strategy align` and check it with `scripts/04_eval_alignment.py` (see "Training the AI model").
+
+### Settings migration
+
+Settings files carry `settings_version = 2`. A file without it was written by an older build and is migrated when it is read: `alignment_mode = "affine"` becomes `registration` (the same 4-parameter search), the old single-pass `registration` becomes `registration` with `bounded_search = true`, and `translation` stays `translation` (it now also fits a scale). The old `dmap_*` keys, `relief_engine` and `use_gpu` are renamed on reading. Saving always writes the current names.
 
 ---
 
-## 🧠 Training the AI model
+## GUI settings overview
 
-The `z-stackr-train` binary trains a `FocusMergeNet` from scratch. Training data is a directory of *scene* sub-directories, each containing the focus stack, ground-truth all-in-focus image, soft in-focus masks, an occlusion map, and a `metadata.json` descriptor (the synthetic-data generators under the project's Python tooling produce exactly this layout).
+The settings dialog ("Stacking Settings", Edit > Settings, Ctrl+,) edits the stacking settings in six tabs: **General**, **Apex**, **Relief**, **Strata**, **Input** and **Output**. Hover a setting for a tooltip. Every edit is saved at once (debounced) to `settings.toml`, the same file format the CLI reads with `--config`. The **Algorithm** box, **Align**, **Show Aligned** and **Start Stacking** are in the main window, not in the dialog.
+
+### General tab
+* **Alignment Mode**: the registration model applied before fusion. The classical modes minimise an intensity (RMS) difference of the luma planes over a coarse-to-fine pyramid. See "Alignment" above for the details.
+    * `Registration` (default): shift, uniform scale and rotation (a 4-parameter similarity transform). This is what the mode called `Affine` did before the rename, so default results are unchanged.
+    * `Translation`: shift and one uniform scale (focus breathing), no rotation.
+    * `Affine`: the full 6-parameter model: shift, scale, rotation, plus aspect ratio and shear. It is always searched inside bounds.
+    * `None`: skips alignment: no seed, no refinement, no warp; the frames are used as loaded.
+    * `Neural` (`nn` builds, desktop only): a trained alignment network predicts the matrices on small thumbnails. Two more rows appear: **Alignment Model** (which model from the `models/` folder; the choice applies to the session and is not stored in the settings file) and **Refine Neural Alignment Classically**.
+* **Optimizer** (not offered in the browser build): `Auto` (Lucas-Kanade first, the Nelder-Mead simplex when it fails or ends up worse), `Lucas-Kanade` or `Nelder-Mead`. Lucas-Kanade is a CPU path; the browser build always uses the simplex.
+* **Bounded Search** (toggle): keeps the optimiser inside a band around the starting estimate (a logit-space bounded simplex). The default half-widths are 5 % of the image size for each shift, 5 % for the scale and 5 degrees for the rotation (10 % for aspect and shear). Under `Translation` only the shifts and the scale are searched.
+* **AKAZE Seeding** (toggle, off by default): seeds the optimiser from an AKAZE feature match before the intensity refinement. It helps on textured subjects with large shifts and has no effect unless the app was built with the `akaze` feature.
+* **Correct Brightness** (toggle, on by default): matches every aligned frame's brightness to the reference.
+* **Chain Alignment** (toggle, off by default): aligns each frame to its predecessor instead of the reference, which helps long stacks whose ends share little content; drift can add up.
+* **Refine Neural Alignment Classically** (toggle, on by default; only with `Neural`): the network's matrices seed the classical refinement instead of being applied directly.
+* **Auto-Cull Frames**: runs the frame-optimisation pass before fusion. It scores every frame with the plane-fit focus measure (window radius 1), then (a) drops frames that win fewer than `min(2, 50 / N)` percent of the scene's in-focus detail pixels (N is the frame count: 2 percent for stacks of up to 25 frames, half of the average share for deeper ones); if every frame would be dropped, all are kept and a warning is shown; and (b) can re-order the kept frames by a greedy nearest-neighbour walk over the centroids of the pixels each frame won. The surviving frames are fused in stack (capture) order unless **Sort by Sharpness** is on, because the multigrid depth needs the capture order. With auto-cull off, every frame is used in its loaded order. Dropped frames stay in the Source Files list, dimmed and marked `(culled)`. **Cull Threshold %** (`auto_cull_threshold_pct`, 0 to 50, shown as "Auto" at 0) replaces the automatic rule with a fixed share; 0 keeps the automatic rule. The **Sort** and **Cull** buttons of the Source Files list run these steps on their own. See `crates/stacker-algo/README.md`.
+* **Sort by Sharpness** (off by default): orders the frames sharpest-first before alignment, so the sharpest frame becomes the reference.
+* **Stack Every Nth Frame**: keeps every Nth frame of the list (1 keeps all).
+* **Compute Device** (not offered in the browser build): `CPU` or `GPU` (`compute_device`); see "Key features" for what runs on the GPU.
+* **Tile Size** (`tile_size`; the box lists "In Memory" and tile sizes, the key takes 0 or 64 to 8192; not offered in the browser build): the GUI's out-of-core mode. The command line has its own `--tile-size`, which wins.
+
+### Main window
+* **Align / Show Aligned**: **Align** runs an alignment-only pass; **Show Aligned** then shows the aligned, common-area-cropped version of the frame you click. A following **Start Stacking** reuses the aligned frames while the file list and the alignment settings are unchanged; otherwise a stale badge appears.
+* **Algorithm**: `Relief (Depth Map)`, `Apex (Laplacian)`, `Strata (Guided Fusion)`, `Both (Relief & Apex)` (two passes of one job), `All Three (Strata, Relief & Apex)` (three passes, Strata first) and, in `nn` builds, `AI Model (Neural)`. Settings and project files that carry the old labels ("PMax (Laplacian)", "DMap (Depth Map)", "Both (DMap & PMax)") still load.
+
+### Apex tab (Laplacian pyramid)
+* **Pyramid levels** (2 to 12, default 8): the number of bands. More levels reach larger structures and cost time; in the CLI they also raise the apron (see "Memory and disk").
+* **Use all color channels**: adds the chroma bands to the energy Apex uses to pick the sharpest frame (luma only by default); luma and chroma are still copied together from one frame.
+* **Grit suppression** (default on): at Apex's finest band, picks each pixel's sharpest frame by the energy of its 3x3 neighbourhood instead of the pixel alone; nothing is smoothed.
+
+### Relief tab (depth map)
+* **Estimation radius** (0 to 100, default 5): the radius of the window of the plane-fit residual-variance focus measure. Larger values give a smoother map and less precise depth.
+* **Smoothing radius** (0 to 50, default 2): the radius of the guided filter applied to the selected luma (the chroma planes are not filtered).
+* **Contrast threshold %**: the fraction of pixels, ranked by the best focus score any frame reaches there, that are not allowed to choose a frame. Those pixels take the mean of all frames instead. It is evaluated once on the whole image.
+* **Show preview during stacking**: pauses the Relief pass and shows a non-modal card over the canvas where you can adjust the threshold and see the mask.
+* **Auto-detect optimum contrast**: computes the threshold from the median and the median absolute deviation of the whole-image focus map (the median plus 1.5 times the deviation), which stays usable on the heavy-tailed maps where Otsu's method collapses. The setting applies to every Relief run, with or without the preview; the row is greyed out in the dialog while the preview switch is off.
+* **Multigrid Depth Solver** (off by default): solves the depth with the multigrid solver (see "Fusion modes"); at most 65,536 frames.
+
+### Strata tab (guided fusion)
+* **Base Radius** (8 to 64, default 31): the box radius that splits each frame into a base and a detail layer. A larger radius moves more of the picture into the smoothly weighted base.
+* **Detail Focus** (1 to 5, default 3): raises the detail weight to this power. On deep stacks the guided filter leaks a small weight to the frames next to the winner and the leaks of dozens of frames add up; a higher value concentrates the detail on the sharpest frame, `1` leaves the weights as they are.
+
+### AI model (neural), `nn` builds only
+These controls sit in the sidebar under the **Algorithm** box, not in the dialog.
+* **AI model**: which trained fusion model from the `models/` folder to use; the picker is greyed out when none is installed. (The alignment model is picked in the General tab, under `Neural` alignment.)
+* **Device**: CPU or GPU; shown only when the build offers more than one backend (`nn-gpu`).
+* **Live preview**: the canvas updates after each frame is folded in.
+
+### Input tab (preprocessing)
+Applied to every frame when it is decoded, in this order: EXIF orientation, pre-rotation, pre-crop, pre-resize.
+* **Pre-rotation**: rotates by 0, 90, 180 or 270 degrees.
+* **Pre-crop** and **Crop spec (w,h or x,y,w,h)**: crops to `w,h` (centred) or `x,y,w,h`. An invalid spec is skipped with a warning.
+* **Pre-resize %** (10 to 100): downscales before processing (Lanczos3).
+* **Reverse sort order**: reverses the file order (the reference frame is then the other end of the stack).
+* **Ignore EXIF orientation**: off by default, so a JPEG with an EXIF orientation tag is rotated upright; switch it on to load the pixels as stored. Only JPEG files are checked for the tag.
+
+### Output tab (image saving)
+* **Crop to Common Area** (toggle, on by default) and **Resize Cropped to Original** (off): crop to the rectangle every frame covers and, optionally, scale the result back to the original canvas size (a slight non-uniform stretch).
+* **Output format**: TIFF, PNG or JPEG.
+* **Bit depth**: 16 or 8 bit for PNG and TIFF; JPEG is always 8-bit.
+* **JPEG quality** (1 to 100).
+* **Filename template**: the pattern for the export file name (without extension). Variables: `{name}`, `{algo}`, `{date}`, `{time}`, `{timestamp}`, `{n}`, `{w}`, `{h}` (see `apps/stacker-gui/README.md`; `{algo}` is `Apex`, `Relief` or `Strata`). The CLI replaces `{name}` only (the stem of the first frame, or the folder name with `--stacks subfolders`) and uses the template when `--output-file` is a directory.
+* **Default output dir**: the folder the export dialog's Save writes to without asking (Save As always asks). In the CLI, a bare `--output-file` name is placed there.
+* **Copy metadata to output**: copies the EXIF block of the source frames (camera, exposure, date, GPS, ...) into JPEG and PNG outputs without touching the pixels. When the pixels were rotated on load, the orientation tag is rewritten to "upright". TIFF output cannot carry EXIF here, and the app says so instead of dropping it silently.
+
+---
+
+## Training the AI model
+
+The `z-stackr-train` binary trains one of four networks from scratch, chosen with `--strategy`:
+
+| `--strategy` | Network | Task | Training data | Checkpoint stem |
+|---|---|---|---|---|
+| `pairwise` (default) | `FocusMergeNet` | recurrent pairwise fusion | stage 2 scenes | `focusmerge` |
+| `batch` | `BatchMergeNet` | whole-stack fusion in one pass | stage 2 scenes | `batchmerge` |
+| `align` | `BatchAlignNet` | whole-stack alignment | stage 3 scenes | `batchalign` |
+| `fusion-align` | `FusionAlignNet` | alignment of one frame against the reference | stage 3 scenes | `fusionalign` |
+
+Training data is a directory of scene sub-directories, each holding the focus stack, a ground-truth all-in-focus image, soft in-focus masks, an occlusion map and a `metadata.json` that names every file (the alignment strategies also read `alignment_gt`). Three scripts in `scripts/` produce this layout from ordinary photographs:
+
+1. `scripts/01_estimate_depth.py` estimates a depth map per photo (Python packages in `scripts/requirements.txt`, plus Depth Anything 3, which is installed separately; see the docstring of the script).
+2. `scripts/02_blender_focus_stack.py` runs inside Blender (`blender -b -P scripts/02_blender_focus_stack.py -- --img ... --depth ... --out <scene_dir>`) and renders the stack, masks, ground truth and `metadata.json`.
+3. `scripts/03_simulate_misalignment.py` (`--input <scene_dir> --out <new_dir>`) turns a perfectly aligned stage 2 scene into an unaligned one: per-frame shift, rotation, anisotropic scale and shear, plus brightness, gamma, noise and blur differences, with the ground-truth matrices in `alignment_gt`. All frames are cropped by a margin larger than any displacement, so no synthetic border teaches the network a shortcut.
+
+Everything the networks do runs in linear light.
 
 ```bash
 # CPU (default ndarray autodiff backend)
-cargo run --release --bin z-stackr-train -- \
+cargo run --release -p z-stackr-nn --bin z-stackr-train -- \
     --data /path/to/scenes --out models --size l --epochs 60
 
-# GPU (NVIDIA / A100) — much faster for the larger presets
-cargo run --release --no-default-features --features "cuda,autodiff" \
+# GPU (wgpu: Vulkan / Metal / DX12)
+cargo run --release -p z-stackr-nn --no-default-features --features "wgpu,autodiff" \
     --bin z-stackr-train -- --data /path/to/scenes --out models --size xxl
 ```
 
-Key flags: `--size <xs|s|m|l|xl|xxl>` (capacity preset), `--strategy <pairwise|batch|align|fusion-align>` (which of the four built-in architectures to train — `pairwise`/`batch` are the two fusion strategies described above; `align` trains the whole-stack `BatchAlignNet` and `fusion-align` the streaming pairwise `FusionAlignNet`, both consumed by `alignment_mode = "neural"`), `--epochs`, `--lr`, `--crop` (training patch size), `--ss-max` (scheduled-sampling probability), `--ckpt-every <N>` (steps between rolling checkpoints), and `--resume` (continue from the last rolling checkpoint).
+Flags (defaults in brackets): `--data <dir>` (required), `--out <dir>` [`checkpoints`], `--strategy <pairwise|batch|align|fusion-align>` [`pairwise`], `--size <xs|s|m|l|xl|xxl>` [`m`], `--epochs` [40], `--lr` [3e-4], `--crop` (training patch size) [256], `--seed` [42], `--ss-max` (scheduled-sampling probability) [0.5], `--ckpt-every <N>` (steps between rolling checkpoints) [200], `--cache-mb <N>` (budget for decoded scenes kept between steps, `0` keeps nothing) [1024], `--resume` (continue from the rolling checkpoint) and `--fresh` (with `--resume`: start from scratch instead of failing when no usable checkpoint exists). For the alignment strategies: `--corr-radius <N>` (correlation search radius, recorded in the manifest), and for `align` only `--real-data <dir>` (plain folders of real, unlabelled stacks; in the last quarter of the epochs a photometric loss on them is added) with `--photometric-weight <F>` [0.1].
 
-**Training the alignment model.** `--strategy align` expects scene directories built by `scripts/03_simulate_misalignment.py` (which augments a fusion-strategy scene with ground-truth alignment matrices), not the plain `02_blender_focus_stack.py` output the fusion strategies use:
+**Checkpoints.** Every `--ckpt-every` steps and at each epoch end the trainer writes `<stem>_latest.model.mpk` (full precision), `<stem>_latest.optim.mpk` (the AdamW moments) and a train-state file, each through a temporary file and a rename (`<stem>` is `focusmerge` for the default strategy; each strategy has its own, so they can share an `--out` directory). Per-epoch snapshots (`<stem>_epoch_NNN.mpk`) and `<stem>_final.mpk` are also written. `--resume` restores model weights, optimiser moments, epoch and step, and fails when `train_state.json` or a checkpoint file is missing or corrupt. Every exported model has a `.json` manifest so the apps can rebuild the architecture.
+
+**Retraining is required after the normalisation change.** The model now uses a per-pixel channel norm instead of GroupNorm, so weights trained earlier fail to load; see `crates/stacker-nn/README.md` for the files to delete and the learning-rate advice.
+
+To use a trained model, copy its `.mpk` + `.json` pair into the `models/` folder next to the binary. A fusion model (`pairwise`, `batch`) appears in the GUI's model picker and is selectable with `--model`; an alignment model (`align`, `fusion-align`) appears in the alignment-model picker and is selectable with `--align-model`. The manifest records the architecture; a manifest without one is read as a `FocusMergeNet`. Every network uses the per-pixel channel norm, so checkpoints trained with the older group norm do not load.
+
+Capacity presets (channels x context depth): `xs` 16x2, `s` 24x3, `m` 32x4, `l` 48x6, `xl` 64x9, `xxl` 96x12.
+
+**Evaluating an alignment model.** Build the evaluation binary and run the script on held-out stage 3 scenes:
 
 ```bash
-cargo run --release --bin z-stackr-train -- \
-    --data /path/to/scenes_unaligned --out models --size m --strategy align --epochs 60
+cargo build --release -p z-stackr-nn --bin stacker-nn-eval
+python scripts/04_eval_alignment.py --scenes-dir data/held_out --model models/batchalign_final.mpk \
+    --eval-binary target/release/stacker-nn-eval --output reports/alignment_eval.json
 ```
 
-This writes `batchalign_latest.mpk` / `batchalign_epoch_NNN.mpk` / `batchalign_final.mpk` plus matching `.json` manifests stamped with the `batchalign-v2` architecture tag — drop the pair into `models/` to make it selectable as a `Neural` alignment model in the GUI/CLI, exactly like a fusion checkpoint.
-
-**Crash-safe checkpointing.** Every `--ckpt-every` steps and at each epoch boundary the trainer writes a rolling `focusmerge_latest.mpk` (plus its `.optim` Adam-moment state) and a `train_state.json`; per-epoch snapshots (`focusmerge_epoch_NNN.mpk`) and a final `focusmerge_final.mpk` are also written. Re-run with `--resume` to pick up after a reboot or crash — model weights, optimiser moments, epoch, and step all restore. Every checkpoint is accompanied by a `.json` manifest so the apps can reconstruct the architecture.
-
-To use a trained model, copy its `.mpk` + `.json` pair into the `models/` folder next to the binary; it then appears in the GUI's model picker and is selectable via `--model` on the CLI.
-
-Capacity presets (channels × context-depth): `xs` 16×2, `s` 24×3, `m` 32×4, `l` 48×6, `xl` 64×9, `xxl` 96×12. Larger presets need more VRAM/compute but capture more; `xl`/`xxl` are intended for the A100.
+For each scene it reports the mean corner error in pixels (also normalised to a 3000 px wide image) of the network alone, of the network plus classical refinement, and of the classical refiner alone, a paired significance test between the last two, the network's wall-clock time, and a pass or fail against the acceptance bars in the script.
 
 ---
 
-## 🧪 Testing
+## Python
 
-The repository includes a comprehensive suite of unit and end-to-end integration tests.
+`crates/stacker-python` builds the Python module `zstackr` (PyPI name `z-stackr`) with [maturin](https://www.maturin.rs/). It exposes the pipeline's two paths: an in-memory path on NumPy arrays (align and fuse a list of images) and the out-of-core file path (stack a folder of files through `stacker_pipeline::tiled`, the same code the CLI runs). Settings are the same keys as in the TOML file. It is a separate Cargo project with its own `[workspace]`, listed under `exclude` in the root `Cargo.toml`, so `cargo test --workspace` never links libpython.
 
-To run all tests across all crates (including the end-to-end tests in `z-stackr-cli`):
 ```bash
-cargo test --all-targets --features akaze
+pip install maturin
+cd crates/stacker-python
+maturin develop --release                   # or: maturin build --release --features gpu,raw
+cd ../..
+cargo test --manifest-path crates/stacker-python/Cargo.toml   # the pure-Rust parts, from the repository root
 ```
-Note: The end-to-end tests will look for images in a `sample/` directory at the project root.
+
+`gpu`, `raw` and `akaze` are opt-in features of the module, as for the apps. The neural modes are not available from Python yet: `alignment_mode = "neural"` falls back to `registration` with a warning. See `crates/stacker-python/README.md` for the API.
 
 ---
 
-## 🤝 Contributing
-Contributions, bug reports, and feature requests are welcome! Feel free to open an issue or submit a pull request.
+## Testing
 
-## 📄 License
-This project is licensed under the MIT License. See `LICENSE.md` for details.
+The repository has unit tests, integration tests, doctests and end-to-end tests of the CLI. Run them on the pinned nightly from the workspace root: `cargo test --workspace --all-features --all-targets` runs everything except the doctests, which need `cargo test --workspace --all-features --doc`. The GPU tests print `SKIPPED` and pass on a machine without an adapter. The Python crate is outside the workspace and is tested with `--manifest-path` (see "Python"). To run one package at a time, `cargo test -p <package>` covers the library tests, the integration tests in `tests/` and the doctests, and does not build the Criterion bench (`harness = false`):
 
-The GUI is built with [Slint](https://slint.dev), used under the
-[Slint Royalty-free Desktop, Mobile, and Web Applications License 2.0](https://github.com/slint-ui/slint/blob/master/LICENSES/LicenseRef-Slint-Royalty-free-2.0.md).
+```bash
+cargo test -p z-stackr-core
+cargo test -p z-stackr-align                      # without the AKAZE / RANSAC tests
+cargo test -p z-stackr-align --features akaze     # the AKAZE / RANSAC tests as well
+cargo test -p z-stackr-algo
+cargo test -p z-stackr-nn                         # default: ndarray + autodiff
+cargo test -p z-stackr-nn --no-default-features --features wgpu,autodiff --no-run   # compile only: running needs a GPU
+cargo test -p z-stackr-pipeline
+cargo test -p z-stackr-pipeline --features akaze
+cargo test -p z-stackr-cli
+cargo test -p z-stackr-cli --features akaze
+cargo test -p z-stackr-gui                        # default features (akaze)
+cargo test -p z-stackr-gui --features nn
+cargo test -p z-stackr-gui --no-default-features
+```
 
-[![Made with Slint](https://raw.githubusercontent.com/slint-ui/slint/master/logo/MadeWithSlint-logo-whitebg.png)](https://slint.dev)
+The lint gate is the same matrix with `cargo clippy ... --tests` (plus `--benches` for `z-stackr-algo`); it must report zero warnings. `.github/workflows/ci.yml` defines both matrices; it has not run on a hosted runner yet.
 
-Optional-feature third-party licenses: RAW support (`raw` feature) uses
-[rawler](https://github.com/dnglab/dnglab/tree/main/rawler) (LGPL-2.1).
+**What the tests write and need**
+
+* Tests write only into the system temp directory (unique per test and process, removed afterwards) or, for the quality metrics, under `target/quality/`; `cargo test` leaves the working tree unchanged.
+* The end-to-end tests (`apps/stacker-cli/tests/e2e_test.rs`) need the committed `sample/` frames. When `sample/` is missing they fail with a message naming the directory; set `Z_STACKR_ALLOW_MISSING_SAMPLE=1` to turn that into an explicit `SKIPPED:` line on stderr.
+* The quality tests against a reference stack (`test_quality_vs_zerene_*` in `apps/stacker-cli/src/pipeline/tests.rs`) are `#[ignore]`d because they take minutes; run them with `cargo test -p z-stackr-cli --features akaze -- --ignored --nocapture test_quality_vs_zerene`. Their SSIM gates (0.40, and 0.30 at low resolution) were set before the alignment-direction fix and have not been re-measured since.
+* The reference image `sample/result/zerene.jpg` is the output of a commercial product and is used only by those quality tests. It stays in the tree until the owner has confirmed that its licence allows redistribution.
+* Wall-clock speed-up checks are `#[ignore]`d too and print timings without asserting on them. The GPU backend tests are not run in CI.
+
+---
+
+## Contributing
+Contributions, bug reports and feature requests are welcome. Open an issue or submit a pull request.
+
+## License
+This project is licensed under either of
+
+* the Apache License, Version 2.0 ([`LICENSE-APACHE`](LICENSE-APACHE)), or
+* the MIT license ([`LICENSE-MIT`](LICENSE-MIT)),
+
+at your option. Every package declares `license = "MIT OR Apache-2.0"`.

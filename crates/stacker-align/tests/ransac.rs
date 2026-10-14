@@ -1,15 +1,28 @@
 #![cfg(feature = "akaze")]
-#![allow(
+#![expect(
     clippy::similar_names,
+    reason = "dx/dy, sx/sy and ox/oy are paired coordinates in the correspondence fixtures"
+)]
+#![expect(
     clippy::suboptimal_flops,
+    reason = "the fixtures spell out the ground-truth transforms as plain multiply-add"
+)]
+#![expect(
     clippy::missing_const_for_fn,
+    reason = "tiny fixture builders; const-ness would only be noise"
+)]
+#![expect(
     clippy::cast_precision_loss,
+    reason = "indices and image sizes in the fixtures are far below 2^24"
+)]
+#![expect(
     clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    reason = "rounded in-range pixel coordinates are converted to indices"
 )]
 
 use akaze::KeyPoint;
-use stacker_align::{akaze_match::Match, ransac::*, transform::warp_image_clamped};
+use stacker_align::{akaze_match::Match, ransac::*, transform::warp_image};
 use stacker_core::{error::StackerError, image::PlanarImage};
 
 /// Build a synthetic `KeyPoint` at `(x, y)`.
@@ -209,7 +222,7 @@ fn test_breathing_scale_recovery_exact_correspondences() {
 /// estimates the forward map `src → dst`.  `warp_image(img, M)` applies
 /// the *inverse* of `M` as the source-lookup (standard inverse-mapping).
 ///
-/// So to correct `target` back toward `reference` we need:
+/// So to correct `target` back toward `reference`:
 ///
 /// - Pairs as `(target_pt, ref_pt)` — i.e. *src = target, dst = reference*.
 /// - Estimator returns `M` mapping `target → reference` (scale ≈ 1/s).
@@ -227,7 +240,6 @@ fn test_breathing_scale_recovery_exact_correspondences() {
 /// - The warp uses bilinear interpolation (a real resampling step).
 /// - The assertion is relative (corrected < uncorrected), not circular.
 #[test]
-
 fn test_breathing_warp_reduces_misalignment() {
     const W: usize = 64;
     const H: usize = 64;
@@ -311,7 +323,7 @@ fn test_breathing_warp_reduces_misalignment() {
 
     // Apply correction: warp_image inverts M_corr, so it samples
     // target at scale*s ≈ 1 — recovering the reference content.
-    let corrected = warp_image_clamped(&target, &m_corr).expect("warp must succeed");
+    let corrected = warp_image(&target, &m_corr).expect("warp must succeed");
 
     // Compare only the interior region (MARGIN-pixel border excluded) that
     // is valid in both images.  `target` has zero-fill at the outer border
@@ -350,12 +362,12 @@ fn test_breathing_warp_reduces_misalignment() {
     );
 }
 
-/// **Regression test: single-application alignment scale (Option B fix)**
+/// **Regression test: single-application alignment scale**
 ///
-/// Verifies that the pipeline's new affine-only alignment path applies the
-/// geometric correction exactly ONCE — not twice as in the previous buggy
-/// code that composed `affine_matrix * breathing_matrix` where BOTH matrices
-/// were estimated from the same raw `KeyPoint` correspondences.
+/// The pipeline's affine-only alignment path applies the geometric correction
+/// exactly ONCE. Composing `affine_matrix * breathing_matrix`, both estimated
+/// from the same raw `KeyPoint` correspondences, would correct twice (scale
+/// `s²`).
 ///
 /// ## Setup
 ///
@@ -365,22 +377,13 @@ fn test_breathing_warp_reduces_misalignment() {
 ///
 /// ## What is asserted
 ///
-/// 1. **Single-application (correct):** `AlignmentEstimator::compute_matrix`
-///    on the raw correspondences returns a matrix whose effective scale
-///    ≈ `s = 1.05` (the forward ref→target magnification).  Warping the
-///    target by this matrix (which internally inverts it) applies scale `1/s`
-///    — a single, correct correction.
-///
-/// 2. **Double-application (old bug):** composing
-///    `affine_matrix * breathing_matrix`, where both were estimated from the
-///    same raw pairs, yields a matrix whose effective scale ≈ `s²`.  The test
-///    explicitly asserts this to document what the bug produced.
-///
-/// 3. The single-application scale `s` must NOT equal `s²` within the tight
-///    tolerance, confirming that the two code paths produce detectably
-///    different results.
+/// 1. `AlignmentEstimator::compute_matrix` on the raw correspondences returns a
+///    matrix whose effective scale is `s` (not `s² = 1.1025`) to within 0.001.
+/// 2. Both that matrix and the breathing estimator's matrix carry every
+///    reference point onto its target point to within 0.01 px, measured with
+///    `apply_h`. A doubled correction would miss by more than 5 px at the far
+///    points, so the property cannot hold for a double apply.
 #[test]
-
 fn test_affine_only_alignment_applies_correction_once_not_twice() {
     let cx = 200.0_f32;
     let cy = 150.0_f32;
@@ -414,7 +417,7 @@ fn test_affine_only_alignment_applies_correction_once_not_twice() {
 
     let (kps0, kps1, matches) = build_correspondences(&pairs);
 
-    // ── Path 1 (Option B — the fix): affine RANSAC on raw correspondences ─
+    // ── Path 1: affine RANSAC on the raw correspondences, applied once ────
     let affine_matrix =
         AlignmentEstimator::compute_matrix(&matches, &kps0, &kps1, AlignmentMode::Affine)
             .expect("affine RANSAC must converge on exact correspondences");
@@ -422,126 +425,38 @@ fn test_affine_only_alignment_applies_correction_once_not_twice() {
     // The affine matrix maps ref→target with scale ≈ s.
     // Its diagonal entries m[0,0] and m[1,1] encode the effective scale
     // (for a pure centre-anchored similarity, both equal s).
-    let affine_scale_x = affine_matrix[(0, 0)];
-    let affine_scale_y = affine_matrix[(1, 1)];
-    // Average diagonal as proxy for the uniform scale component.
-    let affine_scale = (affine_scale_x + affine_scale_y) * 0.5;
+    let affine_scale = f32::midpoint(affine_matrix[(0, 0)], affine_matrix[(1, 1)]);
 
-    // Single application: recovered scale must be ≈ s (not s²).
+    // Single application: recovered scale must be ≈ s (not s² = 1.1025). The
+    // correspondences are exact and the solve is least-squares in f64, so the
+    // only error is the f32 storage of the matrix.
     let single_err = (affine_scale - s).abs();
     assert!(
-        single_err < 0.01,
+        single_err < 0.001,
         "affine-only scale {affine_scale:.5} should be ≈ s={s:.5} (single correction); \
          error={single_err:.5}"
     );
 
-    // ── Path 2 (old bug): compose affine_matrix * breathing_matrix ────────
-    // Both were estimated from the same raw pairs, so both approximate the
-    // same full forward transform.  The composition approximates s².
+    // The proving property: the matrix carries every reference point onto its
+    // target point, i.e. it is the ground-truth forward transform applied ONCE.
+    // A doubled correction would land at s²·(p − c) + c, which is
+    // (s² − s)·|p − c| ≈ 0.0525·|p − c| away — more than 5 px at the far points
+    // of this set — so the tight bound below cannot be met by a double apply.
+    // The breathing estimator, fed the same pairs, must reproduce it too.
     let breathing_est = BreathingCorrector::estimate_from_pairs(&pairs, cx, cy)
         .expect("breathing estimator must converge on exact correspondences");
     let breathing_matrix = BreathingCorrector::build_matrix(&breathing_est, cx, cy);
-
-    let composed_buggy = affine_matrix * breathing_matrix;
-    // For a pure-scale similarity, the composed scale ≈ s * s = s².
-    let composed_scale_x = composed_buggy[(0, 0)];
-    let composed_scale_y = composed_buggy[(1, 1)];
-    let composed_scale = (composed_scale_x + composed_scale_y) * 0.5;
-
-    let s_sq = s * s;
-    let double_err = (composed_scale - s_sq).abs();
-    assert!(
-        double_err < 0.02,
-        "composed (buggy) scale {composed_scale:.5} should be ≈ s²={s_sq:.5} \
-         (double correction); error={double_err:.5}"
-    );
-
-    // ── The two paths must be detectably different ──────────────────────
-    // s=1.05, s²=1.1025 — difference is 0.0525, well above any rounding.
-    let path_diff = (affine_scale - composed_scale).abs();
-    assert!(
-        path_diff > 0.04,
-        "single-correction scale ({affine_scale:.5}) and double-correction scale \
-         ({composed_scale:.5}) must differ by > 0.04; got diff={path_diff:.5}"
-    );
-
-    // Explicit confirmation: the single path does NOT produce s².
-    assert!(
-        (affine_scale - s_sq).abs() > 0.04,
-        "affine-only scale ({affine_scale:.5}) must NOT be ≈ s²={s_sq:.5} \
-         (that would indicate the double-apply bug is still present)"
-    );
-}
-
-/// **Regression test for the 1-inlier acceptance bug.** `TranslationOnly`'s
-/// minimal RANSAC sample is a single correspondence, so before the
-/// `min_inliers` support requirement was added, a model fitted to exactly
-/// one spurious match could be accepted outright. With 20 pairs where 18
-/// are consistent with a known translation and 2 are wild outliers, the
-/// estimator must recover the true translation using the majority support.
-#[test]
-fn test_translation_only_recovers_with_majority_inliers_and_two_outliers() {
-    let tx = 12.0_f32;
-    let ty = -7.0_f32;
-
-    let mut raw: Vec<(f32, f32, f32, f32)> = (0..18_usize)
-        .map(|i| {
-            let sx = 10.0 + i as f32 * 14.0;
-            let sy = 20.0 + (i % 6) as f32 * 17.0;
-            (sx, sy, sx + tx, sy + ty)
-        })
-        .collect();
-
-    // 2 wild outliers, inconsistent with the translation model.
-    raw.push((15.0, 15.0, 400.0, -300.0));
-    raw.push((60.0, 200.0, -250.0, 500.0));
-
-    let (kps0, kps1, matches) = build_correspondences(&raw);
-
-    let m =
-        AlignmentEstimator::compute_matrix(&matches, &kps0, &kps1, AlignmentMode::TranslationOnly)
-            .expect("should recover the majority-supported translation despite 2 outliers");
-
-    let err_x = (m[(0, 2)] - tx).abs();
-    let err_y = (m[(1, 2)] - ty).abs();
-    assert!(err_x < 0.5, "tx error {err_x} too large");
-    assert!(err_y < 0.5, "ty error {err_y} too large");
-}
-
-/// **Regression test for the 1-inlier acceptance bug (negative case).**
-/// With 20 pairs of pure random noise (no consistent translation model
-/// underlies the data), `TranslationOnly` must return `Err` rather than
-/// accepting whatever single-match translation happened to win the RANSAC
-/// loop. This is the core regression test: before the `min_inliers` support
-/// requirement, a `TranslationOnly` model needs support from only 1 match
-/// (its own minimal sample) to be accepted, so pure noise would still
-/// spuriously "succeed".
-#[test]
-fn test_translation_only_rejects_pure_noise() {
-    // Deterministic pseudo-random destinations that share no consistent
-    // translation model with the sources (each pair's implied translation
-    // is wildly different from every other pair's).
-    let raw: Vec<(f32, f32, f32, f32)> = (0..20_usize)
-        .map(|i| {
-            let fi = i as f32;
-            let sx = 10.0 + fi * 13.7;
-            let sy = 20.0 + (fi * 7.3) % 200.0;
-            // Destination jitter is large and non-uniform across pairs, so
-            // no single translation explains more than a handful of them.
-            let dx = (fi * 97.0) % 500.0;
-            let dy = (fi * 53.0) % 400.0;
-            (sx, sy, dx, dy)
-        })
-        .collect();
-
-    let (kps0, kps1, matches) = build_correspondences(&raw);
-
-    let result =
-        AlignmentEstimator::compute_matrix(&matches, &kps0, &kps1, AlignmentMode::TranslationOnly);
-    assert!(
-        matches!(result, Err(StackerError::AlignmentFailed(_))),
-        "pure noise correspondences must not produce an accepted translation model, got {result:?}"
-    );
+    for &(sx, sy, dx, dy) in &pairs {
+        for (name, m) in [("affine", &affine_matrix), ("breathing", &breathing_matrix)] {
+            let (px, py) = apply_h(m, sx, sy).expect("a similarity has a finite divisor");
+            let err = (px - dx).hypot(py - dy);
+            assert!(
+                err < 0.01,
+                "{name} matrix maps ({sx}, {sy}) to ({px:.4}, {py:.4}) but the target point is \
+                 ({dx:.4}, {dy:.4}); error {err:.4} px"
+            );
+        }
+    }
 }
 
 /// Sanity check: fewer than 2 correspondences must return an error.
@@ -576,7 +491,6 @@ fn test_breathing_too_few_pairs_errors() {
 ///   by more than the RANSAC tolerance, confirming the outliers do pollute
 ///   the naïve solution and the RANSAC is doing real work.
 #[test]
-
 fn test_breathing_ransac_robust_to_outliers() {
     let cx = 200.0_f32;
     let cy = 150.0_f32;
@@ -677,4 +591,151 @@ fn test_breathing_ransac_robust_to_outliers() {
         "plain LSQ scale error ({lsq_scale_err:.5}) is suspiciously small; \
          outliers should pull it beyond 0.003"
     );
+}
+
+/// `total` correspondences, `inliers` of them following the shift `(10, 5)`
+/// exactly, the rest gross outliers whose displacements are pairwise more than
+/// 10 px apart in x (so no two outliers can corroborate the same translation
+/// model, whose inlier threshold is 3 px) and far from the true shift.
+fn contaminated_shift_pairs(total: usize, inliers: usize) -> Vec<(f32, f32, f32, f32)> {
+    (0..total)
+        .map(|i| {
+            let sx = ((i * 37) % 211) as f32 + 5.0;
+            let sy = ((i * 53) % 173) as f32 + 7.0;
+            if i < inliers {
+                (sx, sy, sx + 10.0, sy + 5.0)
+            } else {
+                let k = (i - inliers) as f32;
+                (sx, sy, sx + 40.0 + 11.0 * k, sy - 150.0 + 17.0 * (k % 7.0))
+            }
+        })
+        .collect()
+}
+
+/// D8: a model is accepted only with `max(min_sample + 2, ceil(0.2 * n))`
+/// inliers (capped at 50). 15 inliers in 100 matches is below the 20 needed.
+#[test]
+fn test_ransac_rejects_fifteen_percent_inliers() {
+    let raw = contaminated_shift_pairs(100, 15);
+    let (kps0, kps1, matches) = build_correspondences(&raw);
+    let result =
+        AlignmentEstimator::compute_matrix(&matches, &kps0, &kps1, AlignmentMode::TranslationOnly);
+    assert!(
+        matches!(result, Err(StackerError::AlignmentFailed(_))),
+        "15 % inliers must be rejected, got {result:?}"
+    );
+}
+
+/// 30 inliers in 100 matches clears the 20 needed and recovers the shift.
+#[test]
+fn test_ransac_accepts_thirty_percent_inliers() {
+    let raw = contaminated_shift_pairs(100, 30);
+    let (kps0, kps1, matches) = build_correspondences(&raw);
+    let m =
+        AlignmentEstimator::compute_matrix(&matches, &kps0, &kps1, AlignmentMode::TranslationOnly)
+            .expect("30 % inliers must be accepted");
+    assert!((m[(0, 2)] - 10.0).abs() < 0.01, "tx = {}", m[(0, 2)]);
+    assert!((m[(1, 2)] - 5.0).abs() < 0.01, "ty = {}", m[(1, 2)]);
+}
+
+/// The cap: with 400 matches the requirement is 50, not 80, so 60 clean
+/// inliers (15 %) are accepted.
+#[test]
+fn test_ransac_requirement_is_capped_at_fifty() {
+    let raw = contaminated_shift_pairs(400, 60);
+    let (kps0, kps1, matches) = build_correspondences(&raw);
+    let m =
+        AlignmentEstimator::compute_matrix(&matches, &kps0, &kps1, AlignmentMode::TranslationOnly)
+            .expect("60 inliers exceed the cap of 50");
+    assert!((m[(0, 2)] - 10.0).abs() < 0.01, "tx = {}", m[(0, 2)]);
+}
+
+/// The breathing estimator applies the same floor: 15 % inliers rejected.
+#[test]
+fn test_breathing_rejects_fifteen_percent_inliers() {
+    let (cx, cy, s) = (120.0_f32, 90.0_f32, 1.03_f32);
+    let pairs: Vec<(f32, f32, f32, f32)> = (0..100_usize)
+        .map(|i| {
+            let sx = ((i * 37) % 211) as f32 + 5.0;
+            let sy = ((i * 53) % 173) as f32 + 7.0;
+            if i < 15 {
+                (sx, sy, s * (sx - cx) + cx, s * (sy - cy) + cy)
+            } else {
+                let k = (i - 15) as f32;
+                (sx, sy, sx + 40.0 + 11.0 * k, sy - 150.0 + 17.0 * (k % 7.0))
+            }
+        })
+        .collect();
+    let result = BreathingCorrector::estimate_from_pairs(&pairs, cx, cy);
+    assert!(
+        matches!(result, Err(StackerError::AlignmentFailed(_))),
+        "15 % inliers must be rejected, got {result:?}"
+    );
+}
+
+/// The breathing estimator accepts 30 % inliers and recovers the scale.
+#[test]
+fn test_breathing_accepts_thirty_percent_inliers() {
+    let (cx, cy, s) = (120.0_f32, 90.0_f32, 1.03_f32);
+    let pairs: Vec<(f32, f32, f32, f32)> = (0..100_usize)
+        .map(|i| {
+            let sx = ((i * 37) % 211) as f32 + 5.0;
+            let sy = ((i * 53) % 173) as f32 + 7.0;
+            if i < 30 {
+                (sx, sy, s * (sx - cx) + cx, s * (sy - cy) + cy)
+            } else {
+                let k = (i - 30) as f32;
+                (sx, sy, sx + 40.0 + 11.0 * k, sy - 150.0 + 17.0 * (k % 7.0))
+            }
+        })
+        .collect();
+    let est = BreathingCorrector::estimate_from_pairs(&pairs, cx, cy)
+        .expect("30 % inliers must be accepted");
+    assert!((est.scale - s).abs() < 0.001, "scale = {}", est.scale);
+}
+
+/// Project `(x, y)` through a homography given as row-major `[f32; 9]`.
+fn project(h: &[f32; 9], x: f32, y: f32) -> (f32, f32) {
+    let w = h[6] * x + h[7] * y + h[8];
+    (
+        (h[0] * x + h[1] * y + h[2]) / w,
+        (h[3] * x + h[4] * y + h[5]) / w,
+    )
+}
+
+/// ALN-4: the minimal four-pair sample gives an 8 × 9 DLT design matrix, whose
+/// thin SVD has no row 8 in `Vᵀ`.  `Homography` mode used to panic on its first
+/// hypothesis; it must now return `Ok` and reproject within 1e-3 px.
+#[test]
+fn test_homography_with_exactly_four_pairs_does_not_panic() {
+    let h = [
+        1.02_f32, 0.01, 5.0, //
+        -0.01, 0.99, -3.0, //
+        1.0e-5, 2.0e-5, 1.0,
+    ];
+    let src = [
+        (10.0_f32, 20.0_f32),
+        (300.0, 15.0),
+        (290.0, 220.0),
+        (25.0, 240.0),
+    ];
+    let raw: Vec<(f32, f32, f32, f32)> = src
+        .iter()
+        .map(|&(sx, sy)| {
+            let (dx, dy) = project(&h, sx, sy);
+            (sx, sy, dx, dy)
+        })
+        .collect();
+    let (kps0, kps1, matches) = build_correspondences(&raw);
+
+    let m = AlignmentEstimator::compute_matrix(&matches, &kps0, &kps1, AlignmentMode::Homography)
+        .expect("four exact homography correspondences must give Ok");
+
+    for &(sx, sy, dx, dy) in &raw {
+        let (px, py) = apply_h(&m, sx, sy).expect("non-degenerate projection");
+        assert!(
+            (px - dx).abs() < 1.0e-3 && (py - dy).abs() < 1.0e-3,
+            "({sx},{sy}) reprojects to ({px},{py}), expected ({dx},{dy})"
+        );
+    }
 }

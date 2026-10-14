@@ -1,0 +1,222 @@
+import { Button, ScrollView } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+
+// One block of the manual. `kind` is "h1", "h2", "h3", "p", "li" (a bullet) or
+// "code" (a preformatted line). Rust (`gui/help.rs`) parses `docs/manual.md`
+// into these at start-up, so the manual is one Markdown file and no shell or
+// external viewer is involved.
+export struct ManualBlock {
+    kind: string,
+    text: string,
+}
+
+export global ManualModel {
+    // Help > Manual (F1).
+    in-out property <bool> open: false;
+    // Help > About.
+    in-out property <bool> about-open: false;
+    in-out property <[ManualBlock]> blocks;
+    // Pushed from Rust (`CARGO_PKG_VERSION`, `CARGO_PKG_LICENSE`).
+    in-out property <string> version: "";
+    in-out property <string> licence: "";
+
+    public function close() {
+        open = false;
+    }
+    public function close-about() {
+        about-open = false;
+    }
+}
+
+// The manual: a scrollable card over the window. Esc, Return, Close and a click
+// outside the card close it; other keys are swallowed so the window's shortcuts
+// cannot act underneath. Mounted while `ManualModel.open`.
+export component ManualDialog inherits Rectangle {
+    background: Theme.overlay-backdrop;
+
+    FocusScope {
+        width: 100%;
+        height: 100%;
+        init => { self.focus(); }
+        key-pressed(event) => {
+            if event.text == Key.Escape || event.text == Key.Return {
+                ManualModel.close();
+            } else if event.text == Key.Tab {
+                return reject;
+            }
+            return accept;
+        }
+
+        TouchArea {
+            clicked => { ManualModel.close(); }
+        }
+
+        Rectangle {
+            width: min(680px, parent.width - 2 * Theme.space-xl);
+            height: min(680px, parent.height - 2 * Theme.space-xl);
+            background: Theme.surface-dialog;
+            border-radius: Theme.radius-md;
+            border-width: Theme.hairline;
+            border-color: Theme.border-dialog;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: Theme.modal-shadow;
+            clip: true;
+
+            TouchArea {}
+
+            VerticalLayout {
+                padding: Theme.space-lg;
+                spacing: Theme.space-sm;
+
+                HorizontalLayout {
+                    Text {
+                        horizontal-stretch: 1;
+                        text: "z-stackr manual";
+                        font-size: Theme.font-label;
+                        font-weight: 700;
+                        color: Theme.text-strong;
+                    }
+                    Rectangle {
+                        width: 22px;
+                        height: 22px;
+                        border-radius: Theme.radius-sm;
+                        background: close-touch.has-hover ? Theme.bg-hover : transparent;
+                        close-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            accessible-role: button;
+                            accessible-label: "Close dialog";
+                            accessible-action-default => { ManualModel.close(); }
+                            clicked => { ManualModel.close(); }
+                        }
+                        Text {
+                            text: "\u{2715}";
+                            font-size: Theme.font-sm;
+                            color: Theme.text-muted;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                Rectangle { height: Theme.hairline; background: Theme.border-subtle; }
+
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        spacing: Theme.space-xs;
+                        padding-right: Theme.space-md;
+                        // A short page stays at the top instead of being spread out.
+                        alignment: start;
+                        for block in ManualModel.blocks: VerticalLayout {
+                            padding-top: block.kind == "h1" ? 0px : (block.kind == "h2" ? Theme.space-md : (block.kind == "h3" ? Theme.space-sm : 0px));
+                            Text {
+                                text: block.kind == "li" ? "\u{2022}  " + block.text : block.text;
+                                font-size: block.kind == "h1" ? Theme.font-title
+                                    : (block.kind == "h2" ? Theme.font-lg
+                                    : (block.kind == "h3" ? Theme.font-md : Theme.font-sm));
+                                font-weight: (block.kind == "h1" || block.kind == "h2" || block.kind == "h3") ? 700 : 400;
+                                font-family: block.kind == "code" ? "Consolas" : "";
+                                color: block.kind == "h1" ? Theme.text-strong
+                                    : (block.kind == "h2" ? Theme.accent
+                                    : (block.kind == "h3" ? Theme.text-primary
+                                    : (block.kind == "code" ? Theme.accent-result : Theme.text-secondary)));
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    Button {
+                        text: "Close";
+                        primary: true;
+                        clicked => { ManualModel.close(); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The About card: name, version, licence. Mounted while `ManualModel.about-open`;
+// Esc, Return, Close and a click outside close it.
+export component AboutDialog inherits Rectangle {
+    background: Theme.overlay-backdrop;
+
+    FocusScope {
+        width: 100%;
+        height: 100%;
+        init => { self.focus(); }
+        key-pressed(event) => {
+            if event.text == Key.Escape || event.text == Key.Return {
+                ManualModel.close-about();
+            } else if event.text == Key.Tab {
+                return reject;
+            }
+            return accept;
+        }
+
+        TouchArea {
+            clicked => { ManualModel.close-about(); }
+        }
+
+        Rectangle {
+            width: min(380px, parent.width - 2 * Theme.space-xl);
+            height: about-content.preferred-height;
+            background: Theme.surface-dialog;
+            border-radius: Theme.radius-md;
+            border-width: Theme.hairline;
+            border-color: Theme.border-dialog;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: Theme.modal-shadow;
+            clip: true;
+
+            TouchArea {}
+
+            about-content := VerticalLayout {
+                padding: Theme.space-xl;
+                spacing: Theme.space-sm;
+
+                Text {
+                    text: "z-stackr";
+                    font-size: Theme.font-xl;
+                    font-weight: 700;
+                    color: Theme.text-strong;
+                }
+                Text {
+                    text: "Version " + ManualModel.version;
+                    font-size: Theme.font-md;
+                    color: Theme.accent;
+                }
+                Text {
+                    text: "Focus stacking: aligns a series of photographs taken at different focus distances and fuses their sharp regions into one image (Apex, Relief, Strata, or the optional AI mode).";
+                    font-size: Theme.font-sm;
+                    color: Theme.text-secondary;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Licence: " + ManualModel.licence;
+                    font-size: Theme.font-sm;
+                    color: Theme.text-secondary;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Open Help > Manual for the full description, and Help > Keyboard Shortcuts for the key list.";
+                    font-size: Theme.font-xs;
+                    color: Theme.text-dim;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    padding-top: Theme.space-sm;
+                    alignment: end;
+                    Button {
+                        text: "Close";
+                        primary: true;
+                        clicked => { ManualModel.close-about(); }
+                    }
+                }
+            }
+        }
+    }
+}

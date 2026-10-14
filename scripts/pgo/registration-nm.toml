@@ -1,0 +1,8 @@
+# Settings for the PGO workload (scripts/pgo-workload.sh / .ps1): registration with the
+# Nelder-Mead simplex (the coarse-biased level schedule and the full-resolution polish), the
+# only optimiser the browser build and the GPU objective use.
+settings_version = 2
+alignment_mode = "registration"
+optimizer = "neldermead"
+bounded_search = true
+correct_brightness = true

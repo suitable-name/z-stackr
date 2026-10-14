@@ -1,0 +1,37 @@
+[package]
+name = "z-stackr-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# Keep the crate identifier `stacker_gpu` (the package is `z-stackr-gpu`).
+name = "stacker_gpu"
+
+[dependencies]
+z-stackr-core = { workspace = true }
+wgpu = { workspace = true }
+# `extern_crate_alloc` for `pod_collect_to_vec`, the unaligned-safe copy of a readback.
+bytemuck = { workspace = true, features = ["extern_crate_alloc"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# The async readback hands the mapping result over a oneshot channel; it works
+# on wasm32, where nothing may block.
+futures-channel = { version = "0.3", default-features = false, features = ["std"] }
+
+# Blocking on a device request or a readback is native only; the browser drives
+# the futures itself. wgpu's `webgpu` feature (the WebGPU backend on wasm32) is
+# one of its defaults in 23.0.1, which the workspace keeps.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = { workspace = true }
+
+[dev-dependencies]
+# The CPU reference the kernels are checked and timed against.
+z-stackr-algo = { workspace = true }
+z-stackr-align = { workspace = true }
+rayon = { workspace = true }
+# Validates the WGSL without a GPU (the build never does).
+naga = { version = "23.1", features = ["wgsl-in"] }
+
+[lints]
+workspace = true

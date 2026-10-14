@@ -1,0 +1,29 @@
+// State for the transient UI layers mounted in `app.slint`: the toast and the
+// confirmation dialog. Both default to closed; the Rust side opens them by setting
+// the properties and listens to the callbacks for the user's decision.
+export global DialogModel {
+    // ── Toast ────────────────────────────────────────────────────────────────
+    in-out property <bool> toast-visible: false;
+    in-out property <string> toast-text: "";
+    // "info", "success", "warning" or "error". Warnings and errors should not be
+    // auto-dismissed by the Rust side: they report something the user must read.
+    in-out property <string> toast-kind: "info";
+    callback toast-dismissed();
+
+    // ── Confirmation dialog ──────────────────────────────────────────────────
+    in-out property <bool> confirm-open: false;
+    // Identifies WHAT is being confirmed, so one Rust handler can serve several
+    // confirmations ("clear-files", "discard-retouch", ...). Passed back unchanged
+    // by the callbacks below.
+    in-out property <string> confirm-action: "";
+    in-out property <string> confirm-heading: "Please confirm";
+    in-out property <string> confirm-message: "";
+    // An empty label hides that button; "Cancel" is always present.
+    in-out property <string> confirm-primary-label: "OK";
+    in-out property <string> confirm-secondary-label: "";
+    in-out property <string> confirm-tertiary-label: "";
+    callback confirm-primary(string);
+    callback confirm-secondary(string);
+    callback confirm-tertiary(string);
+    callback confirm-cancel(string);
+}

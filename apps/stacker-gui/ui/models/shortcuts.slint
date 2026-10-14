@@ -1,0 +1,18 @@
+// The keyboard-shortcut table shown by the shortcut overlay. `context` groups the
+// rows ("Global" or "Image view"). The key handler in `app.slint` implements these
+// bindings; keep the two in step.
+export struct ShortcutItem {
+    keys: string,
+    action: string,
+    context: string,
+}
+
+export global ShortcutsModel {
+    in-out property <bool> open: false;
+    // Filled by Rust at start-up from the shortcut table.
+    in-out property <[ShortcutItem]> shortcuts: [];
+
+    public function close() {
+        open = false;
+    }
+}

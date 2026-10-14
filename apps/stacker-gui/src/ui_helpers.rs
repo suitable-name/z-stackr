@@ -1,231 +1,180 @@
-use std::path::PathBuf;
+//! Moving values between the Rust state and the Slint models: the source and
+//! result lists and the settings dialog.
 
-use slint::{ModelRc, SharedString, VecModel};
+use std::{path::PathBuf, rc::Rc};
 
-use crate::{
-    App,
-    mem_estimate::{estimate_peak_bytes, format_bytes, total_system_memory_bytes},
-    settings::{
-        AlignmentModeSetting, ImageSavingSettings, OptimizerSetting, OutputFormat,
-        PreprocessingSettings, StackingSettings,
+use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
+use stacker_gui::{
+    settings::StackingSettings,
+    settings_contract::{
+        SettingsValues, alignment_options, compute_device_options, optimizer_options,
+        output_format_options, tile_size_options,
     },
 };
 
+use crate::{App, SettingsModel};
+
 // ── Slint list helpers ────────────────────────────────────────────────────────
 
-pub fn update_source_list(app: &App, paths: &[PathBuf]) {
-    let display_names: Vec<SharedString> = paths
+fn display_names(paths: &[PathBuf]) -> ModelRc<SharedString> {
+    let names: Vec<SharedString> = paths
         .iter()
         .map(|f| SharedString::from(f.file_name().unwrap_or_default().to_string_lossy().as_ref()))
         .collect();
-    app.set_loaded_files(ModelRc::from(std::rc::Rc::new(VecModel::from(
-        display_names,
-    ))));
-    // No culling applied here — reset the parallel flags model so a
-    // previously-marked list (from a Cull run / cached Cull application)
-    // doesn't leave stale "culled" marks on an unrelated file-list update
-    // (e.g. Open Files, Remove, drag-reorder).
-    app.set_loaded_files_culled(ModelRc::from(std::rc::Rc::new(VecModel::from(vec![
-        false;
-        paths
-            .len(
-            )
-    ]))));
-    update_memory_estimate(app, paths);
+    ModelRc::from(std::rc::Rc::new(VecModel::from(names)))
 }
 
-/// Recomputes the "Est. peak memory" line shown under the source-file list
-/// and flags `memory-warning` when the estimate exceeds total system RAM.
-///
-/// This estimate is for the GUI's default in-RAM path (`tile_size == 0`).
-/// When the user sets `tile_size > 0` in Settings, the Stack handler switches
-/// to the shared out-of-core `stacker_pipeline::run_pipeline` engine instead
-/// (see `main.rs::on_request_stack`), whose peak memory scales with tile
-/// area rather than stack size — this estimate does not apply to that mode.
-pub fn update_memory_estimate(app: &App, paths: &[PathBuf]) {
-    let tile_size = app.get_set_tile_size();
-    if tile_size > 0.0 {
-        app.set_memory_estimate_text(SharedString::from(
-            "Est. peak memory: bounded (tiled processing)",
-        ));
-        app.set_memory_warning(false);
-        return;
-    }
-
-    // Cheap header-only dimension read of the first frame — good enough for
-    // an order-of-magnitude estimate, since every frame in a real focus
-    // stack comes from the same sensor and is the same size.
-    let Some((w, h)) = paths.iter().find_map(|p| image::image_dimensions(p).ok()) else {
-        app.set_memory_estimate_text(SharedString::new());
-        app.set_memory_warning(false);
-        return;
-    };
-
-    let akaze = app.get_set_akaze_seeding();
-    let estimate = estimate_peak_bytes(paths.len(), w, h, akaze);
-    let total = total_system_memory_bytes();
-    let warn = total.is_some_and(|t| estimate > t);
-    let text = total.map_or_else(
-        || format!("Est. peak memory: ~{}", format_bytes(estimate)),
-        |t| {
-            let suffix = if warn {
-                " — may exceed available RAM"
-            } else {
-                ""
-            };
-            format!(
-                "Est. peak memory: ~{} (system RAM: {}){suffix}",
-                format_bytes(estimate),
-                format_bytes(t)
-            )
-        },
-    );
-    app.set_memory_warning(warn);
-    app.set_memory_estimate_text(SharedString::from(text));
+/// Show `paths` in the sidebar's source list and keep `has-images` and
+/// `frame-count` in step with it.
+pub fn push_source_panel(app: &App, paths: &[PathBuf]) {
+    app.set_loaded_files(display_names(paths));
+    app.set_has_images(!paths.is_empty());
+    app.set_frame_count(i32::try_from(paths.len()).unwrap_or(i32::MAX));
 }
 
-/// Like [`update_source_list`], but also populates the parallel
-/// `loaded-files-culled` flags model.
-///
-/// Used after the Cull button runs, or after Stack applies a cached Cull
-/// result. The Slint side (`Sidebar`'s file-list `for`) renders a `true`
-/// entry dimmed with a "(culled)" suffix; this function only supplies plain
-/// display names plus the flags. `culled` is compared by path against
-/// `paths`, not by index, so it is robust to any prior manual reordering of
-/// `paths` relative to when the culled set was computed.
-pub fn update_source_list_marked(app: &App, paths: &[PathBuf], culled: &[PathBuf]) {
-    let display_names: Vec<SharedString> = paths
-        .iter()
-        .map(|f| SharedString::from(f.file_name().unwrap_or_default().to_string_lossy().as_ref()))
-        .collect();
-    let culled_flags: Vec<bool> = paths.iter().map(|f| culled.contains(f)).collect();
-    app.set_loaded_files(ModelRc::from(std::rc::Rc::new(VecModel::from(
-        display_names,
-    ))));
-    app.set_loaded_files_culled(ModelRc::from(std::rc::Rc::new(VecModel::from(
-        culled_flags,
-    ))));
-    update_memory_estimate(app, paths);
-}
-
+/// Show `paths` in the sidebar's result list.
 pub fn update_result_list(app: &App, paths: &[PathBuf]) {
-    let display_names: Vec<SharedString> = paths
-        .iter()
-        .map(|f| SharedString::from(f.file_name().unwrap_or_default().to_string_lossy().as_ref()))
-        .collect();
-    app.set_result_files(ModelRc::from(std::rc::Rc::new(VecModel::from(
-        display_names,
-    ))));
+    app.set_result_files(display_names(paths));
 }
 
-// ── Settings → UI helpers ─────────────────────────────────────────────────────
+// ── Settings ↔ SettingsModel ──────────────────────────────────────────────────
+//
+// The pure mapping lives in `stacker_gui::settings_contract`; these functions
+// only move a `SettingsValues` between the Slint global and Rust, one property
+// per field, in exactly one place.
 
-/// Push every field of `s` into the App's `set-*` properties.
-///
-/// The slider-bound settings are stored as `float` in the Slint component.
-/// All values fit in f32 exactly: the largest integer field is `relief_estimation_radius`
-/// capped at 100, well within the 23-bit mantissa.
+/// A Slint string model holding `items`.
+fn string_model(items: &[&str]) -> ModelRc<SharedString> {
+    let items: Vec<SharedString> = items.iter().map(|s| SharedString::from(*s)).collect();
+    ModelRc::from(Rc::new(VecModel::from(items)))
+}
+
+/// Fill the combo-box entry lists the first time; later pushes leave them alone
+/// so an open combo box is not rebuilt under the user's cursor.
+fn push_option_lists(model: &SettingsModel<'_>) {
+    if model.get_alignment_options().row_count() == 0 {
+        model.set_alignment_options(string_model(&alignment_options()));
+    }
+    if model.get_optimizer_options().row_count() == 0 {
+        model.set_optimizer_options(string_model(&optimizer_options()));
+    }
+    if model.get_tile_size_options().row_count() == 0 {
+        let labels = tile_size_options();
+        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+        model.set_tile_size_options(string_model(&labels));
+    }
+    if model.get_compute_device_options().row_count() == 0 {
+        model.set_compute_device_options(string_model(&compute_device_options()));
+    }
+    if model.get_output_format_options().row_count() == 0 {
+        model.set_output_format_options(string_model(&output_format_options()));
+    }
+}
+
+/// Write `values` into the `SettingsModel` properties (no `settings-edited` is
+/// fired: this is the program changing the dialog, not the user).
+pub fn push_settings_values(app: &App, values: &SettingsValues) {
+    let model = app.global::<SettingsModel>();
+    push_option_lists(&model);
+
+    model.set_alignment(values.alignment.as_str().into());
+    model.set_optimizer(values.optimizer.as_str().into());
+    model.set_bounded_search(values.bounded_search);
+    model.set_akaze_seeding(values.akaze_seeding);
+    model.set_correct_brightness(values.correct_brightness);
+    model.set_chain_alignment(values.chain_alignment);
+    model.set_neural_refine_classically(values.neural_refine_classically);
+    model.set_auto_cull(values.auto_cull);
+    model.set_auto_cull_threshold_pct(values.auto_cull_threshold_pct);
+    model.set_sort_by_sharpness(values.sort_by_sharpness);
+    model.set_stack_every_nth(values.stack_every_nth);
+
+    model.set_pyramid_levels(values.pyramid_levels);
+    model.set_use_all_color_channels(values.use_all_color_channels);
+    model.set_grit_suppression(values.grit_suppression);
+    model.set_compute_device(values.compute_device.as_str().into());
+    model.set_tile_size(values.tile_size.as_str().into());
+
+    model.set_relief_estimation_radius(values.relief_estimation_radius);
+    model.set_relief_smoothing_radius(values.relief_smoothing_radius);
+    model.set_relief_contrast_pct(values.relief_contrast_pct);
+    model.set_relief_show_preview(values.relief_show_preview);
+    model.set_relief_auto_detect(values.relief_auto_detect);
+    model.set_relief_use_multigrid(values.relief_use_multigrid);
+
+    model.set_strata_base_radius(values.strata_base_radius);
+    model.set_strata_detail_focus(values.strata_detail_focus);
+    model.set_crop_to_common_area(values.crop_to_common_area);
+    model.set_resize_cropped_to_original(values.resize_cropped_to_original);
+
+    model.set_pre_rotation(values.pre_rotation);
+    model.set_pre_crop_enabled(values.pre_crop_enabled);
+    model.set_pre_crop_spec(values.pre_crop_spec.as_str().into());
+    model.set_pre_resize_percent(values.pre_resize_percent);
+    model.set_sort_reverse(values.sort_reverse);
+    model.set_ignore_exif(values.ignore_exif);
+
+    model.set_output_format(values.output_format.as_str().into());
+    model.set_bit_depth(values.bit_depth);
+    model.set_jpeg_quality(values.jpeg_quality);
+    model.set_filename_template(values.filename_template.as_str().into());
+    model.set_default_output_dir(values.default_output_dir.as_str().into());
+    model.set_copy_metadata(values.copy_metadata);
+}
+
+/// Read every `SettingsModel` property.
+#[must_use]
+pub fn read_settings_values(app: &App) -> SettingsValues {
+    let model = app.global::<SettingsModel>();
+    SettingsValues {
+        alignment: model.get_alignment().to_string(),
+        optimizer: model.get_optimizer().to_string(),
+        bounded_search: model.get_bounded_search(),
+        akaze_seeding: model.get_akaze_seeding(),
+        correct_brightness: model.get_correct_brightness(),
+        chain_alignment: model.get_chain_alignment(),
+        neural_refine_classically: model.get_neural_refine_classically(),
+        auto_cull: model.get_auto_cull(),
+        auto_cull_threshold_pct: model.get_auto_cull_threshold_pct(),
+        sort_by_sharpness: model.get_sort_by_sharpness(),
+        stack_every_nth: model.get_stack_every_nth(),
+        pyramid_levels: model.get_pyramid_levels(),
+        use_all_color_channels: model.get_use_all_color_channels(),
+        grit_suppression: model.get_grit_suppression(),
+        relief_estimation_radius: model.get_relief_estimation_radius(),
+        relief_smoothing_radius: model.get_relief_smoothing_radius(),
+        relief_contrast_pct: model.get_relief_contrast_pct(),
+        relief_show_preview: model.get_relief_show_preview(),
+        relief_auto_detect: model.get_relief_auto_detect(),
+        relief_use_multigrid: model.get_relief_use_multigrid(),
+        strata_base_radius: model.get_strata_base_radius(),
+        strata_detail_focus: model.get_strata_detail_focus(),
+        crop_to_common_area: model.get_crop_to_common_area(),
+        resize_cropped_to_original: model.get_resize_cropped_to_original(),
+        compute_device: model.get_compute_device().to_string(),
+        tile_size: model.get_tile_size().to_string(),
+        pre_rotation: model.get_pre_rotation(),
+        pre_crop_enabled: model.get_pre_crop_enabled(),
+        pre_crop_spec: model.get_pre_crop_spec().to_string(),
+        pre_resize_percent: model.get_pre_resize_percent(),
+        sort_reverse: model.get_sort_reverse(),
+        ignore_exif: model.get_ignore_exif(),
+        output_format: model.get_output_format().to_string(),
+        bit_depth: model.get_bit_depth(),
+        jpeg_quality: model.get_jpeg_quality(),
+        filename_template: model.get_filename_template().to_string(),
+        default_output_dir: model.get_default_output_dir().to_string(),
+        copy_metadata: model.get_copy_metadata(),
+    }
+}
+
+/// Show `s` in the settings dialog.
 pub fn push_settings_to_ui(app: &App, s: &StackingSettings) {
-    // ── Existing fields ───────────────────────────────────────────────────
-    app.set_set_alignment(SharedString::from(s.alignment_mode.as_combo_str()));
-    app.set_set_optimizer(SharedString::from(s.optimizer.as_combo_str()));
-    app.set_set_akaze_seeding(s.akaze_seeding);
-    app.set_set_neural_refine_classically(s.neural_refine_classically);
-    app.set_set_correct_brightness(s.correct_brightness);
-    app.set_set_auto_cull(s.auto_cull);
-    app.set_set_sort_by_sharpness(s.sort_by_sharpness);
-    app.set_set_auto_cull_threshold_pct(s.auto_cull_threshold_pct);
-    app.set_set_crop_to_common_area(s.crop_to_common_area);
-    app.set_set_resize_cropped_to_original(s.resize_cropped_to_original);
-    app.set_set_use_gpu(s.use_gpu);
-    app.set_set_stack_every_nth(s.stack_every_nth as f32);
-    app.set_set_tile_size(s.tile_size as f32);
-    app.set_set_pyramid_levels(s.pyramid_levels as f32);
-    app.set_set_use_all_color_channels(s.use_all_color_channels);
-    app.set_set_grit_suppression(s.grit_suppression);
-    app.set_set_relief_estimation_radius(s.relief_estimation_radius as f32);
-    app.set_set_relief_smoothing_radius(s.relief_smoothing_radius as f32);
-    app.set_set_relief_contrast_pct(s.relief_contrast_pct);
-    app.set_set_relief_show_preview(s.relief_show_preview);
-    app.set_set_relief_auto_detect(s.relief_auto_detect);
-    app.set_set_relief_use_multigrid(s.relief_use_multigrid);
-    app.set_set_strata_base_radius(s.strata_base_radius as f32);
-    app.set_set_strata_detail_focus(s.strata_detail_focus as f32);
-
-    // ── Preprocessing ─────────────────────────────────────────────────────
-    let pre = &s.preprocessing;
-
-    app.set_set_pre_rotation(pre.pre_rotation as i32);
-    app.set_set_pre_crop_enabled(pre.pre_crop_enabled);
-    app.set_set_pre_crop_spec(SharedString::from(pre.pre_crop_spec.as_str()));
-    app.set_set_pre_resize_percent(pre.pre_resize_percent as f32);
-    app.set_set_sort_reverse(pre.sort_reverse);
-    app.set_set_ignore_exif(pre.ignore_exif_orientation);
-
-    // ── Image saving ──────────────────────────────────────────────────────
-    let sav = &s.image_saving;
-    app.set_set_output_format(SharedString::from(sav.output_format.as_combo_str()));
-
-    app.set_set_bit_depth(sav.bit_depth as i32);
-    app.set_set_jpeg_quality(sav.jpeg_quality as f32);
-    app.set_set_filename_template(SharedString::from(sav.filename_template.as_str()));
-    app.set_set_default_output_dir(SharedString::from(sav.default_output_dir.as_str()));
-    app.set_set_copy_metadata(sav.copy_metadata);
+    push_settings_values(app, &SettingsValues::from(s));
 }
 
-/// Read the App's `set-*` properties back into a [`StackingSettings`].
-/// Slider values are `float`; we round to the nearest integer where applicable.
+/// The dialog's values as clamped [`StackingSettings`] (`sanitized()` applied).
 #[must_use]
 pub fn pull_settings_from_ui(app: &App) -> StackingSettings {
-    let preprocessing = PreprocessingSettings {
-        pre_rotation: app.get_set_pre_rotation().max(0) as u32,
-        pre_crop_enabled: app.get_set_pre_crop_enabled(),
-        pre_crop_spec: app.get_set_pre_crop_spec().to_string(),
-        pre_resize_percent: (app.get_set_pre_resize_percent().round() as u32).clamp(10, 100),
-        sort_reverse: app.get_set_sort_reverse(),
-        ignore_exif_orientation: app.get_set_ignore_exif(),
-    };
-
-    let image_saving = ImageSavingSettings {
-        output_format: OutputFormat::from_combo_str(app.get_set_output_format().as_str()),
-        bit_depth: app.get_set_bit_depth().max(0) as u32,
-        jpeg_quality: (app.get_set_jpeg_quality().round() as u32).clamp(1, 100),
-        filename_template: app.get_set_filename_template().to_string(),
-        default_output_dir: app.get_set_default_output_dir().to_string(),
-        copy_metadata: app.get_set_copy_metadata(),
-    };
-
-    let mut s = StackingSettings {
-        alignment_mode: AlignmentModeSetting::from_combo_str(app.get_set_alignment().as_str()),
-        optimizer: OptimizerSetting::from_combo_str(app.get_set_optimizer().as_str()),
-        akaze_seeding: app.get_set_akaze_seeding(),
-        neural_refine_classically: app.get_set_neural_refine_classically(),
-        correct_brightness: app.get_set_correct_brightness(),
-        auto_cull: app.get_set_auto_cull(),
-        sort_by_sharpness: app.get_set_sort_by_sharpness(),
-        auto_cull_threshold_pct: ((app.get_set_auto_cull_threshold_pct() * 10.0).round() / 10.0)
-            .clamp(0.1, 5.0),
-        crop_to_common_area: app.get_set_crop_to_common_area(),
-        resize_cropped_to_original: app.get_set_resize_cropped_to_original(),
-        use_gpu: app.get_set_use_gpu(),
-        tile_size: app.get_set_tile_size().round().max(0.0) as u32,
-        stack_every_nth: (app.get_set_stack_every_nth().round() as u32).max(1),
-        pyramid_levels: (app.get_set_pyramid_levels().round() as u32).max(2),
-        use_all_color_channels: app.get_set_use_all_color_channels(),
-        grit_suppression: app.get_set_grit_suppression(),
-        relief_estimation_radius: app.get_set_relief_estimation_radius().round() as u32,
-        relief_smoothing_radius: app.get_set_relief_smoothing_radius().round() as u32,
-        relief_contrast_pct: app.get_set_relief_contrast_pct(),
-        relief_show_preview: app.get_set_relief_show_preview(),
-        relief_auto_detect: app.get_set_relief_auto_detect(),
-        relief_use_multigrid: app.get_set_relief_use_multigrid(),
-        strata_base_radius: app.get_set_strata_base_radius().round() as u32,
-        strata_detail_focus: app.get_set_strata_detail_focus().round() as u32,
-        preprocessing,
-        image_saving,
-    };
-    s.clamp_valid();
-    s.preprocessing.clamp_valid();
-    s.image_saving.clamp_valid();
-    s
+    read_settings_values(app).to_sanitized()
 }

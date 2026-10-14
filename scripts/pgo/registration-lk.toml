@@ -1,0 +1,8 @@
+# Settings for the PGO workload (scripts/pgo-workload.sh / .ps1): the default alignment path.
+# Registration (shift, scale, rotation) with the Lucas-Kanade optimiser only (the simplex is
+# not tried; a frame whose refinement fails keeps its seed), brightness correction on. Keys
+# that are missing use their defaults.
+settings_version = 2
+alignment_mode = "registration"
+optimizer = "lucaskanade"
+correct_brightness = true

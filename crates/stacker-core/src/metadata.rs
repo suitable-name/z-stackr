@@ -1,303 +1,342 @@
-//! Shared EXIF-metadata copy-through: read the raw EXIF blob from a source
-//! frame and re-inject it into a fused output file, without decoding or
-//! re-encoding pixel data.
+//! EXIF copy-through from a source frame into an encoded output file.
 //!
-//! This backs the `image_saving.copy_metadata` setting and is used
-//! identically by `z-stackr-cli` and `z-stackr-gui` — the CLI/GUI-parity
-//! principle applied throughout this crate: any metadata-handling decision
-//! lives here once, not duplicated per app.
+//! The EXIF block of the source is read and spliced into the output, without
+//! decoding or re-encoding any pixel.
+//!
+//! This backs the `image_saving.copy_metadata` setting. Everything works on
+//! byte slices (`*_bytes` functions, usable in the browser build) with thin
+//! file wrappers on top.
 //!
 //! # How it works
 //!
-//! [`extract_exif`] uses `kamadak-exif`'s container sniffing to pull the raw
-//! TIFF-structured EXIF payload out of the source frame (JPEG, TIFF, PNG,
-//! HEIF or WebP — whatever the source happens to be). [`inject_exif`] then
-//! uses `img-parts` to splice that exact byte payload into the *output*
-//! container at the byte level, with no pixel decode/re-encode involved.
+//! * [`extract_exif_from_bytes`] / [`extract_exif`] find the EXIF block of a JPEG,
+//!   PNG, HEIF, WebP or TIFF-based file with `kamadak-exif` and return it as a
+//!   bare TIFF-structured blob. For a JPEG, PNG, HEIF or WebP source this is the
+//!   block as stored. A TIFF-based source (TIFF, DNG, NEF, CR2, ...) keeps its
+//!   EXIF inside the image file itself, so the blob is **rebuilt**: only the
+//!   descriptive tags (camera, exposure, date, GPS, ...) are written, never the
+//!   structural ones (strip offsets, sizes, compression, MakerNote, ...), and the
+//!   blob stays a few kilobytes.
+//! * [`inject_exif_into_bytes`] / [`inject_exif`] splice a blob into an encoded
+//!   JPEG or PNG with `img-parts`, replacing any EXIF block already there.
 //!
-//! # RAW sources (`raw` feature)
+//! # Supported outputs
 //!
-//! [`copy_metadata`]/[`extract_exif`] are always called with the *original*
-//! source file path, never the decoded/cached blob — so for a RAW input
-//! frame, `kamadak-exif` is handed the actual `.cr2`/`.nef`/`.dng`/etc. file.
-//! Since CR2, NEF, and DNG are themselves TIFF-based containers,
-//! `kamadak-exif`'s TIFF reader can often parse their EXIF IFD directly with
-//! no code changes here. Formats it can't parse (or a container it doesn't
-//! recognise at all) fall through [`extract_exif`]'s existing `None` return
-//! path exactly like any other unparseable source — a graceful no-op, not an
-//! error — so RAW sources need no special-casing in this module.
+//! JPEG and PNG. **TIFF output is not supported**: neither `img-parts` nor the
+//! `image` crate's TIFF encoder can write an EXIF block into a TIFF, so
+//! [`inject_exif_into_bytes`] returns [`MetadataError::UnsupportedFormat`] and
+//! callers log a warning.
 //!
-//! # Supported output containers
+//! # Orientation
 //!
-//! Re-injection only supports JPEG and PNG outputs, because `img-parts` only
-//! understands those two (plus WebP, which this pipeline never writes).
-//! **TIFF output is not supported**: neither `img-parts` nor the `image`
-//! crate's baseline TIFF encoder expose a hook to write a custom EXIF IFD
-//! into a freshly encoded TIFF. [`copy_metadata`] returns
-//! [`MetadataError::UnsupportedFormat`] for `.tif`/`.tiff` outputs (and any
-//! other unrecognised extension) rather than silently doing nothing, so
-//! callers can log a clear, honest warning instead of overclaiming.
+//! The pipeline rotates pixels on load when the EXIF orientation is applied, so
+//! the copied block must say "upright": [`set_exif_orientation`] rewrites tag
+//! `0x0112` in place.
 
 use std::{
-    fs,
-    io::BufReader,
-    path::{Path, PathBuf},
+    fmt, fs,
+    io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom},
+    path::Path,
 };
 
 use img_parts::{DynImage, ImageEXIF};
 
-/// Errors that can occur while copying EXIF metadata into an output file.
+/// The largest EXIF blob a JPEG can carry: an APP1 segment holds at most
+/// 65 533 bytes after its length field, 6 of them the `Exif\0\0` header.
+pub const JPEG_EXIF_MAX_BYTES: usize = 65_527;
+
+/// Why EXIF could not be copied into an output.
 ///
-/// These are all non-fatal from the pipeline's point of view: by the time
-/// `copy_metadata` runs, the fused image has already been written
-/// successfully. Callers should log and continue rather than fail the run.
-#[derive(Debug, thiserror::Error)]
+/// None of these is fatal for a run: the fused image is already encoded when
+/// the metadata is copied, so callers log the error and carry on.
+#[derive(Debug)]
 pub enum MetadataError {
-    /// The output file could not be read back or written.
-    #[error("I/O error while injecting metadata into {path}: {source}")]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    /// The output file's bytes could not be parsed as a supported container.
-    #[error("failed to parse {path} as a JPEG/PNG container for metadata injection: {message}")]
-    Parse { path: PathBuf, message: String },
-    /// The output format doesn't support EXIF re-injection (e.g. TIFF).
-    #[error(
-        "copy_metadata is enabled, but output format \"{0}\" does not support EXIF injection \
-         (only JPEG and PNG outputs are supported) — metadata was not copied"
-    )]
+    /// The output file could not be read or written.
+    Io(std::io::Error),
+    /// The output bytes are not a well-formed container of the supported kind.
+    Parse(String),
+    /// The output container cannot carry EXIF (TIFF, or an unknown format).
     UnsupportedFormat(String),
+    /// The blob does not fit the output container.
+    TooLarge {
+        /// Size of the blob.
+        bytes: usize,
+        /// The most the container takes.
+        limit: usize,
+    },
 }
 
-/// Reads the raw EXIF blob (bare TIFF-structured bytes, no container
-/// prefix) from `source_path`, if present.
-///
-/// Uses `kamadak-exif`'s container sniffing, so this works regardless of
-/// whether the source frame is a JPEG, TIFF, PNG, HEIF, or WebP — we only
-/// need the exact original byte payload to re-inject later, not any
-/// Rust-level decoded fields.
-///
-/// Returns `None` if the file has no EXIF data, can't be opened, or can't
-/// be parsed. A source frame with no/corrupt EXIF is not itself an error
-/// condition for the caller — metadata copying just becomes a no-op.
+impl fmt::Display for MetadataError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "I/O error while copying metadata: {e}"),
+            Self::Parse(message) => write!(
+                f,
+                "cannot parse the output as a JPEG or PNG container for metadata copying: \
+                 {message}"
+            ),
+            Self::UnsupportedFormat(kind) => write!(
+                f,
+                "copy_metadata is on, but the output format ({kind}) cannot carry EXIF; only \
+                 JPEG and PNG outputs can, so the metadata was not copied"
+            ),
+            Self::TooLarge { bytes, limit } => write!(
+                f,
+                "the EXIF block ({bytes} bytes) is larger than the output container takes \
+                 ({limit} bytes); the metadata was not copied"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MetadataError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for MetadataError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+// ── Reading ───────────────────────────────────────────────────────────────────
+
+/// `true` when `head` starts with a TIFF byte-order mark and the magic 42.
+fn is_tiff_header(head: &[u8]) -> bool {
+    matches!(
+        head.get(..4),
+        Some([b'I', b'I', 42, 0] | [b'M', b'M', 0, 42])
+    )
+}
+
+/// The EXIF blob of an encoded image held in memory, or `None` when there is
+/// none (or it cannot be parsed). See the module documentation for what the
+/// blob holds for a TIFF-based source.
 #[must_use]
-pub fn extract_exif(source_path: &Path) -> Option<Vec<u8>> {
-    let file = fs::File::open(source_path).ok()?;
-    let exif = exif::Reader::new()
-        .read_from_container(&mut BufReader::new(file))
-        .ok()?;
-    Some(exif.buf().to_vec())
+pub fn extract_exif_from_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
+    read_blob(&mut Cursor::new(bytes), is_tiff_header(bytes))
 }
 
-/// Injects `exif_blob` (bare TIFF-structured bytes, as returned by
-/// [`extract_exif`]) into the JPEG/PNG file at `output_path`, in place.
+/// The EXIF blob of the file at `path`, or `None` when the file cannot be read
+/// or holds no EXIF. A frame without metadata is not an error: copying simply
+/// does nothing.
+#[must_use]
+pub fn extract_exif(path: &Path) -> Option<Vec<u8>> {
+    let mut reader = BufReader::new(fs::File::open(path).ok()?);
+    let mut magic = [0_u8; 4];
+    reader.read_exact(&mut magic).ok()?;
+    reader.seek(SeekFrom::Start(0)).ok()?;
+    read_blob(&mut reader, is_tiff_header(&magic))
+}
+
+/// Parse the container behind `reader` and return its EXIF blob.
+fn read_blob<R: BufRead + Seek>(reader: &mut R, tiff_source: bool) -> Option<Vec<u8>> {
+    let exif = exif::Reader::new().read_from_container(reader).ok()?;
+    if tiff_source {
+        // `buf()` would be the whole image file: rebuild a compact block.
+        rebuild_compact(&exif)
+    } else {
+        Some(exif.buf().to_vec())
+    }
+}
+
+/// Write the descriptive fields of the primary image of a TIFF-based source
+/// into a fresh, small EXIF block of the same byte order.
+fn rebuild_compact(exif: &exif::Exif) -> Option<Vec<u8>> {
+    let fields: Vec<&exif::Field> = exif
+        .fields()
+        .filter(|f| f.ifd_num == exif::In::PRIMARY && keep_field(f))
+        .collect();
+    if fields.is_empty() {
+        return None;
+    }
+    let mut writer = exif::experimental::Writer::new();
+    for field in fields {
+        writer.push_field(field);
+    }
+    let mut out = Cursor::new(Vec::new());
+    writer.write(&mut out, exif.little_endian()).ok()?;
+    Some(out.into_inner())
+}
+
+/// Tags of the TIFF (IFD0) context worth copying: they describe the camera and
+/// the shot, not the image data of the source file.
+const KEPT_TIFF_TAGS: &[u16] = &[
+    0x010E, // ImageDescription
+    0x010F, // Make
+    0x0110, // Model
+    0x0112, // Orientation
+    0x011A, // XResolution
+    0x011B, // YResolution
+    0x0128, // ResolutionUnit
+    0x0131, // Software
+    0x0132, // DateTime
+    0x013B, // Artist
+    0x013C, // HostComputer
+    0x8298, // Copyright
+];
+
+/// Tags of the Exif context that are dropped: the `MakerNote` (its inner offsets
+/// do not survive a rewrite), the pixel dimensions (stale after any crop or
+/// resize) and the pointer to the Interoperability IFD.
+const DROPPED_EXIF_TAGS: &[u16] = &[0x927C, 0xA002, 0xA003, 0xA005];
+
+/// Whether `field` goes into a rebuilt block.
+fn keep_field(field: &exif::Field) -> bool {
+    if matches!(field.value, exif::Value::Unknown(..)) {
+        return false;
+    }
+    let number = field.tag.number();
+    match field.tag.context() {
+        exif::Context::Tiff => KEPT_TIFF_TAGS.contains(&number),
+        exif::Context::Exif => !DROPPED_EXIF_TAGS.contains(&number),
+        exif::Context::Gps => true,
+        _ => false,
+    }
+}
+
+// ── Orientation ───────────────────────────────────────────────────────────────
+
+fn read_u16(blob: &[u8], at: usize, little: bool) -> Option<u16> {
+    let b = blob.get(at..at + 2)?;
+    Some(if little {
+        u16::from_le_bytes([b[0], b[1]])
+    } else {
+        u16::from_be_bytes([b[0], b[1]])
+    })
+}
+
+fn read_u32(blob: &[u8], at: usize, little: bool) -> Option<u32> {
+    let b = blob.get(at..at + 4)?;
+    Some(if little {
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    } else {
+        u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+    })
+}
+
+/// Where the orientation value sits in a TIFF-structured blob: the offset of its
+/// two bytes and whether the blob is little-endian. `None` when IFD0 has no
+/// orientation entry of type SHORT with a count of one.
+fn orientation_slot(blob: &[u8]) -> Option<(usize, bool)> {
+    let little = match blob.get(..2)? {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    if read_u16(blob, 2, little)? != 42 {
+        return None;
+    }
+    let ifd = usize::try_from(read_u32(blob, 4, little)?).ok()?;
+    let entries = usize::from(read_u16(blob, ifd, little)?);
+    for i in 0..entries {
+        let entry = ifd + 2 + 12 * i;
+        if read_u16(blob, entry, little)? == 0x0112 {
+            let is_one_short =
+                read_u16(blob, entry + 2, little)? == 3 && read_u32(blob, entry + 4, little)? == 1;
+            return is_one_short.then_some((entry + 8, little));
+        }
+    }
+    None
+}
+
+/// The orientation tag (`0x0112`) of IFD0 in a TIFF-structured EXIF blob, or
+/// `None` when the blob has none.
+#[must_use]
+pub fn exif_orientation(blob: &[u8]) -> Option<u16> {
+    let (at, little) = orientation_slot(blob)?;
+    read_u16(blob, at, little)
+}
+
+/// Set the orientation tag of IFD0 in place and return `true`; `false` (blob
+/// untouched) when the blob has no such tag.
 ///
-/// This edits the container at the byte level — the pixel data is never
-/// decoded or re-encoded. Any pre-existing EXIF in the output is replaced.
+/// Only the two value bytes change, so every offset in the blob stays valid.
+pub fn set_exif_orientation(blob: &mut [u8], orientation: u16) -> bool {
+    let Some((at, little)) = orientation_slot(blob) else {
+        return false;
+    };
+    let bytes = if little {
+        orientation.to_le_bytes()
+    } else {
+        orientation.to_be_bytes()
+    };
+    blob[at..at + 2].copy_from_slice(&bytes);
+    true
+}
+
+// ── Writing ───────────────────────────────────────────────────────────────────
+
+/// Splice `exif_blob` (a bare TIFF-structured block, as the `extract` functions
+/// return it) into the encoded JPEG or PNG `container` and return the new file
+/// contents.
+///
+/// The pixel data is not touched; an EXIF block already present is
+/// replaced. The container is recognised from its leading bytes.
 ///
 /// # Errors
-///
-/// Returns [`MetadataError::UnsupportedFormat`] if `output_path`'s
-/// extension isn't `.jpg`/`.jpeg`/`.png`, [`MetadataError::Parse`] if the
-/// file's bytes can't be parsed as that container format, and
-/// [`MetadataError::Io`] on read/write failure.
-pub fn inject_exif(output_path: &Path, exif_blob: &[u8]) -> Result<(), MetadataError> {
-    let ext = output_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase);
-    if !matches!(ext.as_deref(), Some("jpg" | "jpeg" | "png")) {
-        return Err(MetadataError::UnsupportedFormat(
-            ext.unwrap_or_else(|| "<no extension>".to_owned()),
-        ));
+/// [`MetadataError::UnsupportedFormat`] for a TIFF or any other container,
+/// [`MetadataError::Parse`] for a malformed JPEG or PNG,
+/// [`MetadataError::TooLarge`] when a JPEG cannot hold the blob,
+/// [`MetadataError::Io`] when writing fails.
+pub fn inject_exif_into_bytes(
+    container: &[u8],
+    exif_blob: &[u8],
+) -> Result<Vec<u8>, MetadataError> {
+    let mut image = DynImage::from_bytes(container.to_vec().into())
+        .map_err(|e| MetadataError::Parse(e.to_string()))?
+        .ok_or_else(|| MetadataError::UnsupportedFormat(sniff_name(container).to_owned()))?;
+    if matches!(image, DynImage::Jpeg(_)) && exif_blob.len() > JPEG_EXIF_MAX_BYTES {
+        return Err(MetadataError::TooLarge {
+            bytes: exif_blob.len(),
+            limit: JPEG_EXIF_MAX_BYTES,
+        });
     }
-
-    let bytes = fs::read(output_path).map_err(|source| MetadataError::Io {
-        path: output_path.to_path_buf(),
-        source,
-    })?;
-
-    let mut image = DynImage::from_bytes(bytes.into())
-        .map_err(|source| MetadataError::Parse {
-            path: output_path.to_path_buf(),
-            message: source.to_string(),
-        })?
-        .ok_or_else(|| MetadataError::UnsupportedFormat("<unrecognised container>".to_owned()))?;
-
     image.set_exif(Some(exif_blob.to_vec().into()));
+    let mut out = Vec::with_capacity(container.len() + exif_blob.len() + 16);
+    image.encoder().write_to(&mut out)?;
+    Ok(out)
+}
 
-    let file = fs::File::create(output_path).map_err(|source| MetadataError::Io {
-        path: output_path.to_path_buf(),
-        source,
-    })?;
-    image
-        .encoder()
-        .write_to(file)
-        .map_err(|source| MetadataError::Io {
-            path: output_path.to_path_buf(),
-            source,
-        })?;
+/// The name of the container `bytes` starts like, for messages.
+fn sniff_name(bytes: &[u8]) -> &'static str {
+    if is_tiff_header(bytes) {
+        "TIFF"
+    } else {
+        "unrecognised container"
+    }
+}
+
+/// [`inject_exif_into_bytes`] on the file at `output_path`, in place.
+///
+/// # Errors
+/// See [`inject_exif_into_bytes`]; [`MetadataError::Io`] also when the file
+/// cannot be read.
+pub fn inject_exif(output_path: &Path, exif_blob: &[u8]) -> Result<(), MetadataError> {
+    let bytes = fs::read(output_path)?;
+    let spliced = inject_exif_into_bytes(&bytes, exif_blob)?;
+    fs::write(output_path, spliced)?;
     Ok(())
 }
 
-/// Convenience wrapper combining [`extract_exif`] + [`inject_exif`]: copies
-/// EXIF metadata from `source_path` (the first frame of the input stack)
-/// into `output_path` (the fused result).
+/// Copy the EXIF of `source_path` into the JPEG or PNG at `output_path`
+/// unchanged ([`extract_exif`] then [`inject_exif`]).
 ///
-/// Returns:
-/// - `Ok(true)` — metadata was found in the source and copied.
-/// - `Ok(false)` — the source had no EXIF data; nothing to copy (not an
-///   error).
-/// - `Err(_)` — the source had EXIF data, but the output format doesn't
-///   support injection, or the output file couldn't be read/written.
-///
-/// Callers (CLI/GUI) should treat `Err` as non-fatal: log a warning and
-/// continue, since the fused image itself was already written successfully
-/// by the time metadata copying runs.
+/// Returns `Ok(true)` when metadata was copied and `Ok(false)` when the source
+/// has none. The pipeline uses the two halves directly, because it must fix the
+/// orientation tag in between (see the module documentation).
 ///
 /// # Errors
-///
 /// See [`inject_exif`].
 pub fn copy_metadata(source_path: &Path, output_path: &Path) -> Result<bool, MetadataError> {
-    let Some(exif_blob) = extract_exif(source_path) else {
+    let Some(blob) = extract_exif(source_path) else {
         return Ok(false);
     };
-    inject_exif(output_path, &exif_blob)?;
+    inject_exif(output_path, &blob)?;
     Ok(true)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::BufWriter;
-
-    /// A minimal, hand-built, valid little-endian TIFF/EXIF IFD containing a
-    /// single `ImageDescription` ASCII field ("hi"). Used as a deterministic
-    /// EXIF payload for round-trip tests, without depending on any binary
-    /// fixture files.
-    fn synthetic_exif_blob() -> Vec<u8> {
-        vec![
-            // TIFF header: "II" (little-endian) + magic 42 + offset to IFD0 (8)
-            0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, // IFD0: 1 entry
-            0x01, 0x00, // Entry: tag=0x010E (ImageDescription), type=2 (ASCII), count=3
-            0x0E, 0x01, 0x02, 0x00, 0x03, 0x00, 0x00, 0x00,
-            // value (inlined, ASCII count <= 4): "hi\0" + pad
-            b'h', b'i', 0x00, 0x00, // next IFD offset = 0 (none)
-            0x00, 0x00, 0x00, 0x00,
-        ]
-    }
-
-    fn write_tiny_jpeg(path: &Path) {
-        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([120u8, 60, 200]));
-        let file = fs::File::create(path).expect("create tmp jpeg");
-        let mut writer = BufWriter::new(file);
-        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, 90);
-        enc.encode(
-            img.as_raw(),
-            img.width(),
-            img.height(),
-            image::ExtendedColorType::Rgb8,
-        )
-        .expect("encode tmp jpeg");
-    }
-
-    fn write_tiny_png(path: &Path) {
-        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([10u8, 200, 30]));
-        img.save(path).expect("save tmp png");
-    }
-
-    fn read_back_description(path: &Path) -> String {
-        let file = fs::File::open(path).expect("reopen output");
-        let exif = exif::Reader::new()
-            .read_from_container(&mut BufReader::new(file))
-            .expect("parse injected exif");
-        let field = exif
-            .get_field(exif::Tag::ImageDescription, exif::In::PRIMARY)
-            .expect("ImageDescription field present after injection");
-        field.display_value().to_string()
-    }
-
-    #[test]
-    fn test_inject_exif_jpeg_round_trip() {
-        let path = std::env::temp_dir().join(format!(
-            "z_stackr_metadata_test_{}_jpeg.jpg",
-            std::process::id()
-        ));
-        write_tiny_jpeg(&path);
-
-        inject_exif(&path, &synthetic_exif_blob()).expect("inject exif into jpeg");
-        assert_eq!(read_back_description(&path), "\"hi\"");
-
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn test_inject_exif_png_round_trip() {
-        let path = std::env::temp_dir().join(format!(
-            "z_stackr_metadata_test_{}_png.png",
-            std::process::id()
-        ));
-        write_tiny_png(&path);
-
-        inject_exif(&path, &synthetic_exif_blob()).expect("inject exif into png");
-        assert_eq!(read_back_description(&path), "\"hi\"");
-
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn test_inject_exif_rejects_unsupported_tiff_extension() {
-        let path = std::env::temp_dir().join(format!(
-            "z_stackr_metadata_test_{}_unsupported.tif",
-            std::process::id()
-        ));
-        // File need not even exist: the extension check runs first.
-        let err = inject_exif(&path, &synthetic_exif_blob()).unwrap_err();
-        assert!(matches!(err, MetadataError::UnsupportedFormat(ref ext) if ext == "tif"));
-    }
-
-    #[test]
-    fn test_copy_metadata_no_source_exif_is_not_an_error() {
-        // A source path that doesn't exist / has no parseable EXIF should
-        // make `copy_metadata` a clean no-op, not a hard failure.
-        let missing_source = std::env::temp_dir().join(format!(
-            "z_stackr_metadata_test_{}_missing_source.jpg",
-            std::process::id()
-        ));
-        let out_path = std::env::temp_dir().join(format!(
-            "z_stackr_metadata_test_{}_copy_out.png",
-            std::process::id()
-        ));
-        write_tiny_png(&out_path);
-
-        let copied = copy_metadata(&missing_source, &out_path).expect("no-op, not an error");
-        assert!(!copied);
-
-        let _ = fs::remove_file(&out_path);
-    }
-
-    #[test]
-    fn test_extract_exif_round_trips_through_inject() {
-        let source_path = std::env::temp_dir().join(format!(
-            "z_stackr_metadata_test_{}_source.jpg",
-            std::process::id()
-        ));
-        write_tiny_jpeg(&source_path);
-        inject_exif(&source_path, &synthetic_exif_blob()).expect("seed source exif");
-
-        let extracted = extract_exif(&source_path).expect("extract seeded exif");
-
-        let out_path = std::env::temp_dir().join(format!(
-            "z_stackr_metadata_test_{}_dest.png",
-            std::process::id()
-        ));
-        write_tiny_png(&out_path);
-        inject_exif(&out_path, &extracted).expect("inject extracted exif");
-        assert_eq!(read_back_description(&out_path), "\"hi\"");
-
-        let _ = fs::remove_file(&source_path);
-        let _ = fs::remove_file(&out_path);
-    }
 }

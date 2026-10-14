@@ -1,0 +1,74 @@
+import { Theme } from "../theme.slint";
+import { ActivityItem } from "../models/activity.slint";
+
+// One running background operation as a compact chip: a label, a determinate
+// fraction or an elapsed time, and a cancel affordance when the operation allows it.
+// The status strip mounts one per entry of `ActivityModel.activities`.
+export component ActivityChip inherits Rectangle {
+    in property <ActivityItem> item;
+    // `ActivityModel.now-ms`, passed in so the chip stays a pure view of its inputs.
+    in property <int> now-ms: 0;
+    callback cancel(int);
+
+    // Elapsed whole seconds, never negative (the first tick can precede `started_ms`).
+    property <int> elapsed-s: Math.max(0, Math.floor((root.now-ms - root.item.started_ms) / 1000));
+    // "37 s" under a minute, "2 min 5 s" after.
+    property <string> elapsed-text: root.elapsed-s < 60
+        ? root.elapsed-s + " s"
+        : Math.floor(root.elapsed-s / 60) + " min " + Math.mod(root.elapsed-s, 60) + " s";
+
+    width: layout.preferred-width;
+    height: 18px;
+    border-radius: Theme.radius-sm;
+    background: Theme.accent-faint;
+    border-width: Theme.hairline;
+    border-color: Theme.accent;
+
+    layout := HorizontalLayout {
+        padding-left: Theme.space-sm;
+        padding-right: Theme.space-sm;
+        spacing: Theme.space-xs;
+
+        Text {
+            text: root.item.label;
+            font-size: Theme.font-xs;
+            font-weight: 600;
+            color: Theme.text-primary;
+            vertical-alignment: center;
+        }
+        Text {
+            // The fraction when known, then the elapsed time.
+            text: root.item.progress >= 0.0
+                ? Math.round(root.item.progress * 100) + "% · " + root.elapsed-text
+                : root.elapsed-text;
+            font-size: Theme.font-xs;
+            color: Theme.text-secondary;
+            vertical-alignment: center;
+        }
+        if root.item.eta_text != "": Text {
+            text: root.item.eta_text;
+            font-size: Theme.font-xs;
+            color: Theme.text-secondary;
+            vertical-alignment: center;
+        }
+        if root.item.cancellable: Rectangle {
+            width: 14px;
+            border-radius: Theme.radius-sm;
+            background: cancel-touch.has-hover ? Theme.overlay-hover : transparent;
+            cancel-touch := TouchArea {
+                mouse-cursor: pointer;
+                accessible-role: button;
+                accessible-label: "Cancel " + root.item.label;
+                accessible-action-default => { root.cancel(root.item.id); }
+                clicked => { root.cancel(root.item.id); }
+            }
+            Text {
+                text: "\u{2715}";
+                font-size: Theme.font-xs;
+                color: Theme.danger;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}

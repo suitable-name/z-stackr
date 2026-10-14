@@ -1,0 +1,38 @@
+import { Theme } from "../theme.slint";
+
+// A thin vertical drag handle between two side-by-side regions (the sidebar and
+// the canvas), dragged left/right.
+//
+// Purely a gesture source: it never resizes anything itself. `dragged` reports the
+// pointer's INCREMENTAL movement since the last event, not the distance from the
+// initial press; the caller clamps and stores the running total.
+export component SplitHandle inherits Rectangle {
+    callback dragged(length);
+
+    background: (touch.pressed || touch.has-hover) ? Theme.accent : Theme.border-subtle;
+    animate background { duration: 100ms; }
+
+    // Only the thickness is pinned (min == max == 6px); the height stays
+    // unconstrained so the enclosing layout stretches the bar.
+    // NEVER bind the height to `100%`: a percent binding on a layout child
+    // becomes that child's min AND max, and the parent can then never grow again.
+    min-width: 6px;
+    max-width: 6px;
+
+    // The pointer's last-seen x, so each `dragged` call reports only the delta
+    // since the previous one.
+    property <length> last-pos: 0px;
+
+    touch := TouchArea {
+        mouse-cursor: MouseCursor.col-resize;
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down {
+                root.last-pos = self.mouse-x;
+            }
+        }
+        moved => {
+            root.dragged(self.mouse-x - root.last-pos);
+            root.last-pos = self.mouse-x;
+        }
+    }
+}

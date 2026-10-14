@@ -1,0 +1,6 @@
+# Settings for the PGO workload (scripts/pgo-workload.sh / .ps1): the Relief fusion with the
+# multigrid depth solver instead of the guided-filter argmax, on the default alignment path.
+settings_version = 2
+alignment_mode = "registration"
+optimizer = "auto"
+relief_use_multigrid = true

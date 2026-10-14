@@ -1,0 +1,92 @@
+import { Button, Slider } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+
+// The depth-map preview shown while a Relief stack waits for its contrast
+// threshold: the rejection mask overlaid on the first frame, a threshold slider,
+// an auto-detect action and the Continue / Cancel decision.
+//
+// This is a card, not a modal dialog: it has no backdrop and the window around it
+// stays fully usable (the canvas, the lists, zoom and pan). Its own `TouchArea`
+// only keeps pointer events from reaching the canvas underneath the card. The
+// owner places it (`x` / `y`); the image is rendered off the UI thread at panel
+// size, so dragging the slider never stalls the window.
+export component ReliefPreviewPanel inherits Rectangle {
+    in-out property <float> contrast-pct;
+    in property <image> preview-image;
+    callback apply();
+    callback cancel();
+    callback auto-detect();
+    callback contrast-changed();
+
+    width: 400px;
+    height: 440px;
+    background: Theme.bg-panel;
+    border-radius: Theme.radius-md;
+    border-width: Theme.hairline;
+    border-color: Theme.border-dialog;
+    drop-shadow-blur: 16px;
+    drop-shadow-offset-y: 4px;
+    drop-shadow-color: Theme.shadow;
+
+    TouchArea { }
+
+    VerticalLayout {
+        padding: Theme.space-lg;
+        spacing: Theme.space-md;
+
+        Text {
+            text: "Depth map preview";
+            color: Theme.text-strong;
+            font-weight: 700;
+            font-size: Theme.font-lg;
+        }
+
+        Text {
+            text: "Red marks pixels the threshold rejects (they are averaged over all frames).";
+            color: Theme.text-secondary;
+            font-size: Theme.font-sm;
+            wrap: word-wrap;
+        }
+
+        Image {
+            source: root.preview-image;
+            image-fit: contain;
+            vertical-stretch: 1;
+        }
+
+        HorizontalLayout {
+            spacing: Theme.space-md;
+            Text {
+                text: "Threshold";
+                color: Theme.text-primary;
+                vertical-alignment: center;
+            }
+            Slider {
+                accessible-label: "Threshold";
+                minimum: 0.0;
+                maximum: 1.0;
+                horizontal-stretch: 1;
+                value <=> root.contrast-pct;
+                changed => { root.contrast-changed(); }
+            }
+            Text {
+                text: Math.round(root.contrast-pct * 100) + "%";
+                color: Theme.text-strong;
+                vertical-alignment: center;
+                horizontal-alignment: right;
+                width: 40px;
+            }
+        }
+
+        HorizontalLayout {
+            alignment: space-between;
+            spacing: Theme.space-md;
+            Button { text: "Auto-Detect"; clicked => { root.auto-detect(); } }
+            HorizontalLayout {
+                spacing: Theme.space-md;
+                Button { text: "Cancel"; clicked => { root.cancel(); } }
+                Button { text: "Continue"; primary: true; clicked => { root.apply(); } }
+            }
+        }
+    }
+}

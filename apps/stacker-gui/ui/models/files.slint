@@ -1,0 +1,30 @@
+// The source frames, the produced results and the image on the canvas. Rust fills
+// the two lists (`update_source_list` / `update_result_list`); `App.loaded-files`,
+// `App.result-files`, `App.has-images` and `App.displayed-image` are two-way bound
+// to these properties for compatibility.
+export global FilesModel {
+    in-out property <[string]> loaded-files;
+    in-out property <[string]> result-files;
+    in-out property <bool> has-images: false;
+    in-out property <image> displayed-image;
+
+    // ── Currency of derived results (`gui/stale.rs` fills these) ─────────────
+    // "Aligned frames (N)"; empty while there is no Align cache.
+    in-out property <string> aligned-summary: "";
+    // The Align cache was built from files or settings that have since changed.
+    in-out property <bool> aligned-stale: false;
+    // The badge text, e.g. "Stale (files)".
+    in-out property <string> aligned-stale-text: "";
+    // The newest result was built from files or settings that have since changed.
+    in-out property <bool> result-stale: false;
+    in-out property <string> result-stale-text: "";
+    // One flag per entry of `loaded-files`: dropped by the last auto-cull. Rust
+    // refreshes it within a poll tick of a list change, so read it with a bound
+    // check (`idx < culled-files.length`).
+    in-out property <[bool]> culled-files;
+
+    // Recompute actions of the stale badges. Recompute-result carries the
+    // sidebar's algorithm, AI model and AI device choices, like `App.request-stack`.
+    callback recompute-aligned();
+    callback recompute-result(string, string, string);
+}

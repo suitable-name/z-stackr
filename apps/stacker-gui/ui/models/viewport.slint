@@ -1,0 +1,66 @@
+// The image viewport's geometry and pointer events. The canvas writes its own
+// size and the displayed raster size here; zoom and pan are the view state; the
+// pointer callbacks carry canvas coordinates in logical pixels (already divided by
+// `1px`). Rust maps canvas coordinates to raster pixels with
+// `stacker_gui::viewport_map::Frame`, so no component needs to know the fit rule.
+export global ViewportModel {
+    // ── Geometry (written by the canvas) ────────────────────────────────────
+    in-out property <float> canvas-width: 0.0;
+    in-out property <float> canvas-height: 0.0;
+    // Size of the raster currently displayed (written by Rust with the image).
+    in-out property <int> image-width: 0;
+    in-out property <int> image-height: 0;
+
+    // ── View state ──────────────────────────────────────────────────────────
+    // 1.0 = the whole image fits the canvas; larger magnifies.
+    in-out property <float> zoom: 1.0;
+    // Pan offset in canvas pixels, added to the centred placement.
+    in-out property <float> pan-x: 0.0;
+    in-out property <float> pan-y: 0.0;
+
+    // ── Placement (written by Rust, `viewport_map::Frame::placement`) ───────
+    // Where the image lands inside the canvas, in canvas pixels. The fit rule
+    // lives once, in Rust; the canvas only draws what it is told. All zero while
+    // no image is displayed.
+    in-out property <float> place-x: 0.0;
+    in-out property <float> place-y: 0.0;
+    in-out property <float> place-width: 0.0;
+    in-out property <float> place-height: 0.0;
+    // Canvas pixels per raster pixel (the brush ring uses it to draw the brush
+    // radius at the right size).
+    in-out property <float> place-scale: 1.0;
+    // True while Space is held: a left-drag pans even with the Retouch tool on.
+    in-out property <bool> pan-armed: false;
+
+    // ── Panel layout (persisted through `settings::layout`) ─────────────────
+    in-out property <length> sidebar-width: 280px;
+    // Limits, pushed from Rust at start-up so the persisted clamp and the drag
+    // clamp cannot disagree.
+    in-out property <length> sidebar-min: 200px;
+    in-out property <length> sidebar-max: 520px;
+    // The user dragged the sidebar handle (never fired by a window-size re-clamp).
+    callback layout-changed();
+
+    // ── Notifications to Rust ───────────────────────────────────────────────
+    // The canvas size changed; Rust coalesces bursts before recomputing.
+    callback canvas-resized();
+    // The displayed raster changed (raster pixels; 0 x 0 when nothing is shown).
+    callback image-changed(int, int);
+
+    // ── Pointer events (canvas coordinates) ─────────────────────────────────
+    // Brush strokes: one press, any number of moves, one release. The canvas emits
+    // them only while the Retouch tool is on.
+    callback brush-down(float, float);
+    callback brush-moved(float, float);
+    callback brush-up();
+    // Mouse wheel over the canvas: delta in wheel notches (the canvas divides the
+    // toolkit's 60 px per notch; positive = away from the user), with the pointer
+    // position in canvas pixels.
+    callback wheel(float, float, float);
+    // Pan drag (middle button or Space + drag): incremental delta.
+    callback pan-by(float, float);
+    // Explicit zoom requests from buttons or shortcuts.
+    callback zoom-fit();
+    callback zoom-one-to-one();
+    callback zoom-step(float);   // factor, e.g. 1.25 or 0.8
+}

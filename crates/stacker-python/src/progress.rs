@@ -1,191 +1,87 @@
-#![cfg(feature = "python")]
-//! Progress-callback shim: maps `stacker_pipeline::PipelineProgress` onto a
-//! stable Python-facing `(stage: str, current: int, total: int)` tuple.
+//! The progress contract of the Python API: `(stage, current, total)`.
 //!
-//! # The mapping
+//! The pipeline reports `Progress::stage(stage, fraction, label)` with a fraction in
+//! `0.0..=1.0`. Python callbacks get a stable tuple instead:
 //!
-//! | `PipelineProgress` variant | `stage` string | `current` | `total` |
-//! |---|---|---|---|
-//! | `DecodeRaw { current, total }` | `"decode_raw"` | frame index (1-based) | RAW frame count |
-//! | `AlignStart { total }` | `"align_start"` | `0` | frame count |
-//! | `AlignFrame { current, total }` | `"align_frame"` | frame index (1-based) | frame count |
-//! | `AlignDone` | `"align_done"` | `0` | `0` |
-//! | `FuseStart { total }` | `"fuse_start"` | `0` | tile count |
-//! | `FuseTile { current, total }` | `"fuse_tile"` | tile index (1-based) | tile count |
-//! | `FuseDone` | `"fuse_done"` | `0` | `0` |
-//! | `Encoding` | `"encoding"` | `0` | `0` |
+//! | `stage` | meaning |
+//! |---|---|
+//! | `"load"` | decoding the frames (the in-RAM path of `stack_files` with `tile_size = 0`) |
+//! | `"align"` | aligning the frames to the reference |
+//! | `"cull"` | the focus census and the auto-cull |
+//! | `"fuse"` | fusing (tile by tile on the out-of-core path; a two-pass engine counts both) |
+//! | `"save"` | encoding and writing the result |
 //!
-//! This mapping is intentionally a stable, minimal, structural contract
-//! (a string tag plus two integers) rather than exposing
-//! `PipelineProgress` itself as a `#[pyclass]` enum — pyo3 enums are more
-//! ceremony for callers than a `(str, int, int)` tuple, and the tag/shape
-//! above is easy to keep stable across future `PipelineProgress` variants
-//! (a new variant just needs a new tag; existing callers pattern-matching
-//! on known tags are unaffected).
+//! `total` is always [`PROGRESS_TOTAL`] (1000) and `current` is the fraction in thousandths, so
+//! `current / total` is the progress of the stage and `current == total` marks its end. A
+//! stage is reported when `current` changes, so a long stage produces at most 1001 calls.
 //!
-//! # GIL handling
-//!
-//! The pipeline's compute (`smol::block_on(run_pipeline(...))`) always runs
-//! with the GIL released (`Python::detach`), so other Python threads are
-//! not frozen during a long stack. The progress callback shim re-acquires
-//! the GIL (`Python::attach`) only for the duration of each individual
-//! Python callable invocation.
-//!
-//! # Exceptions raised by the Python callback
-//!
-//! If the Python progress callable raises, the exception is printed to
-//! stderr (`PyErr::print`, the same thing an uncaught exception at the top
-//! level would do) and otherwise ignored — the stack continues running.
-//! A misbehaving progress callback must never abort an otherwise-successful
-//! multi-minute stack.
+//! The mapping is independent of Python: [`ProgressForwarder`] takes any closure. The Python
+//! callback is wired in by `crate::bridge`.
 
-use pyo3::prelude::*;
-use stacker_pipeline::PipelineProgress;
+use std::cell::Cell;
 
-/// Map one [`PipelineProgress`] event onto the stable `(stage, current,
-/// total)` tuple described in the module docs.
+use stacker_pipeline::{Progress, Stage};
+
+/// The `total` of every progress tuple: a fraction is reported in thousandths.
+pub const PROGRESS_TOTAL: u32 = 1000;
+
+/// The tag of `stage` in the Python callback.
 #[must_use]
-pub const fn progress_to_tuple(event: PipelineProgress) -> (&'static str, usize, usize) {
-    match event {
-        PipelineProgress::DecodeRaw { current, total } => ("decode_raw", current, total),
-        PipelineProgress::AlignStart { total } => ("align_start", 0, total),
-        PipelineProgress::AlignFrame { current, total } => ("align_frame", current, total),
-        PipelineProgress::AlignDone => ("align_done", 0, 0),
-        PipelineProgress::FuseStart { total } => ("fuse_start", 0, total),
-        PipelineProgress::FuseTile { current, total } => ("fuse_tile", current, total),
-        PipelineProgress::FuseDone => ("fuse_done", 0, 0),
-        PipelineProgress::Encoding => ("encoding", 0, 0),
+pub const fn stage_name(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Load => "load",
+        Stage::Align => "align",
+        Stage::Cull => "cull",
+        Stage::Fuse => "fuse",
+        Stage::Save => "save",
     }
 }
 
-/// Invoke an optional Python progress callable for one [`PipelineProgress`]
-/// event, acquiring the GIL only for the duration of the call.
-///
-/// A no-op when `callback` is `None`. If the callable raises, the exception
-/// is printed to stderr and swallowed (see the module docs) so a single bad
-/// callback invocation can never abort an in-progress stack.
-pub fn call_progress(callback: Option<&Py<PyAny>>, event: PipelineProgress) {
-    let Some(callback) = callback else { return };
-    let (stage, current, total) = progress_to_tuple(event);
-    Python::attach(|py| {
-        // A plain Rust tuple implements the conversion traits `call1` needs
-        // directly, so there is no need to build a `PyTuple` by hand.
-        if let Err(err) = callback.call1(py, (stage, current, total)) {
-            err.print(py);
+/// The `(stage, current, total)` tuple of a pipeline report. A fraction outside `0.0..=1.0`
+/// is clamped and NaN reads as 0.
+#[must_use]
+pub fn progress_tuple(stage: Stage, fraction: f32) -> (&'static str, u32, u32) {
+    let fraction = if fraction.is_nan() {
+        0.0
+    } else {
+        fraction.clamp(0.0, 1.0)
+    };
+    (stage_name(stage), thousandths(fraction), PROGRESS_TOTAL)
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the fraction is in 0..=1, so the rounded product is in 0..=1000"
+)]
+fn thousandths(fraction: f32) -> u32 {
+    (fraction * 1000.0).round() as u32
+}
+
+/// A [`Progress`] that turns reports into `(stage, current, total)` calls of a closure, and
+/// skips a report that would repeat the previous tuple.
+pub struct ProgressForwarder<F> {
+    emit: F,
+    last: Cell<Option<(Stage, u32)>>,
+}
+
+impl<F: Fn(&'static str, u32, u32)> ProgressForwarder<F> {
+    /// A forwarder that calls `emit(stage, current, total)`.
+    #[must_use]
+    pub const fn new(emit: F) -> Self {
+        Self {
+            emit,
+            last: Cell::new(None),
         }
-    });
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pyo3::types::PyTuple;
-
-    #[test]
-    fn mapping_matches_documented_table() {
-        assert_eq!(
-            progress_to_tuple(PipelineProgress::DecodeRaw {
-                current: 2,
-                total: 5
-            }),
-            ("decode_raw", 2, 5)
-        );
-        assert_eq!(
-            progress_to_tuple(PipelineProgress::AlignStart { total: 7 }),
-            ("align_start", 0, 7)
-        );
-        assert_eq!(
-            progress_to_tuple(PipelineProgress::AlignFrame {
-                current: 3,
-                total: 7
-            }),
-            ("align_frame", 3, 7)
-        );
-        assert_eq!(
-            progress_to_tuple(PipelineProgress::AlignDone),
-            ("align_done", 0, 0)
-        );
-        assert_eq!(
-            progress_to_tuple(PipelineProgress::FuseStart { total: 12 }),
-            ("fuse_start", 0, 12)
-        );
-        assert_eq!(
-            progress_to_tuple(PipelineProgress::FuseTile {
-                current: 4,
-                total: 12
-            }),
-            ("fuse_tile", 4, 12)
-        );
-        assert_eq!(
-            progress_to_tuple(PipelineProgress::FuseDone),
-            ("fuse_done", 0, 0)
-        );
-        assert_eq!(
-            progress_to_tuple(PipelineProgress::Encoding),
-            ("encoding", 0, 0)
-        );
-    }
-
-    #[test]
-    fn call_progress_none_callback_is_noop() {
-        // Must not panic or require an initialised interpreter.
-        call_progress(None, PipelineProgress::Encoding);
-    }
-
-    #[test]
-    fn call_progress_invokes_python_callable_with_expected_args() {
-        Python::initialize();
-        Python::attach(|py| {
-            let calls =
-                std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, usize, usize)>::new()));
-
-            // Build a Python-callable wrapper around a Rust closure via a
-            // tiny `types.SimpleNamespace`-free approach: use `PyCFunction`.
-            let calls_capture = calls.clone();
-            let f = pyo3::types::PyCFunction::new_closure(
-                py,
-                None,
-                None,
-                move |args: &Bound<'_, PyTuple>, _kwargs| -> PyResult<()> {
-                    let stage: String = args.get_item(0)?.extract()?;
-                    let current: usize = args.get_item(1)?.extract()?;
-                    let total: usize = args.get_item(2)?.extract()?;
-                    calls_capture.lock().unwrap().push((stage, current, total));
-                    Ok(())
-                },
-            )
-            .unwrap();
-            let callback: Py<PyAny> = f.into_any().unbind();
-
-            call_progress(
-                Some(&callback),
-                PipelineProgress::AlignFrame {
-                    current: 2,
-                    total: 9,
-                },
-            );
-
-            let recorded = calls.lock().unwrap();
-            assert_eq!(recorded.len(), 1);
-            assert_eq!(recorded[0], ("align_frame".to_owned(), 2, 9));
-            drop(recorded);
-        });
-    }
-
-    #[test]
-    fn call_progress_swallows_python_exceptions() {
-        Python::initialize();
-        Python::attach(|py| {
-            let code =
-                std::ffi::CString::new("def raiser(*a):\n    raise ValueError('boom')\n").unwrap();
-            let filename = std::ffi::CString::new("raiser.py").unwrap();
-            let module_name = std::ffi::CString::new("raiser_mod").unwrap();
-            let module =
-                pyo3::types::PyModule::from_code(py, &code, &filename, &module_name).unwrap();
-            let raiser: Py<PyAny> = module.getattr("raiser").unwrap().unbind();
-
-            // Must not panic or propagate the Python exception.
-            call_progress(Some(&raiser), PipelineProgress::FuseDone);
-        });
+impl<F: Fn(&'static str, u32, u32)> Progress for ProgressForwarder<F> {
+    fn stage(&self, stage: Stage, fraction: f32, _label: &str) {
+        let (name, current, total) = progress_tuple(stage, fraction);
+        if self.last.get() != Some((stage, current)) {
+            self.last.set(Some((stage, current)));
+            (self.emit)(name, current, total);
+        }
     }
 }

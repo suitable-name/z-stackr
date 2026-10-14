@@ -1,0 +1,220 @@
+import { Button, ComboBox, Slider } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { RetouchModel } from "../models/retouch.slint";
+import { ViewportModel } from "../models/viewport.slint";
+
+// The Retouch tool's options, one slim row above the canvas. It exists only while
+// the tool is on (`RetouchModel.tool-on`), so there is no permanent brush card: the
+// frame to paint from, the brush size and opacity, Undo/Redo and Done. When the
+// canvas is too narrow for one row the controls wrap into two. A reason the brush
+// cannot paint right now (`RetouchModel.hint`) shows in a line under the controls.
+
+// Caption, slider and value text of one brush parameter.
+component BrushSlider inherits HorizontalLayout {
+    in property <string> caption;
+    in property <string> value-text;
+    in property <float> minimum;
+    in property <float> maximum;
+    in-out property <float> value;
+    spacing: Theme.space-sm;
+    horizontal-stretch: 0;
+
+    Text {
+        horizontal-stretch: 0;
+        text: root.caption;
+        color: Theme.text-primary;
+        font-size: Theme.font-sm;
+        vertical-alignment: center;
+    }
+    Slider {
+        width: 120px;
+        accessible-label: root.caption;
+        minimum: root.minimum;
+        maximum: root.maximum;
+        value <=> root.value;
+    }
+    Text {
+        text: root.value-text;
+        width: 46px;
+        color: Theme.text-secondary;
+        font-size: Theme.font-sm;
+        vertical-alignment: center;
+    }
+}
+
+// "Paint from" and the frame picker. Changing the frame keeps the strokes already
+// painted and re-sources them.
+component SourcePicker inherits HorizontalLayout {
+    spacing: Theme.space-sm;
+
+    Text {
+        horizontal-stretch: 0;
+        text: "Paint from";
+        color: Theme.text-primary;
+        font-size: Theme.font-sm;
+        vertical-alignment: center;
+    }
+    // The combo box has no placeholder of its own; until a frame is chosen it
+    // would be an empty box, so a dim caption sits over it.
+    Rectangle {
+        horizontal-stretch: 0;
+        width: 200px;
+        height: Theme.control-height-sm;
+        ComboBox {
+            width: parent.width;
+            height: parent.height;
+            model: RetouchModel.source-names;
+            current-index <=> RetouchModel.source-index;
+            enabled: RetouchModel.source-names.length > 0;
+            accessible-label: "Frame the brush paints from";
+            changed current-index => {
+                RetouchModel.source-chosen(RetouchModel.source-index);
+            }
+        }
+        if RetouchModel.source-index < 0: Text {
+            x: Theme.space-md;
+            width: parent.width - 2 * Theme.space-xl;
+            height: parent.height;
+            text: RetouchModel.source-names.length > 0 ? "Choose a frame\u{2026}" : "No frames";
+            color: Theme.text-dim;
+            font-size: Theme.font-sm;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+
+component HistoryButtons inherits HorizontalLayout {
+    callback undo-stroke();
+    callback redo-stroke();
+    spacing: Theme.space-sm;
+    horizontal-stretch: 0;
+
+    Button {
+        text: "Undo";
+        height: Theme.control-height-sm;
+        enabled: RetouchModel.can-undo;
+        accessible-description: RetouchModel.undo-label;
+        clicked => { root.undo-stroke(); }
+    }
+    Button {
+        text: "Redo";
+        height: Theme.control-height-sm;
+        enabled: RetouchModel.can-redo;
+        accessible-description: RetouchModel.redo-label;
+        clicked => { root.redo-stroke(); }
+    }
+}
+
+export component RetouchBar inherits Rectangle {
+    callback undo-stroke();
+    callback redo-stroke();
+    // The Done button: leave the tool.
+    callback done();
+
+    // One row needs about 1050 px; narrower canvases wrap onto two rows. The width
+    // comes from the canvas, which publishes it through a `changed` handler. Reading
+    // `root.width` here would be a binding loop: the choice of layout changes this
+    // row's horizontal constraints, and those decide the column's width.
+    property <bool> two-rows: ViewportModel.canvas-width < 1060.0;
+    property <bool> has-hint: RetouchModel.hint != "";
+
+    // Rows of `Theme.control-height-sm` between 8 px of padding, plus the hint line.
+    height: (root.two-rows ? 88px : 48px) + (root.has-hint ? 22px : 0px);
+    background: Theme.bg-panel;
+    border-radius: Theme.radius-md;
+    border-width: Theme.hairline;
+    border-color: Theme.border-subtle;
+
+    VerticalLayout {
+        padding: Theme.space-sm;
+        spacing: Theme.space-sm;
+
+        if !root.two-rows: HorizontalLayout {
+            spacing: Theme.space-lg;
+            Text {
+                horizontal-stretch: 0;
+                text: "Retouch";
+                color: Theme.text-strong;
+                font-weight: 700;
+                font-size: Theme.font-label;
+                vertical-alignment: center;
+            }
+            SourcePicker { horizontal-stretch: 0; }
+            BrushSlider {
+                caption: "Size";
+                value-text: Math.round(RetouchModel.brush-size) + " px";
+                minimum: 1.0;
+                maximum: 100.0;
+                value <=> RetouchModel.brush-size;
+            }
+            BrushSlider {
+                caption: "Opacity";
+                value-text: Math.round(RetouchModel.brush-opacity * 100) + "%";
+                minimum: 0.01;
+                maximum: 1.0;
+                value <=> RetouchModel.brush-opacity;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            HistoryButtons {
+                undo-stroke => { root.undo-stroke(); }
+                redo-stroke => { root.redo-stroke(); }
+            }
+            Button {
+                text: "Done";
+                primary: true;
+                height: Theme.control-height-sm;
+                clicked => { root.done(); }
+            }
+        }
+
+        if root.two-rows: HorizontalLayout {
+            spacing: Theme.space-lg;
+            Text {
+                horizontal-stretch: 0;
+                text: "Retouch";
+                color: Theme.text-strong;
+                font-weight: 700;
+                font-size: Theme.font-label;
+                vertical-alignment: center;
+            }
+            SourcePicker { horizontal-stretch: 0; }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: "Done";
+                primary: true;
+                height: Theme.control-height-sm;
+                clicked => { root.done(); }
+            }
+        }
+        if root.two-rows: HorizontalLayout {
+            spacing: Theme.space-lg;
+            BrushSlider {
+                caption: "Size";
+                value-text: Math.round(RetouchModel.brush-size) + " px";
+                minimum: 1.0;
+                maximum: 100.0;
+                value <=> RetouchModel.brush-size;
+            }
+            BrushSlider {
+                caption: "Opacity";
+                value-text: Math.round(RetouchModel.brush-opacity * 100) + "%";
+                minimum: 0.01;
+                maximum: 1.0;
+                value <=> RetouchModel.brush-opacity;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            HistoryButtons {
+                undo-stroke => { root.undo-stroke(); }
+                redo-stroke => { root.redo-stroke(); }
+            }
+        }
+
+        if root.has-hint: Text {
+            text: RetouchModel.hint;
+            color: Theme.warning;
+            font-size: Theme.font-xs;
+            overflow: elide;
+        }
+    }
+}
