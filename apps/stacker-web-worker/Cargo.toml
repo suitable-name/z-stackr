@@ -3,6 +3,8 @@ name = "z-stackr-web-worker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+homepage.workspace = true
+repository.workspace = true
 description = "The Web Worker of the z-stackr browser app: decodes a message, runs the stacking pipeline, posts the reply. Built by Trunk as a worker next to apps/stacker-web."
 
 # `cdylib` for wasm-bindgen/Trunk; `rlib` so a native `cargo check`/`clippy` of the

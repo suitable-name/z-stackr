@@ -1,8 +1,10 @@
 [package]
 name = "z-stackr-python"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+homepage = "https://z-stackr.suitable-na.me"
+repository = "https://github.com/suitable-name/z-stackr"
 description = "Python bindings for the z-stackr focus-stacking engine (out-of-core file pipeline and in-RAM numpy path)"
 # Not published to crates.io: this crate ships to end users as a Python wheel built by
 # `maturin` (see `pyproject.toml` and the README), never as a Rust dependency of another crate.

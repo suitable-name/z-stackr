@@ -3,6 +3,9 @@ name = "z-stackr-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Core types of z-stackr: planar linear-light images, sRGB conversion, the settings schema and a file-backed tile store."
 
 [lib]
 # Keep the crate identifier `stacker_core` so source `use` paths are unchanged

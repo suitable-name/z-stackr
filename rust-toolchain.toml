@@ -1,0 +1,7 @@
+# z-stackr needs a nightly compiler (`portable_simd`).  Pin the one the code is
+# linted and tested with, so a fresh clone builds the same code the same way.
+# Bump the date deliberately, after a clean `cargo clippy` run on the new nightly.
+[toolchain]
+# nightly-2026-09-08 is rustc 1.100.0-nightly (cea272fa3 2026-09-07).
+channel = "nightly-2026-09-08"
+components = ["clippy", "rustfmt"]

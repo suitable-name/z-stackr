@@ -4618,7 +4618,7 @@ dependencies = [
 
 [[package]]
 name = "z-stackr-algo"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rayon",
  "tracing",
@@ -4627,7 +4627,7 @@ dependencies = [
 
 [[package]]
 name = "z-stackr-align"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "akaze",
  "bitarray",
@@ -4639,7 +4639,7 @@ dependencies = [
 
 [[package]]
 name = "z-stackr-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bytemuck",
  "image 0.23.14",
@@ -4656,7 +4656,7 @@ dependencies = [
 
 [[package]]
 name = "z-stackr-gpu"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bytemuck",
  "futures-channel",
@@ -4669,7 +4669,7 @@ dependencies = [
 
 [[package]]
 name = "z-stackr-nn"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "burn",
  "image 0.23.14",
@@ -4683,7 +4683,7 @@ dependencies = [
 
 [[package]]
 name = "z-stackr-pipeline"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "image 0.23.14",
  "rayon",
@@ -4699,7 +4699,7 @@ dependencies = [
 
 [[package]]
 name = "z-stackr-python"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "image 0.23.14",
  "numpy",

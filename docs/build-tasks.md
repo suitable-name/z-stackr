@@ -102,5 +102,50 @@ Step 4 passes `-pgo-warn-missing-function`: a flood of `no profile data availabl
 warnings that name z-stackr functions means the profile did not match. Do not edit the sources
 between steps 1 and 4.
 
+## Build scripts (PGO, every CPU and GPU variant)
+
+For release binaries of every CPU and GPU variant, two scripts run the whole PGO chain
+(instrumented build, training, merge, check, optimised build) per combination; the VS Code
+tasks above remain for single builds and experiments.
+
+```powershell
+pwsh -File scripts/pgo-build.ps1                 # Windows
+```
+
+```bash
+scripts/pgo-bolt-build.sh                        # Linux: PGO, then BOLT on the CLI
+```
+
+| Axis | Windows | Linux | Values |
+|---|---|---|---|
+| CPU | `-Cpu` | `--cpu` | `scalar` (`x86-64-v2`), `avx2` (`x86-64-v3`), `avx512` (`x86-64-v4`), `native`, `all` (default: scalar, avx2 and avx512 when the host has it) |
+| GPU | `-Gpu` | `--gpu` | `gpu` (Cargo feature `gpu`), `cpu` (none), `both` (default) |
+| Target | `-Target` | `--target` | `cli`, `gui`, `all` (default; one combined build) |
+
+Other switches: `-SkipTrain` / `--skip-train` (reuse the profile in `pgo-profile/`), `-OutDir` /
+`--out-dir` (default `dist`), and on Linux `--no-bolt`. `akaze` and `raw` are always built; `nn`,
+`nn-gpu` and `ui-harness` never are. An explicit AVX-512 request on a CPU without AVX-512 is
+refused, and `all` drops it. The SIMD width is fixed at compile time (no runtime dispatch), so
+every CPU tier is trained once, under its own build.
+
+**Where the binaries land.** In `dist/`, as `z-stackr-win-<cpu>-<gpu>.exe` and
+`z-stackr-gui-win-<cpu>-<gpu>.exe` on Windows, `z-stackr-linux-<cpu>-<gpu>` and
+`z-stackr-gui-linux-<cpu>-<gpu>` on Linux, plus `z-stackr-linux-<cpu>-<gpu>-bolt` (the BOLT
+result for the CLI). Merged profiles are kept in `pgo-profile/`, build logs in
+`target/pgo-all-<cpu>-<gpu>/build.log` (`pgo-cli-...` for `--target cli`).
+
+**What is trained.** `-Target all` builds `z-stackr-cli` and `z-stackr-gui` in one cargo
+invocation, so the shared library crates get one crate hash and the one profile applies to both
+apps. The profile comes from `scripts/pgo-workload.*` run with the instrumented CLI (the six
+runs above, all with `--stacks single`; in the `gpu` tier also with `compute_device = "gpu"`,
+and without a usable adapter the pipeline falls back to the CPU with a warning, which leaves the
+GPU code untrained). The GUI is not driven, so GUI-only code (the Slint wiring) stays cold.
+After the optimised build the scripts compare the crate-hash tokens of `stacker_pipeline` and
+`stacker_algo` in the profile with the built rlibs and scan `build.log` for "hash mismatch".
+
+**Tools.** The `llvm-tools` component of the pinned toolchain (`rustup component add llvm-tools
+--toolchain nightly-2026-09-08`; its LLVM must match `rustc -vV`), and on Linux `llvm-bolt` and
+`merge-fdata` of the same LLVM version (or `--no-bolt`).
+
 Builds and training runs are the owner's to run and time; nothing in the repository starts
 them. Speed figures from them are only comparable on a quiet machine.

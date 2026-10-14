@@ -7,18 +7,20 @@ members = ["apps/*", "crates/*"]
 exclude = ["crates/stacker-python"]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+homepage = "https://z-stackr.suitable-na.me"
+repository = "https://github.com/suitable-name/z-stackr"
 
 [workspace.dependencies]
-z-stackr-core = { path = "crates/stacker-core" }
-z-stackr-align = { path = "crates/stacker-align" }
-z-stackr-algo = { path = "crates/stacker-algo" }
-z-stackr-pipeline = { path = "crates/stacker-pipeline" }
-z-stackr-gpu = { path = "crates/stacker-gpu" }
-z-stackr-nn = { path = "crates/stacker-nn", default-features = false }
-z-stackr-web-core = { path = "crates/stacker-web-core" }
+z-stackr-core = { path = "crates/stacker-core", version = "1.1.0" }
+z-stackr-align = { path = "crates/stacker-align", version = "1.1.0" }
+z-stackr-algo = { path = "crates/stacker-algo", version = "1.1.0" }
+z-stackr-pipeline = { path = "crates/stacker-pipeline", version = "1.1.0" }
+z-stackr-gpu = { path = "crates/stacker-gpu", version = "1.1.0" }
+z-stackr-nn = { path = "crates/stacker-nn", version = "1.1.0", default-features = false }
+z-stackr-web-core = { path = "crates/stacker-web-core", version = "1.1.0" }
 # `image` stays at 0.23.14: `akaze 0.7.0` depends on it (the upgrade is deferred, owner decision D11).
 image = "0.23.14"
 akaze = "0.7.0"

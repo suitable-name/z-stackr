@@ -3,6 +3,9 @@ name = "z-stackr-gpu"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "GPU kernels of z-stackr through wgpu: the alignment objective and warp, Apex, Relief, Strata and the multigrid depth solver."
 
 [lib]
 # Keep the crate identifier `stacker_gpu` (the package is `z-stackr-gpu`).

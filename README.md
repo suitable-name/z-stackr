@@ -108,6 +108,8 @@ $env:RUSTFLAGS = "-C target-cpu=x86-64-v3"; cargo build --release -p z-stackr-cl
 
 `docs/vscode-tasks.json` is a set of VS Code tasks: the GUI, the CLI and the trainer for each CPU level (`generic`, `x86-64-v3`, `x86-64-v4`, `znver3`, `znver4`) on Windows and Linux, and profile-guided-optimisation chains (plus BOLT on Linux) for the CLI and the GUI. Copy it to `.vscode/tasks.json`; `docs/build-tasks.md` explains the tasks, the prerequisites (`llvm-profdata`, `llvm-bolt`) and the training workload (Apex, Relief with and without multigrid, and Strata on the frames in `sample/`, aligned with registration + Lucas-Kanade, registration + Nelder-Mead and the six-parameter affine model). They use the `release-perf` cargo profile: the release code with line tables and symbols kept. These builds take a long time and are run by hand; nothing in the repository starts them.
 
+For release binaries of every CPU and GPU variant, `scripts/pgo-build.ps1` (Windows) and `scripts/pgo-bolt-build.sh` (Linux, PGO then BOLT) run the whole PGO chain per variant (`-Cpu scalar|avx2|avx512|native|all`, `-Gpu gpu|cpu|both`, `-Target cli|gui|all`) and write the binaries to `dist/`; see "Build scripts (PGO, every CPU and GPU variant)" in `docs/build-tasks.md`.
+
 > **No ML by default.** Without `--features nn` (or `nn-gpu`) neither app pulls in Burn, and the AI option is absent from the GUI. The GPU backend is a separate opt-in on top of `nn`.
 
 > **No GPU stack by default.** Without `--features gpu` neither app links wgpu for the stacking stages, and the Compute device box in the GUI lists the CPU only. A settings file that says `compute_device = "gpu"` still loads in such a build; the run uses the CPU and says so.

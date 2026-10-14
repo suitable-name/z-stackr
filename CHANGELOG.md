@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-14
+
 ### Renamed
 
 The fusion algorithms take the names of the GitHub release. Everything that wrote the
@@ -127,6 +129,14 @@ old names still reads.
   throw-away profile with the native file dialogs answered from a queue. The scenarios
   run in parallel worker processes while cores are idle (`SLINT_HARNESS_JOBS=serial`
   for one process).
+- **PGO build scripts for every CPU and GPU variant:** `scripts/pgo-build.ps1` (Windows)
+  and `scripts/pgo-bolt-build.sh` (Linux, PGO then BOLT) build `z-stackr` and
+  `z-stackr-gui` together for the scalar (`x86-64-v2`), AVX2 (`x86-64-v3`), AVX-512
+  (`x86-64-v4`) and native CPU tiers, each with and without the `gpu` feature
+  (`akaze` and `raw` always on). One combined instrumented build is trained with
+  `scripts/pgo-workload.*`, the profile is merged and checked against the optimised
+  build's crate hashes, and the binaries land in `dist/`. The workload scripts take
+  `-Gpu` / `--gpu` to repeat the six runs with `compute_device = "gpu"`.
 
 ### Changed
 
@@ -177,6 +187,9 @@ Performance, with the output unchanged unless stated above:
 
 ### Fixed
 
+- **The PGO training workload stopped on `sample/`.** `sample/` holds a `result/` subfolder
+  with images, so every CLI call of `scripts/pgo-workload.sh` / `.ps1` ended with "pass
+  `--stacks subfolders` or `--stacks single`". Every run now passes `--stacks single`.
 - **Alignment of series with strong focus breathing.** Lucas-Kanade (the first pass of
   the default `auto` optimizer) and the `affine` simplex searched the narrow bounded-search
   windows even with Bounded Search off, so no frame could get more than 5 % scale from the

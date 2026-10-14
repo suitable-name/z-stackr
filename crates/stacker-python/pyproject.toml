@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 # The PyPI name differs from the import name: `pip install z-stackr`, `import zstackr`.
 name = "z-stackr"
-version = "1.0.0"
+version = "1.1.0"
 description = "Python bindings for z-stackr, a focus-stacking engine written in Rust (import name: zstackr)"
 readme = "README.md"
 requires-python = ">=3.8"

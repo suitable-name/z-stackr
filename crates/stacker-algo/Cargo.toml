@@ -3,6 +3,9 @@ name = "z-stackr-algo"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Fusion algorithms of z-stackr: Apex (Laplacian pyramid), Relief (depth map with a guided filter or a multigrid solver), Strata (guided-filter blend), auto-cull and retouching."
 
 [lib]
 name = "stacker_algo"

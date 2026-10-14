@@ -3,6 +3,9 @@ name = "z-stackr-gui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Desktop focus-stacking app built with Slint: add frames, align, stack with Apex, Relief or Strata, retouch from the source frames and export."
 build = "build.rs"
 
 [lib]

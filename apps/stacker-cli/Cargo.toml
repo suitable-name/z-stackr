@@ -3,6 +3,9 @@ name = "z-stackr-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Command-line focus stacking: aligns a series of photographs focused at different depths and fuses them into one sharp image (Apex, Relief, Strata), out of core for large stacks."
 
 [lib]
 # Keep the crate identifier `stacker_cli` so source `use` paths are unchanged.

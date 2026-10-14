@@ -3,6 +3,9 @@ name = "z-stackr-pipeline"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "The z-stackr stacking pipeline its apps share: frame discovery, decoding, alignment, auto-cull, fusion, out-of-core tiling and encoding."
 
 [lib]
 # Keep the crate identifier `stacker_pipeline` (the package is `z-stackr-pipeline`).
